@@ -53,6 +53,13 @@ Rules that follow from these pins:
   (`traceparent`, `tracestate`). The MCP proxy (feature 09) must not pass
   through tokens it received and must avoid the confused-deputy problem, as
   the revision's security considerations require.
+  On Streamable HTTP every POST carries `MCP-Protocol-Version` and the
+  REQUIRED `Mcp-Method` header (the body's `method`); `tools/call`,
+  `resources/read` and `prompts/get` also carry `Mcp-Name` (`params.name` or
+  `params.uri`, Base64-sentinel encoded when not plain ASCII). A server
+  answers a header that disagrees with the body with `HeaderMismatchError`
+  (-32020) and HTTP 400. So any change the proxy makes to a request body must
+  update these headers to match.
 - **ACP.** Callsheet negotiates `protocolVersion` 1 during `initialize` and
   uses JSON-RPC 2.0 over stdio, newline-delimited. Wire compatibility is
   judged by the negotiated protocol version, not by schema or crate versions.
@@ -105,7 +112,8 @@ environment, so the Git sources were used):
 - MCP: https://modelcontextprotocol.io/specification/2026-07-28 — source
   https://github.com/modelcontextprotocol/modelcontextprotocol/tree/2026-07-28/docs/specification/2026-07-28
   (`changelog.mdx`, `basic/authorization/security-considerations.mdx`,
-  `basic/transports/streamable-http.mdx`) and `schema/2026-07-28/schema.ts`
+  `basic/transports/streamable-http.mdx` including its request-header table,
+  `schema.mdx` for `HeaderMismatchError`) and `schema/2026-07-28/schema.ts`
   (`LATEST_PROTOCOL_VERSION = "2026-07-28"`).
 - ACP: https://agentclientprotocol.com — source
   https://github.com/agentclientprotocol/agent-client-protocol/blob/v1.9.1/README.md
