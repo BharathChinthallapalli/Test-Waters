@@ -373,3 +373,17 @@ Choices worth knowing:
 
 The resolved tree is 178 crates. `deny.toml` will need `BSD-3-Clause` (subtle) and `Zlib`
 (foldhash).
+
+### 02 design amended after the review on #36 (issue #41)
+
+- Erasure takes an exclusive read gate, so `wal_checkpoint(TRUNCATE)` can't be blocked by our
+  own readers. It deletes leftover migration backups and reports success only when every copy
+  is gone. Otherwise it returns 1004 "erasure pending", keeps a durable `erasure_pending`
+  flag, retries every 30 s and at startup, and `health` shows it.
+- Migration backups are deleted after the migrated database passes `integrity_check` and a
+  full verify at startup.
+- The append API rejects floats and integers outside ±(2^53 − 1); tests pin it.
+- Verification runs in 10 000-event chunks, each a short read under the shared gate.
+- There's a clear message and docs for Linux without Secret Service (WSL, servers).
+- JSON-RPC batches follow section 6: an empty array gets one -32600 error, notifications
+  get no entries, and an all-notification batch gets HTTP 204.

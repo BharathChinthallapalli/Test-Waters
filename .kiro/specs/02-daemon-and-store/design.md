@@ -108,18 +108,21 @@ params and result type is in `cs-core::control`, all exported with ts-rs.
 - **Standard errors:** -32700 parse, -32600 invalid request, -32601 method not found, -32602
   invalid params.
 - **Callsheet errors** use codes outside the reserved range (ADR 0003): 1001 keychain
-  unavailable, 1002 erase plan out of date, 1003 unknown run.
-- **Batches** up to 16 requests are processed in order.
+  unavailable, 1002 erase plan out of date, 1003 unknown run, 1004 erasure pending.
+- **Batches** of 1 to 16 requests are processed in order, as JSON-RPC 2.0 section 6
+  requires: an empty array gets one `-32600` Invalid Request response with `id: null`;
+  notifications (no `id`) are executed and get no response entry; a batch of only
+  notifications gets HTTP 204 with no body; more than 16 entries is `-32600`.
 
 | Method | Result |
 |---|---|
-| `health` | `{ status: "ok", uptimeMs, schemaVersion, captureContent, lastGlobalPosition }` |
+| `health` | `{ status: "ok", uptimeMs, schemaVersion, captureContent, lastGlobalPosition, erasurePending }` |
 | `version` | `{ daemonVersion }` (the existing `VersionResult`) |
 | `token.rotate` | `{}` |
 | `settings.get` / `settings.setCaptureContent` | `{ captureContent }`; enabling fails with 1001 without a keychain |
 | `events.verify` | `{ ok, eventsChecked, erasedEvents, firstProblem? }` |
-| `content.erasePlan` | `{ planId, runId, sharedWithRuns[], contentItems }` (dry run, R6.1) |
-| `content.erase` | `{ erasedItems, affectedRuns[], walTruncated }` given `runId` and `planId` |
+| `content.erasePlan` | `{ planId, runId, sharedWithRuns[], contentItems, backupsToRemove }` (dry run, R6.1) |
+| `content.erase` | `{ erasedItems, affectedRuns[], backupsRemoved }` given `runId` and `planId`; success means every copy is gone (see Erasure) |
 
 No method appends events in 02; the proxy does that from feature 03. Tests append through
 the `cs-store` API.
@@ -128,7 +131,9 @@ the `cs-store` API.
 - **Connections:** one writer connection on a dedicated thread, fed by a bounded
   `tokio::sync::mpsc` queue with a `oneshot` reply per command. Every write is serialised
   there, which is what makes sequence numbers gap-free under concurrent callers. Verification
-  and `health` use a separate read-only connection.
+  and `health` use a separate read-only connection. Every read holds a shared **read gate**
+  (a `tokio::sync::RwLock`) for the length of its SQLite read transaction; erasure takes the
+  gate exclusively (see Erasure), so it can always wait out open readers.
 - **Pragmas** on every connection: `journal_mode=WAL`, `synchronous=FULL` (the log is the
   product, so durability wins over throughput), `foreign_keys=ON`, `secure_delete=ON`.
   `secure_delete` overwrites deleted content with zeros, which erasure relies on.
@@ -137,6 +142,11 @@ the `cs-store` API.
   - Pending migrations on an existing database → first `VACUUM INTO backup-v<from>.db`
     (owner-only). That backup contains no free-page residue.
   - Each migration runs in its own transaction.
+  - **The backup is short-lived.** It exists to recover from a failed migration only. Once
+    the migrated database has passed `PRAGMA integrity_check` and a full `events.verify`
+    at the end of that startup, the backup is deleted. If startup fails, it stays for
+    recovery, and the next successful startup deletes it. Erasure also removes any backup
+    still present (see Erasure), so a Callsheet-made file never keeps erased content.
 
 Schema version 1:
 
@@ -177,10 +187,20 @@ otherwise the previous event's `event_hash`. This is exactly ADR 0007. `globalPo
 included, so moving an event in the global order also breaks its hash. Before any event
 code runs, a test feeds the RFC 8785 test vectors (`input/` → `output/`, from the
 cyberphone/json-canonicalization set that canon-json ships under `testdata/`) through our
-serialiser. No floats appear in event bodies at all.
+serialiser.
+
+**No floats on the hash path.** The append API takes the event body as `serde_json::Value`
+and walks it before hashing: any number that isn't an integer, or any integer outside
+±(2^53 − 1), is rejected with an error. A test appends a body with `1.5` and one with
+`2^53` and expects both to be refused. So RFC 8785's number formatting never reaches an
+event hash, and every integer is exact in JavaScript too.
 
 ### Verification (R4.5, R4.6)
-Verification scans `events` by `global_pos` and reports the first of:
+Verification scans `events` by `global_pos` in chunks of 10 000 events. Each chunk is its
+own short read transaction under the shared read gate, carrying the last hash per run and the
+last position forward, so a long verify never blocks erasure for more than one chunk. Events
+are append-only, so later chunks only ever see more events, never changed ones. It reports the
+first of:
 - a gap or repeat in `global_pos`;
 - a gap or repeat in `seq` within a run;
 - a `prev_hash` mismatch;
@@ -199,6 +219,9 @@ until feature 04's checkpoints exist.
   or an in-memory implementation, so capture-enabled paths run on any CI machine.
 - Enabling capture first calls `content_key()`. If that fails, capture stays off and the
   method returns error 1001 with the store's reason. No key file fallback.
+- On Linux without a Secret Service provider (common on WSL, servers and minimal desktops)
+  the message says so directly: "No Secret Service keychain was found (common on WSL and
+  servers), so content capture stays off." PRIVACY.md and the README say the same.
 - `put_content(bytes)` → `address = hex(HMAC-SHA-256(key, bytes))`, then
   `INSERT OR IGNORE INTO blobs`. The same content is stored once. While capture is off,
   `put_content` isn't called and events carry no `content` field.
@@ -208,15 +231,27 @@ until feature 04's checkpoints exist.
   runs referencing any of them, and
   `plan_id = hex(SHA-256(canon_json({runId, addresses, sharedWithRuns})))`.
 - **Erase:** `erase(run_id, plan_id)` recomputes the plan and rejects with 1002 if the ID
-  differs, so nothing is erased that the user wasn't shown. Otherwise, in one transaction:
-  1. `DELETE FROM blobs WHERE address IN (…)` (overwritten because `secure_delete=ON`);
-  2. append a `content.erased` event to the run, listing the addresses and affected runs.
-- **After commit:** `PRAGMA wal_checkpoint(TRUNCATE)`. Success truncates the WAL to zero
-  bytes; if it reports busy, retry briefly and return `walTruncated: false` so callers know.
-- **Test:** after erasing, the database file and the `-wal` file are searched for the
-  content's bytes and must not contain them.
-- In 02 content lives only in the database, so there are no separate content files to
-  remove (R6.3).
+  differs, so nothing is erased that the user wasn't shown. Otherwise the writer thread:
+  1. takes the read gate **exclusively**, which waits for open read transactions to end and
+     holds new ones back;
+  2. in one transaction: `DELETE FROM blobs WHERE address IN (…)` (overwritten because
+     `secure_delete=ON`), appends a `content.erased` event to the run listing the addresses
+     and affected runs, and sets the setting `erasure_pending = 1`;
+  3. runs `PRAGMA wal_checkpoint(TRUNCATE)`. The WAL's original frames still hold the bytes
+     until this succeeds; with no readers and the daemon as the only process with the file
+     open (ADR 0002, R1.5), it can't be blocked by another connection;
+  4. deletes any leftover `backup-v*.db`;
+  5. clears `erasure_pending` and releases the gate.
+- **Success means the bytes are gone.** If step 3 or 4 still fails, `content.erase` returns
+  an error (1004, "erasure pending") instead of success. `erasure_pending` stays set, and
+  the writer retries the checkpoint and backup removal every 30 seconds and at the next
+  startup until they succeed. `health` reports `erasurePending: true` meanwhile.
+- **Test:** after erasing, the database file, the `-wal` file and any `backup-v*.db` are
+  searched for the content's bytes and must not contain them. A second test holds a read
+  open during the erase and checks that the erase waits for it rather than reporting success
+  early.
+- In 02 content lives only in the database, so apart from the migration backups there are no
+  separate content files to remove (R6.3).
 
 ### Logging (R1.6)
 `tracing-subscriber` writes JSON to stderr. There's no request/response body or header
@@ -251,8 +286,11 @@ Nothing panics on untrusted input: request bodies, headers or files.
   - verification catches each tamper case: edit, reorder, insert, middle removal;
   - end-of-log truncation is *not* caught (asserted, documenting R4.6);
   - dedup;
-  - erasure: plan/confirm, stale plan rejected, bytes absent from `.db` and `-wal`, verify
-    still ok with `contentErased`;
+  - erasure: plan/confirm, stale plan rejected, bytes absent from `.db`, `-wal` and
+    `backup-v*.db`, erase waits for an open reader, verify still ok with `contentErased`;
+  - migration backup deleted after a successful migrated startup, kept after a failed one;
+  - float and out-of-range integers rejected by the append API;
+  - batches: empty array, notifications only, mixed, over 16;
   - RFC 8785 vectors.
 - **Unit (cs-daemon):**
   - non-loopback addresses rejected;
