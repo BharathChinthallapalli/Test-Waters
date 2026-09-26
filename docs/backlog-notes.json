@@ -1,0 +1,748 @@
+{
+  "project": "Blackbox",
+  "branchName": "main",
+  "description": "Local-first flight recorder and control plane for AI agents. Schema is Ralph-compatible (userStories) with extra fields: milestone, type, dependsOn, verify, adr.",
+  "checks": {
+    "global": [
+      "cargo fmt --all --check",
+      "cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo test --workspace",
+      "pnpm biome check .",
+      "pnpm -r typecheck"
+    ]
+  },
+  "userStories": [
+    {
+      "id": "BB-001",
+      "milestone": "M0",
+      "type": "build",
+      "title": "Root workspaces and crate stubs",
+      "description": "Create the Cargo workspace (bb-core, bb-store, bb-proxy, bb-daemon as empty crates) and the pnpm workspace root, following CONTEXT.md layout.",
+      "acceptanceCriteria": [
+        "Cargo.toml workspace with resolver 3 and shared [workspace.package]",
+        "rust-toolchain.toml pins a stable toolchain",
+        "pnpm-workspace.yaml lists apps/* and packages/*",
+        ".gitignore covers target/, node_modules/, *.db",
+        "Empty crates build"
+      ],
+      "dependsOn": [],
+      "verify": [
+        "cargo build --workspace",
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-002",
+      "milestone": "M0",
+      "type": "docs",
+      "title": "Architecture decision records 0001-0006",
+      "description": "Write ADRs: 0001 daemon not sidecar, 0002 SQLite owned by daemon, 0003 JSON-RPC 2.0 control API with token, 0004 Biome over ESLint, 0005 protocol pins (semconv commit, MCP 2026-07-28, ACP version), 0006 passive vs hosted capture modes. Add docs/adr/template.md. Licence ADR is created as BLOCKED for owner decision.",
+      "acceptanceCriteria": [
+        "Each ADR has Status, Context, Decision, Consequences",
+        "0005 records exact semconv commit SHA and ACP schema version with source URLs",
+        "Licence ADR exists with status 'Proposed' and options listed"
+      ],
+      "dependsOn": [],
+      "verify": [
+        "test -f docs/adr/0001-daemon-not-sidecar.md",
+        "test -f docs/adr/0006-capture-modes.md"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-003",
+      "milestone": "M0",
+      "type": "build",
+      "title": "Hardened Electron skeleton",
+      "description": "Create apps/desktop: main, preload, renderer. BrowserWindow with contextIsolation true, sandbox true, nodeIntegration false, webSecurity true, strict CSP, navigation and window.open blocked. Preload exposes an empty typed API object only. Biome config at root.",
+      "acceptanceCriteria": [
+        "App launches and shows a placeholder page",
+        "Security flags asserted in a unit test of the window options",
+        "CSP forbids remote script and inline script",
+        "biome.json at repo root; typecheck passes"
+      ],
+      "dependsOn": [
+        "BB-001"
+      ],
+      "verify": [
+        "pnpm biome check .",
+        "pnpm -r typecheck",
+        "pnpm --filter desktop test"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-004",
+      "milestone": "M0",
+      "type": "build",
+      "title": "Rust to TS type generation",
+      "description": "Research and pick the generator (e.g. ts-rs, or schemars -> JSON Schema -> TS); record the choice in an ADR. Generate types from bb-core into packages/api-types. Add a check that generated output is committed and current.",
+      "acceptanceCriteria": [
+        "One Rust type in bb-core appears as a generated TS type",
+        "Regenerating produces no git diff",
+        "Generator choice documented with source URLs"
+      ],
+      "dependsOn": [
+        "BB-001",
+        "BB-002"
+      ],
+      "verify": [
+        "cargo test -p bb-core",
+        "pnpm --filter api-types typecheck",
+        "git diff --exit-code packages/api-types"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-005",
+      "milestone": "M0",
+      "type": "build",
+      "title": "CI pipeline",
+      "description": "GitHub Actions workflow running all Rust and TS checks plus cargo-deny (licences, advisories, bans). Pin third-party actions by commit SHA. Least-privilege `permissions:` block.",
+      "acceptanceCriteria": [
+        "Workflow runs on push and PR",
+        "cargo-deny config (deny.toml) committed",
+        "All actions pinned by SHA",
+        "Workflow token permissions set to read-only by default"
+      ],
+      "dependsOn": [
+        "BB-003",
+        "BB-004"
+      ],
+      "verify": [
+        "cargo deny check",
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
+        "pnpm biome check .",
+        "pnpm -r typecheck"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-101",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Daemon process and loopback binding",
+      "description": "bb-daemon binary on tokio. Binds 127.0.0.1 only and refuses any other address. Config and data dir via platform conventions. Structured logging with tracing; logging layer redacts auth headers.",
+      "acceptanceCriteria": [
+        "Starting with a non-loopback address exits with an error (tested)",
+        "Data dir created with owner-only permissions on Unix",
+        "Graceful shutdown on SIGINT/SIGTERM"
+      ],
+      "dependsOn": [
+        "BB-005"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://tokio.rs/tokio/tutorial/setup (build-your-own-x: Redis client/server in Rust, official tokio tutorial)"
+      ]
+    },
+    {
+      "id": "BB-102",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Authenticated control API",
+      "description": "JSON-RPC 2.0 over localhost HTTP. Per-install random token stored owner-only; constant-time comparison. Methods: health, version. Types generated to api-types.",
+      "acceptanceCriteria": [
+        "Missing or wrong token returns 401 (tested)",
+        "Token file is 0600 on Unix",
+        "health and version callable from a TS test client using generated types"
+      ],
+      "dependsOn": [
+        "BB-101"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
+        "pnpm biome check .",
+        "pnpm -r typecheck"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-103",
+      "milestone": "M1",
+      "type": "build",
+      "title": "SQLite store and migrations",
+      "description": "bb-store with rusqlite (bundled), WAL mode, forward-only migrations. Tables for calls (provider, model, tokens, latency, status, trace/span ids) and settings. Content capture column nullable, gated by a setting that defaults to off. Model recording as an append-only event log: events(run_id, seq, kind, ts, payload_ref) with seq strictly increasing per run; calls is a projection derived from events (CQRS). When content capture is on, store each message once in a content-addressed blobs table keyed by SHA-256, since agents resend the whole history every call. Hash-chain the event log from day one: each event stores prev_hash and event_hash = SHA-256 over its canonical bytes (RFC 8785 JSON Canonicalization) plus prev_hash. Retrofitting this later would break every existing log.",
+      "acceptanceCriteria": [
+        "Migrations run idempotently on startup",
+        "WAL enabled (tested)",
+        "capture_content setting defaults to false",
+        "events table is insert-only (no UPDATE/DELETE paths in code; tested)",
+        "seq is gap-free and monotonic per run under concurrent writes",
+        "Identical message content across calls is stored once (tested)",
+        "Editing or deleting any stored event is detected by a verify function (tested)"
+      ],
+      "dependsOn": [
+        "BB-101"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "/mnt/project system-design-101 database-and-storage: event sourcing ('designed with determinism')",
+        "system-design-101 how-it-works: exchange sequences orders so replay is deterministic",
+        "https://cstack.github.io/db_tutorial/ (optional background only; SQLite is used, not rebuilt)"
+      ]
+    },
+    {
+      "id": "BB-104",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Anthropic passthrough proxy",
+      "description": "bb-proxy forwards Anthropic Messages API requests (non-streaming and SSE streaming) to the upstream. Client-supplied API key is passed through, never stored or logged. Read the official Anthropic API docs for streaming event shapes and record URLs.",
+      "acceptanceCriteria": [
+        "Non-streaming and streaming requests round-trip against a mock upstream",
+        "Upstream errors are passed through unchanged",
+        "Redaction test: key never appears in logs or DB"
+      ],
+      "dependsOn": [
+        "BB-101"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://tokio.rs/tokio/tutorial/setup"
+      ]
+    },
+    {
+      "id": "BB-105",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Record calls and propagate trace context",
+      "description": "Parse usage from responses and stream events; write one call record per request. Create or continue W3C traceparent and forward it upstream. Recording is off the critical path: the proxy hands events to the recorder over a bounded channel. If the channel is full, drop the event and increment a dropped_events counter exposed via health. The agent request is never delayed by recording.",
+      "acceptanceCriteria": [
+        "Token counts match the fixture's usage fields, including cache tokens",
+        "Incoming traceparent is continued; missing one is created",
+        "Recording failure never breaks the proxied request",
+        "Bounded channel with a tested full-channel path that drops, counts, and does not block",
+        "dropped_events visible through the health method"
+      ],
+      "dependsOn": [
+        "BB-103",
+        "BB-104"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "system-design-primer 06-async-and-communication: back pressure",
+        "system-design-101 how-it-works: critical path vs non-critical flows"
+      ]
+    },
+    {
+      "id": "BB-106",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Transparency golden tests (M1 exit gate)",
+      "description": "Golden tests proving the proxy does not change agent-visible behaviour: bytes, status codes, headers that matter, and stream event order match direct responses for recorded fixtures. Add adapters/claude-code with the base-URL setup and a manual verification checklist. Do NOT add circuit breaking or retries in passthrough mode; they change agent-visible behaviour and break the transparency gate.",
+      "acceptanceCriteria": [
+        "Golden tests cover success, error, and streaming fixtures",
+        "adapters/claude-code/README.md documents setup and how to confirm routing",
+        "Manual check: an agent session works end to end through the proxy"
+      ],
+      "dependsOn": [
+        "BB-105"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-107",
+      "milestone": "M1",
+      "type": "build",
+      "title": "Install root identity and signed log checkpoints",
+      "description": "Generate one Ed25519 root key per install, stored in the OS keychain (research a maintained Rust keychain crate and ed25519 crate from official docs). Periodically sign a checkpoint of the event log in the C2SP tlog-checkpoint / signed-note format (origin, size, root hash). Checkpoints hold hashes only, never content. Add a `verify-log` CLI command.",
+      "acceptanceCriteria": [
+        "Root private key never written to disk in plaintext or logs (tested)",
+        "Checkpoint format matches c2sp.org/tlog-checkpoint (cite spec version)",
+        "verify-log reports the first tampered event and the last valid checkpoint",
+        "ADR records: tamper-evident, not tamper-proof against local root compromise"
+      ],
+      "dependsOn": [
+        "BB-105"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://c2sp.org/tlog-checkpoint",
+        "https://c2sp.org/signed-note",
+        "RFC 8785 (JSON Canonicalization Scheme)"
+      ]
+    },
+    {
+      "id": "BB-201",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Policy schema and tamper-resistant loading",
+      "description": "JSON Schema in schemas/policy.schema.json: scopes (global, project, agent, session), limits (spend, RPM, TPM, concurrency), breach actions (warn, block, downgrade). Daemon loads policy from its own data dir; stores a hash; a file changed outside the control API is rejected and reported.",
+      "acceptanceCriteria": [
+        "Invalid policy rejected with a clear error",
+        "External modification detected and rejected (tested)",
+        "Policy changes only via a control-API method"
+      ],
+      "dependsOn": [
+        "BB-106"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
+        "pnpm biome check .",
+        "pnpm -r typecheck"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-202",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Versioned price table",
+      "description": "Decide the price source (official provider pricing pages vs models.dev) and record it in an ADR. Versioned price file with source and date per entry. Cost computed into blackbox.cost.* fields.",
+      "acceptanceCriteria": [
+        "Each price entry has source URL and effective date",
+        "Unknown model produces an explicit 'unpriced' state, never zero cost",
+        "ADR records the source decision"
+      ],
+      "dependsOn": [
+        "BB-106"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-203",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Budget ledger: reserve and settle",
+      "description": "Transactional reserve (input estimate + max_tokens priced) and settle (actual usage) in SQLite across nested scopes. Treat the ledger like a payment system: each upstream request gets a proxy-assigned request id used as an idempotency key, so SDK retries never double-reserve. Startup reconciliation compares open reservations against settled events.",
+      "acceptanceCriteria": [
+        "Concurrent requests cannot overspend (parallel test)",
+        "Settle releases the unused reservation",
+        "A crash between reserve and settle is reconciled on restart",
+        "Retried request with the same idempotency key reserves once (tested)",
+        "Reconciliation report lists and releases orphaned reservations"
+      ],
+      "dependsOn": [
+        "BB-201",
+        "BB-202"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "system-design-101 payment-and-fintech: exactly-once = retry + idempotency; reconciliation"
+      ]
+    },
+    {
+      "id": "BB-204",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Budget enforcement in the proxy",
+      "description": "Before forwarding, reserve against all applicable scopes. On breach apply the policy action. Blocks return 429 with Retry-After and an error body in the provider's documented error shape so SDKs handle it.",
+      "acceptanceCriteria": [
+        "Over-budget call returns 429 with Retry-After (tested)",
+        "Error body matches the provider's documented error format",
+        "Every enforcement decision is recorded as a span event"
+      ],
+      "dependsOn": [
+        "BB-203"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-205",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Streaming output cap",
+      "description": "Count output tokens during streaming and end the stream cleanly when the cap is hit, with a well-formed final event and a recorded reason.",
+      "acceptanceCriteria": [
+        "Stream ends with a valid terminal event at the cap",
+        "Client SDK fixture parses the truncated stream without error",
+        "Truncation reason recorded"
+      ],
+      "dependsOn": [
+        "BB-204"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-206",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Rate limiting (RPM, TPM, concurrency)",
+      "description": "Per-scope limits using GCRA (evaluate the governor crate from its docs). Returns Retry-After; adds IETF RateLimit/RateLimit-Policy headers (draft-11) as informational.",
+      "acceptanceCriteria": [
+        "RPM, TPM and concurrency limits each tested",
+        "Retry-After value is correct for the limiter state",
+        "Draft header format cited from the IETF draft"
+      ],
+      "dependsOn": [
+        "BB-204"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "system-design-101 cloud-distributed-systems: token bucket vs leaky bucket (GCRA is the token-bucket family)"
+      ]
+    },
+    {
+      "id": "BB-207",
+      "milestone": "M2",
+      "type": "build",
+      "title": "Loop detection v0",
+      "description": "Detect N near-identical consecutive requests from one agent within a window without progress; apply the policy's breach action.",
+      "acceptanceCriteria": [
+        "Repeated identical requests trigger the action (tested)",
+        "Legitimate retries after a 5xx do not trigger it",
+        "Detection event recorded for later replay"
+      ],
+      "dependsOn": [
+        "BB-204"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "BB-006",
+      "milestone": "M0",
+      "type": "docs",
+      "title": "Open-source repository hygiene",
+      "description": "Add the files every reference project ships (OpenClaw, Paperclip, PI-Desktop): README (one-line pitch, install, status badge), LICENSE (per the licence ADR; BLOCKED until the owner decides), CONTRIBUTING, SECURITY (GitHub private vulnerability reporting), CODE_OF_CONDUCT, AGENTS.md (condensed from docs/plan/CONTEXT.md for contributors' coding agents), PRIVACY.md stating exactly what leaves the machine (default: nothing), issue and PR templates, ROADMAP.md from the milestones.",
+      "acceptanceCriteria": [
+        "All listed files exist and link to each other from README",
+        "PRIVACY.md states: no telemetry by default; any future telemetry is opt-in and documented",
+        "AGENTS.md stays under 60 lines",
+        "No code copied from LGPL-licensed PI-Desktop; ideas only"
+      ],
+      "dependsOn": [
+        "BB-002"
+      ],
+      "verify": [
+        "test -f AGENTS.md",
+        "test -f SECURITY.md",
+        "test -f PRIVACY.md"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/openclaw/openclaw (README privacy section, VISION.md)",
+        "https://github.com/paperclipai/paperclip (ROADMAP.md, adapter-plugin.md)"
+      ]
+    },
+    {
+      "id": "BB-208",
+      "milestone": "M2",
+      "type": "build",
+      "title": "First public release: daemon + CLI (v0.1)",
+      "description": "Ship the headless daemon and a small CLI before the Electron UI: developers adopt through the terminal, and it avoids code-signing cost for v0.1. Research a Rust release tool (e.g. cargo-dist) from its official docs. Publish binaries with SHA-256 checksums and an install script that is itself checksummed (as Paperclip does). CLI: start/stop daemon, status, show recent calls, set a budget.",
+      "acceptanceCriteria": [
+        "Release workflow builds macOS arm64/x64, Linux x64, Windows x64",
+        "Every artifact has a published SHA-256; install script verifies before installing",
+        "README quick start works on a clean machine in under 5 minutes",
+        "CHANGELOG.md entry for v0.1"
+      ],
+      "dependsOn": [
+        "BB-206",
+        "BB-207",
+        "BB-006"
+      ],
+      "verify": [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
+        "pnpm biome check .",
+        "pnpm -r typecheck"
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/paperclipai/paperclip (install.sh + install.sh.sha256)"
+      ]
+    },
+    {
+      "id": "BB-300",
+      "milestone": "M3",
+      "type": "planning",
+      "title": "Plan M3: desktop cockpit shell \u2014 Observability + Monitoring",
+      "description": "Electron cockpit on the control API: run/call timeline, call detail, live health (daemon, proxy, dropped events), budgets and rate-limit status, policy editor. Apply the frontend-design skill.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Integration details verified against each runtime's official docs/repo, with URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-208"
+      ],
+      "verify": [],
+      "priority": 30,
+      "passes": false,
+      "notes": "",
+      "references": []
+    },
+    {
+      "id": "BB-400",
+      "milestone": "M4",
+      "type": "planning",
+      "title": "Plan M4: ingest from agent runtimes (OTLP + MCP)",
+      "description": "OTLP/HTTP receiver with semconv normalization at the pinned commit. Adapters that configure each runtime's own exporter: OpenClaw (diagnostics.otel), Hermes (otlp extra), Claude Code, Codex. MCP 2026-07-28 proxy. Never write into a runtime's config without showing the user the change first.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Integration details verified against each runtime's official docs/repo, with URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-300"
+      ],
+      "verify": [],
+      "priority": 40,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/openclaw/openclaw docs/gateway/opentelemetry/configuration.md",
+        "https://github.com/NousResearch/hermes-agent pm/extras.py (otlp extra)"
+      ]
+    },
+    {
+      "id": "BB-500",
+      "milestone": "M5",
+      "type": "planning",
+      "title": "Plan M5: Delegation + task board (ACP host)",
+      "description": "ACP client host: start sessions on any adapter (Claude Code, Codex, Hermes, API-only models), stream updates, own fs/* and terminal/* with recording. Task board with dependencies and acceptance criteria. Approvals from session/request_permission shown in the UI. Every worker session is ephemeral: fresh session per task, closed and released when the task ends. Worker registry and identity: lifecycle states requested -> cast -> hired -> active -> wrapping -> released, plus revoked and expired (orphans reaped on restart). Three identities: (1) spec digest = SHA-256 over the canonical worker spec (adapter+version, model, soul digest, tools/permissions, policy digest), same config -> same digest; (2) instance id = UUIDv7 plus an ephemeral Ed25519 key minted at hire and held only by the daemon, never by the worker process; (3) the install root key signs a hire record binding instance key, spec digest, task, budget and expiry. At wrap, emit an in-toto Statement v1 (DSSE-signed by the instance key) whose subjects are the produced artifacts and whose predicate holds spec digest, sides digest, soul digest, usage and checkpoint reference, then destroy the instance key. Sub-agents spawned by a worker get narrower capabilities than their parent, never wider. Record the model version the provider actually returned, since a model name can change behind the same spec.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-400"
+      ],
+      "verify": [],
+      "priority": 50,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/agentclientprotocol/agent-client-protocol",
+        "https://github.com/NousResearch/hermes-agent acp_adapter/",
+        "https://github.com/snarktank/ralph",
+        "https://github.com/in-toto/attestation spec/v1/statement.md",
+        "https://github.com/secure-systems-lab/dsse",
+        "https://www.ietf.org/archive/id/draft-singla-agent-identity-protocol-03.html (attenuation rule; individual draft, watch only)",
+        "https://datatracker.ietf.org/doc/draft-rampalli-pedigree/ (individual draft, watch only)"
+      ]
+    },
+    {
+      "id": "BB-550",
+      "milestone": "M6",
+      "type": "planning",
+      "title": "Plan M6: Casting \u2014 capacity-aware dispatcher",
+      "description": "Choose which worker gets each task at dispatch time, never by fixed role. Inputs: live load and remaining quota per worker (from the proxy's own recorded usage and provider 429/Retry-After signals), context headroom, capability profile per adapter, cost, and budget policy. Hand off to a fresh session before context rot instead of growing one session. Every dispatch decision is recorded with its reasons so it can be audited and replayed.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-500"
+      ],
+      "verify": [],
+      "priority": 55,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/paperclipai/paperclip (fixed hiring model, for contrast)"
+      ]
+    },
+    {
+      "id": "BB-560",
+      "milestone": "M7",
+      "type": "planning",
+      "title": "Plan M7: Sides \u2014 precision context packs",
+      "description": "Build a token-budgeted context pack per task: only the files, decisions, memory items, and prior outputs the task needs, ranked and cut to fit the chosen worker's window. Record exactly what was injected so outcomes can be traced to context. Evaluate pack quality with an eval set before claiming it helps.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-550"
+      ],
+      "verify": [],
+      "priority": 60,
+      "passes": false,
+      "notes": "",
+      "references": []
+    },
+    {
+      "id": "BB-570",
+      "milestone": "M8",
+      "type": "planning",
+      "title": "Plan M8: Souls + Continuity \u2014 memory layer",
+      "description": "Souls: portable role definitions (voice, rules, skills) injected into whichever worker is cast, like Hermes SOUL.md but runtime-independent. Continuity: global long-term memory plus ephemeral per-task memory that is summarized or discarded at wrap. Memory is derived from the recorded event log, stored locally, user-inspectable and deletable, and never written from secrets or redacted content.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-560"
+      ],
+      "verify": [],
+      "priority": 65,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/NousResearch/hermes-agent SOUL.md"
+      ]
+    },
+    {
+      "id": "BB-600",
+      "milestone": "M9",
+      "type": "planning",
+      "title": "Plan M9: Maintenance",
+      "description": "Adapter health (versions, updates, config drift, stale sessions/worktrees, credential expiry warnings without reading secrets); run each runtime's own repair tooling only with confirmation; retention, backup/restore of our own data and memory.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-570"
+      ],
+      "verify": [],
+      "priority": 70,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://github.com/openclaw/openclaw docs/gateway/doctor/"
+      ]
+    },
+    {
+      "id": "BB-700",
+      "milestone": "M10",
+      "type": "planning",
+      "title": "Plan M10: Replay (dailies and reshoots)",
+      "description": "Fork-from-step replay on the ACP host: snapshot + log, content-addressed workspace snapshots, python harness. Start with a determinism design doc.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-600"
+      ],
+      "verify": [],
+      "priority": 80,
+      "passes": false,
+      "notes": "",
+      "references": [
+        "https://wyag.thb.lt/"
+      ]
+    },
+    {
+      "id": "BB-800",
+      "milestone": "M11",
+      "type": "planning",
+      "title": "Plan M11: Agent blame",
+      "description": "Link diffs to spans, tasks, the cast worker, and the context pack that produced them. Workers sign their git commits with their instance key (git SSH signing; verify from git docs), so blame is cryptographically verifiable and ties each commit to its wrap attestation.",
+      "acceptanceCriteria": [
+        "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
+        "Every integration detail verified against official docs/repos, URLs in notes"
+      ],
+      "dependsOn": [
+        "BB-700"
+      ],
+      "verify": [],
+      "priority": 90,
+      "passes": false,
+      "notes": "",
+      "references": []
+    }
+  ]
+}
