@@ -6,6 +6,7 @@
 | Job | Gates |
 |---|---|
 | Rust (fmt, clippy, test) | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` |
+| Rust on Windows (owner-only files) | `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test -p cs-store --locked fsperm` on `windows-2025` |
 | Rust dependencies (cargo-deny) | `cargo deny check` (licences, advisories, bans, sources; see `deny.toml`) |
 | TypeScript (Biome, typecheck, test, audit) | `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test`, `pnpm audit` |
 | Generated types are current | `node scripts/gen-types.ts --check` (ADR 0009) |
@@ -28,6 +29,22 @@ pnpm check-types
 databases, so `main` can turn red with no code change when a new advisory is
 published. That is the gate working, not a flake: update or replace the
 affected dependency, or record a reasoned exception.
+
+## Windows
+
+The other jobs run on Linux (`ubuntu-24.04`). Behaviour that differs by
+platform (file permissions, locks, signals; requirement 7.2 of feature 02) also
+needs a test on Windows, so **Rust on Windows** runs on the pinned
+`windows-2025` image, with the same checkout and toolchain steps as the Linux
+Rust job. It runs clippy for the whole workspace and the owner-only file tests
+(`fsperm`: owned by the current user, with a protected DACL that grants only
+that user). Later feature 02
+tasks extend it with the lock and signal tests for `cs-store` and `cs-daemon`.
+**CI passed** fails unless this job succeeded too.
+
+There is no full local equivalent on Linux: `cargo clippy --target
+x86_64-pc-windows-gnu` needs a MinGW C compiler to build rusqlite's bundled
+SQLite, so the CI job is the authoritative check.
 
 ## Blocking merges (repository setting)
 
@@ -77,3 +94,5 @@ blocked.
   https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
   and `creating-rulesets-for-a-repository` (read from github/docs `main`).
 - Action inputs read from each action's `action.yml` at the pinned commit.
+- Windows runner labels (`windows-2025`, `windows-latest`):
+  https://github.com/actions/runner-images/blob/main/README.md
