@@ -28,4 +28,5 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["io-util"] }
 tower = { version = "0.5.3", features = ["util"] }
