@@ -29,8 +29,8 @@ supported.
 ## Local control API
 
 The Callsheet daemon (feature 02, being built) is controlled through a small
-JSON-RPC API ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)). It is
-reachable only by programs on your machine that can read your token:
+JSON-RPC API ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)). It can be
+used only by programs on your machine that can read your token:
 
 - It listens on `127.0.0.1` only. The daemon refuses to start with any other
   listen address.
@@ -53,7 +53,8 @@ hidden:
   ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)). Each run's events
   are hash-chained and every event records its place in the daemon's global
   commit order, so verification detects an event that was edited, reordered
-  or inserted, or removed from the middle of the log.
+  or inserted, or removed from anywhere except the end of the global commit
+  order, unless every later hash is recomputed (see below).
 - Until signed checkpoints exist (feature 04), a hash chain has no outside
   anchor to compare against. So **removing the most recent events** (the end
   of the global commit order) cannot be detected, and someone who can write

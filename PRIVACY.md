@@ -26,8 +26,9 @@ is the contract; if the code ever disagrees with it, the code is the bug.
 - **Signing keys** stay in your operating system's keychain and are used only
   by the local daemon ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)).
 
-Everything is stored locally and stays under your control. You can erase a
-run's message content; see [Erasing a run's content](#erasing-a-runs-content).
+Everything is stored locally and stays under your control. Once feature 02
+ships, you can erase a run's message content; see
+[Erasing a run's content](#erasing-a-runs-content).
 
 The daemon and store that hold this data are being built in feature 02. The
 sections below describe how Callsheet behaves once that feature ships.
@@ -62,7 +63,8 @@ message content; with capture on, they refer to it only by its content address.
 
 Each run's events are hash-chained, and every event records its place in the
 daemon's global commit order. Verification therefore detects an event that was
-edited, reordered or inserted, or removed from the middle of the log. It
+edited, reordered or inserted, or removed from anywhere except the end of the
+global commit order, unless every later hash is recomputed (see below). It
 **cannot detect removal of the most recent events** (the end of the global
 commit order) until signed checkpoints exist (feature 04), because a hash chain
 has no outside anchor to compare against. For the same reason, until then
@@ -80,8 +82,8 @@ What Callsheet does:
 
 1. **Lists the other affected runs first.** The same message can be stored
    once for several runs. Callsheet lists every other run that refers to any of
-   the content being erased, with the number of content items, and erases
-   nothing until you confirm. A dry run shows the same list and erases
+   the content being erased, and how many content items will be erased, and
+   erases nothing until you confirm. A dry run shows the same list and erases
    nothing. If the list has changed since you saw it, the erasure is refused,
    so nothing is erased that you weren't shown.
 2. **Removes every stored copy**, including the copies those other runs share.
@@ -92,7 +94,7 @@ What Callsheet does:
 4. **Removes Callsheet's own migration backups.** Before a schema upgrade
    Callsheet makes a backup copy of the database, and deletes it once the
    upgraded database has started cleanly. Erasure deletes any that remain.
-5. **Reports success only once every copy is gone.** If the write-ahead log
+5. **Reports success only once every copy in Callsheet's own files is gone.** If the write-ahead log
    can't be truncated or a backup can't be removed yet, Callsheet reports
    "erasure pending" instead, and retries every 30 seconds and at the next
    start until it succeeds. The daemon's health report shows the erasure as
