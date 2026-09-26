@@ -325,3 +325,19 @@ while the repository is private (#28), and SECURITY.md uses a private contact
 request instead of private vulnerability reporting (6.1) until publication.
 Next: feature 02 (daemon-and-store) starts with `requirements.md` for owner
 approval.
+
+## 2026-09-26 — 02 daemon-and-store: requirements drafted
+
+Feature 02 is now `active`. `.kiro/specs/02-daemon-and-store/requirements.md` covers the
+loopback daemon, the authenticated control API, the daemon-owned SQLite store, the
+append-only hash-chained event log, content storage (off by default) and content erasure.
+Per `workflow.md`, `design.md` waits for the owner's approval of the requirements.
+
+Owner decision (issue #7): deleting erases stored content and keeps event hashes; recorded
+as decision 18 in `DECISIONS.md`, to become an ADR in the design.
+
+Inputs used: ADRs 0001–0003, 0006, 0007, 0009; backlog CS-101–CS-103; issues #7, #10
+(Windows token ACL, `127.0.0.1` not `localhost`) and #21 (drop-and-count queue, for 03).
+Differences from the backlog: content addresses are HMAC-SHA-256 with a per-install key
+(ADR 0006), not plain SHA-256; the event log never updates or deletes rows even when
+content is erased (a new event records the erasure).
