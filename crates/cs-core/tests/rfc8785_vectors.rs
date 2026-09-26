@@ -67,6 +67,7 @@ fn every_rfc8785_vector_matches_byte_for_byte() {
 #[test]
 fn upstream_number_dropped_from_values_json_formats_as_published() {
     let number: f64 = "333333333.33333329".parse().unwrap();
+    let value = serde_json::Value::from(number);
 
-    assert_eq!(canonical_json(&number).unwrap(), b"333333333.3333333");
+    assert_eq!(canonical_json(&value).unwrap(), b"333333333.3333333");
 }

@@ -4,7 +4,7 @@
 `cs_core::event::canonical_json` and expects the bytes of the file with the same
 name in `output/` (R4.7). The files must stay byte-for-byte as published:
 `input/` is deliberately not canonical, and `output/` has no trailing newline.
-That is why `biome.json` here keeps Biome from formatting them.
+That is why `biome.json` here keeps Biome from formatting or linting them.
 
 ## Source and licence
 

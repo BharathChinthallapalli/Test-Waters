@@ -58,7 +58,8 @@ pub struct HashedEvent<'a> {
     pub kind: &'a str,
     /// Unix milliseconds.
     pub ts_ms: u64,
-    /// Refers to content only by its address, never embeds it (R4.4).
+    /// Must refer to content only by its address, never embed it (R4.4). This
+    /// module can't tell content from metadata; the writer (task 7) enforces it.
     pub body: &'a Value,
     /// [`ZERO_HASH`] for `seq = 1`, otherwise the previous event's hash.
     pub prev_hash: &'a str,
@@ -179,16 +180,26 @@ impl From<CanonicalizationError> for EventHashError {
 pub fn event_hash(event: &HashedEvent<'_>) -> Result<String, EventHashError> {
     check_numeric_fields(event)?;
     check_body_numbers(event.body)?;
-    let canonical = canonical_json(event)?;
+    let canonical = to_canonical_bytes(event)?;
     Ok(hex::encode(Sha256::digest(&canonical)))
 }
 
 /// Serialises `value` as RFC 8785 canonical JSON, the bytes an event hash
 /// covers. The RFC 8785 test vectors are checked through this function.
 ///
+/// Takes a [`Value`] because canon-json 0.2.1 panics on a map whose keys are
+/// not strings (`lib.rs`, "Unhandled write into object key"); a `Value`'s
+/// object keys always are.
+///
 /// Checks no numbers: for event data, run [`check_body_numbers`] (or
 /// [`event_hash`], which runs it) first.
-pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CanonicalizationError> {
+pub fn canonical_json(value: &Value) -> Result<Vec<u8>, CanonicalizationError> {
+    to_canonical_bytes(value)
+}
+
+/// Canonical JSON for types whose maps all have string keys: [`Value`] and
+/// [`HashedEvent`]. Private so no other type can reach canon-json's panic.
+fn to_canonical_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CanonicalizationError> {
     value.to_canon_json_vec().map_err(|_| CanonicalizationError)
 }
 
@@ -376,7 +387,7 @@ mod tests {
             r#""runId":"run-01","seq":3,"tsMs":1790000000000}"#,
         );
 
-        assert_eq!(canonical_json(&event).unwrap(), expected.as_bytes());
+        assert_eq!(to_canonical_bytes(&event).unwrap(), expected.as_bytes());
 
         let hash = event_hash(&event).unwrap();
         assert_eq!(hash, sha256_hex(expected.as_bytes()));
@@ -405,7 +416,7 @@ mod tests {
             r#""runId":"run-01","seq":1,"tsMs":1790000000000}"#,
         );
 
-        assert_eq!(canonical_json(&event).unwrap(), expected.as_bytes());
+        assert_eq!(to_canonical_bytes(&event).unwrap(), expected.as_bytes());
         assert_eq!(
             event_hash(&event).unwrap(),
             "322193c3b358aa7be24c5fc29b198cb2c5a1f2c906908ea6b31bbfcd97d13daa"
@@ -644,7 +655,8 @@ mod tests {
     #[test]
     fn the_deepest_accepted_body_parses_again_inside_an_envelope() {
         let body = nested_arrays(MAX_BODY_DEPTH);
-        let canonical = String::from_utf8(canonical_json(&sample_event(&body)).unwrap()).unwrap();
+        let canonical =
+            String::from_utf8(to_canonical_bytes(&sample_event(&body)).unwrap()).unwrap();
         // The hashed object inside eight more levels, such as an export or an
         // RPC response would add.
         let wrapped = format!("{}{canonical}{}", "[".repeat(8), "]".repeat(8));
