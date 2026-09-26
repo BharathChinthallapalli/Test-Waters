@@ -14,8 +14,8 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
 
 /**
  * Maps an app:// request URL to a file inside the renderer directory.
- * Returns null for any other host, for paths that escape the directory and for
- * file types the renderer does not ship.
+ * Returns null for any other host, for malformed percent-escapes, for paths that
+ * escape the directory and for file types the renderer does not ship.
  */
 export function resolveRendererFile(
   requestUrl: string,
@@ -25,7 +25,12 @@ export function resolveRendererFile(
   if (url.protocol !== `${APP_SCHEME}:` || url.host !== RENDERER_HOST) {
     return null;
   }
-  const relative = decodeURIComponent(url.pathname).replace(/^\/+/, "");
+  let relative: string;
+  try {
+    relative = decodeURIComponent(url.pathname).replace(/^\/+/, "");
+  } catch {
+    return null; // malformed percent-escape
+  }
   const filePath = path.resolve(rendererDir, relative || "index.html");
   const fromRoot = path.relative(rendererDir, filePath);
   if (!fromRoot || fromRoot.startsWith("..") || path.isAbsolute(fromRoot)) {

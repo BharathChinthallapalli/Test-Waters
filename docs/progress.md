@@ -177,3 +177,16 @@ Patterns:
 - Integers that can exceed 2^53 go on the wire as strings.
 
 Follow-up: CI (task 5) runs `pnpm check-types` in the types job.
+
+## 2026-09-26 — Issue #14 (desktop permissions and malformed URLs)
+
+- `src/main/permissions.ts`: `denyAllPermissions()` denies permission requests,
+  permission checks and device (HID/serial/USB) permissions; 3 unit tests.
+- `resolveRendererFile()` returns null for malformed percent-escapes instead of
+  throwing; 2 URLs added to the tests.
+- Running app, before vs after: the page saw `Notification.permission`,
+  `geolocation` and `clipboard-read` as **granted** before and **denied** after;
+  `app://renderer/%` and `app://renderer/%E0%A4%A` errored out before and return
+  404 after.
+- Source: https://github.com/electron/electron/blob/v44.4.5/docs/api/session.md
+  (`setPermissionCheckHandler`, `setDevicePermissionHandler`).
