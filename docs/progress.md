@@ -154,3 +154,26 @@ Needs an owner look (the imported text was not edited):
   decision; task 4.1 depends on it.
 - The "Taken" list says the decisions are "to be recorded as ADRs"; they now
   are (ADRs 0001–0007).
+
+## 2026-09-26 — 01 foundation, task 4 (Generate shared types)
+
+Done: ADR 0009 (ts-rs, owner-approved after a side-by-side comparison with
+schemars → json-schema-to-typescript). `cs-core` gains `control::VersionResult`
+(the `version` method's result, camelCase on the wire) with a serde round-trip
+test. ts-rs is a dev-dependency used through `cfg_attr(test, …)`;
+`.cargo/config.toml` points exports at `packages/api-types/src/generated`.
+`pnpm gen-types` regenerates; `pnpm check-types` fails when the generated files
+differ from git. `packages/api-types` re-exports the generated types and
+typechecks.
+
+Checked: `check-types` passes on a clean tree, fails when a Rust field is added
+without regenerating, and a stray file in the generated folder is removed by
+regeneration.
+
+Patterns:
+- Wire types derive `ts_rs::TS` only in test builds:
+  `#[cfg_attr(test, derive(ts_rs::TS), ts(export))]`.
+- Never edit `packages/api-types/src/generated`; Biome skips it.
+- Integers that can exceed 2^53 go on the wire as strings.
+
+Follow-up: CI (task 5) runs `pnpm check-types` in the types job.

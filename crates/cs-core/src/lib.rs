@@ -1,9 +1,6 @@
 //! Domain types for Callsheet. This crate performs no I/O.
 //!
-//! Stub created by feature 01 (foundation); behaviour arrives with later features.
+//! Types that cross the control API derive `ts_rs::TS` in test builds only;
+//! `pnpm gen-types` writes them to `packages/api-types` (ADR 0009).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds_and_runs_tests() {}
-}
+pub mod control;

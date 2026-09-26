@@ -13,6 +13,7 @@
 10. One spec at a time, Kiro format, approval between requirements, design and tasks.
 11. No circuit breaker or retries in passthrough mode.
 12. Python only from the replay feature.
+13. TS types generated with ts-rs (owner-approved 2026-09-26; ADR 0009).
 
 ## Open (owner decisions — sessions must not guess)
 | Decision | Options | Blocks |
@@ -21,7 +22,6 @@
 | Licence | MIT or Apache-2.0 (patent grant) | LICENSE file (ADR 0008) |
 | Lint for TS | Biome (proposed, Rust-based) or ESLint | 01-foundation task 1.3 |
 | First provider for the proxy | Anthropic (proposed) | Feature 03 |
-| Type generator | ts-rs or schemars → JSON Schema → TS | 01-foundation task 4 |
 | Price source | Official provider pages or models.dev | Feature 05 |
 | OpenClaw as delegation target | Via its gateway, or observe-only | Feature 10 |
 

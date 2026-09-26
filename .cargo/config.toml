@@ -1,0 +1,7 @@
+# ts-rs writes TypeScript bindings when `cargo test` runs its export tests.
+# See docs/adr/0009-type-generation.md.
+[env]
+TS_RS_EXPORT_DIR = { value = "packages/api-types/src/generated", relative = true }
+TS_RS_IMPORT_EXTENSION = "ts"
+# JSON carries integers as numbers, not BigInt; values above 2^53 lose precision.
+TS_RS_LARGE_INT = "number"

@@ -17,9 +17,9 @@
   - [x] 3.3 CSP (meta + header) and typed empty preload API
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
 
-- [ ] 4. Generate shared types
-  - [ ] 4.1 Research generators from official docs; write the ADR
-  - [ ] 4.2 Export one sample type from cs-core into packages/api-types via `gen-types`
+- [x] 4. Generate shared types
+  - [x] 4.1 Research generators from official docs; write the ADR
+  - [x] 4.2 Export one sample type from cs-core into packages/api-types via `gen-types`
   - _Requirements: 3.1, 3.2, 3.3_
 
 - [ ] 5. Add CI quality gates
