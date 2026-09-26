@@ -1,7 +1,8 @@
 //! The per-install content key, kept in the OS keychain (R5.3, R5.4).
 //!
 //! Owned by unit `secrets`: the `SecretStore` trait, the keyring-core store
-//! (service `callsheet`, user `content-key`, generated on first use), an in-memory
+//! (service `callsheet`, user `content-key`, generated only when the caller says
+//! no content exists yet), an in-memory
 //! store for tests, and the "keychain unavailable" error (code 1001) with the
 //! Linux-without-Secret-Service message from the design. Never a key file.
 //!
@@ -33,11 +34,31 @@ pub const KEY_LEN: usize = 32;
 /// The reason reported on Linux when no Secret Service provider answers.
 pub const NO_SECRET_SERVICE: &str = "No Secret Service keychain was found (common on WSL and servers), so content capture stays off.";
 
+/// The reason reported on Linux when a Secret Service answers but has no
+/// default keyring (collection) to hold the key.
+pub const NO_DEFAULT_KEYRING: &str = "A Secret Service keychain answered but has no default keyring (common on WSL), so content capture stays off. Create or unlock a default keyring and try again.";
+
+/// The reason reported when the key is missing but content may be stored under it.
+pub const KEY_MISSING: &str = "The OS keychain has no Callsheet content key, but content was stored under one. A new key would make that content unreadable, so none was created and content capture stays off. If the keychain is locked, unlock it and try again.";
+
 const HEX_LEN: usize = KEY_LEN * 2;
+
+/// What [`SecretStore::content_key`] does when the keychain has no content key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfMissing {
+    /// Create and store a new key. Only for a store that holds no content yet,
+    /// so no blob can be addressed under a key that is replaced.
+    Generate,
+    /// Report [`KEY_MISSING`]. Some keychains hide entries while locked (a
+    /// Secret Service provider may leave locked collections out of searches), so
+    /// "no entry" doesn't prove the key never existed.
+    Fail,
+}
 
 /// Where the content key comes from.
 pub trait SecretStore: Send + Sync {
-    /// Returns the content key, generating and storing it on first use.
+    /// Returns the content key. If the keychain has none, creates one only when
+    /// `if_missing` is [`IfMissing::Generate`].
     ///
     /// This call blocks, and on Linux it drives the Secret Service over D-Bus
     /// through zbus's own runtime, which panics if entered from a thread that is
@@ -47,7 +68,7 @@ pub trait SecretStore: Send + Sync {
     /// It may also wait for the user to answer a keychain unlock prompt, and each
     /// call talks to the keychain again. Call it once when capture is enabled and
     /// keep the key; a caller that must answer promptly bounds its own wait.
-    fn content_key(&self) -> Result<[u8; KEY_LEN], KeychainUnavailable>;
+    fn content_key(&self, if_missing: IfMissing) -> Result<[u8; KEY_LEN], KeychainUnavailable>;
 }
 
 /// The OS keychain can't provide the content key, so content capture stays off.
@@ -87,9 +108,10 @@ impl StdError for KeychainUnavailable {}
 type OpenStore = dyn Fn() -> keyring_core::Result<Arc<CredentialStore>> + Send + Sync;
 type Explain = fn(&KeyringError) -> Option<&'static str>;
 
-/// Serializes read-or-generate across every store in the process, so two
-/// callers can't each store a different key. The daemon's single-instance lock
-/// (R1.5) keeps other Callsheet processes out.
+/// Serializes key creation across every store in the process, so two callers
+/// can't each store a different key. Reads don't take it, so a caller never
+/// waits behind another caller's unlock prompt just to read. The daemon's
+/// single-instance lock (R1.5) keeps other Callsheet processes out.
 static GENERATING: Mutex<()> = Mutex::new(());
 
 /// The content key in a keyring-core credential store.
@@ -129,14 +151,14 @@ impl KeyringSecretStore {
         (self.open)()?.build(SERVICE, USER, None)
     }
 
-    fn read_or_generate(&self) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
-        let entry = self.entry().map_err(|err| self.unavailable(err))?;
-        match read_key(&entry) {
+    /// Creates and stores a key unless another caller did so first.
+    fn generate(&self, entry: &Entry) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
+        match read_key(entry) {
             Err(Failure::Store(KeyringError::NoEntry)) => {}
             other => return other.map_err(|failure| self.failure(failure)),
         }
         let mut key = generate_key()?;
-        let stored = store_key(&entry, &key);
+        let stored = store_key(entry, &key);
         wipe(&mut key);
         stored.map_err(|err| self.unavailable(err))?;
         tracing::info!(
@@ -145,7 +167,7 @@ impl KeyringSecretStore {
             "stored a new content key in the OS keychain"
         );
         // Return what the keychain now holds, which is what later calls will see.
-        read_key(&entry).map_err(|failure| match failure {
+        read_key(entry).map_err(|failure| match failure {
             Failure::Store(KeyringError::NoEntry) => KeychainUnavailable::new(
                 "The OS keychain accepted the new content key but then had no entry for it, \
                  so content capture stays off.",
@@ -174,10 +196,18 @@ impl KeyringSecretStore {
 }
 
 impl SecretStore for KeyringSecretStore {
-    fn content_key(&self) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
+    fn content_key(&self, if_missing: IfMissing) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
+        let entry = self.entry().map_err(|err| self.unavailable(err))?;
+        match read_key(&entry) {
+            Err(Failure::Store(KeyringError::NoEntry)) => {}
+            other => return other.map_err(|failure| self.failure(failure)),
+        }
+        if if_missing == IfMissing::Fail {
+            return Err(KeychainUnavailable::new(KEY_MISSING));
+        }
         // The guard protects no data, so a panic elsewhere can't leave it inconsistent.
         let _guard = GENERATING.lock().unwrap_or_else(PoisonError::into_inner);
-        self.read_or_generate()
+        self.generate(&entry)
     }
 }
 
@@ -290,7 +320,7 @@ impl InMemorySecretStore {
 }
 
 impl SecretStore for InMemorySecretStore {
-    fn content_key(&self) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
+    fn content_key(&self, _if_missing: IfMissing) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
         self.key.clone()
     }
 }
@@ -320,8 +350,11 @@ impl fmt::Debug for InMemorySecretStore {
 /// `ServiceUnknown`. A provider without a `default` collection, as on WSL
 /// (zbus-secret-service-keyring-store 1.0.1 crate docs, "Usage on Windows
 /// Subsystem for Linux"), fails with `Error::NoResult`, which secret-service only
-/// returns when a collection alias resolves to nothing. Neither crate is a direct
-/// dependency, so the source chain is inspected through `std::error::Error`.
+/// returns when a collection alias resolves to nothing; that one gets its own
+/// reason, since a provider did answer. Neither crate is a direct dependency, so
+/// the source chain is inspected through `std::error::Error`, matching message
+/// texts checked against secret-service 5.2.0 and zbus 5.19: re-check them when
+/// either is upgraded.
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 mod secret_service {
     use std::error::Error as StdError;
@@ -330,12 +363,11 @@ mod secret_service {
 
     use keyring_core::Error as KeyringError;
 
-    /// Messages of `secret_service::Error::Unavailable` and `Error::NoResult` in
-    /// secret-service 5.2.0 (`src/error.rs`).
-    const SECRET_SERVICE: [&str; 2] = [
-        "no secret service provider or dbus session found",
-        "SS error: result not returned from SS API",
-    ];
+    /// Message of `secret_service::Error::Unavailable` in secret-service 5.2.0
+    /// (`src/error.rs`).
+    const UNAVAILABLE: &str = "no secret service provider or dbus session found";
+    /// Message of `secret_service::Error::NoResult` in secret-service 5.2.0.
+    const NO_RESULT: &str = "SS error: result not returned from SS API";
     /// D-Bus errors meaning no process owns or can be started for the bus name.
     const NO_OWNER: [&str; 2] = [
         "org.freedesktop.DBus.Error.ServiceUnknown",
@@ -343,13 +375,24 @@ mod secret_service {
     ];
 
     pub(super) fn is_unreachable(err: &KeyringError) -> bool {
-        let platform: &(dyn StdError + 'static) = match err {
+        causes(err).any(means_unreachable)
+    }
+
+    /// A provider answered but has no `default` collection.
+    pub(super) fn has_no_default_collection(err: &KeyringError) -> bool {
+        causes(err).any(|cause| cause.to_string().contains(NO_RESULT))
+    }
+
+    /// The platform error in `err` and its sources. Only these two variants carry
+    /// one; the variants that carry stored bytes are never inspected.
+    fn causes(err: &KeyringError) -> impl Iterator<Item = &(dyn StdError + 'static)> {
+        let platform: Option<&(dyn StdError + 'static)> = match err {
             KeyringError::PlatformFailure(cause) | KeyringError::NoStorageAccess(cause) => {
-                cause.as_ref()
+                Some(cause.as_ref())
             }
-            _ => return false,
+            _ => None,
         };
-        std::iter::successors(Some(platform), |&cause| cause.source()).any(means_unreachable)
+        std::iter::successors(platform, |&cause| cause.source())
     }
 
     fn means_unreachable(cause: &(dyn StdError + 'static)) -> bool {
@@ -361,8 +404,7 @@ mod secret_service {
             return true;
         }
         let message = cause.to_string();
-        SECRET_SERVICE
-            .iter()
+        std::iter::once(&UNAVAILABLE)
             .chain(NO_OWNER.iter())
             .any(|marker| message.contains(marker))
     }
@@ -388,7 +430,14 @@ mod platform {
     }
 
     pub(super) fn explain(err: &KeyringError) -> Option<&'static str> {
-        super::secret_service::is_unreachable(err).then_some(super::NO_SECRET_SERVICE)
+        use super::secret_service::{has_no_default_collection, is_unreachable};
+        if is_unreachable(err) {
+            Some(super::NO_SECRET_SERVICE)
+        } else if has_no_default_collection(err) {
+            Some(super::NO_DEFAULT_KEYRING)
+        } else {
+            None
+        }
     }
 }
 
@@ -475,7 +524,9 @@ mod tests {
     fn first_call_generates_and_stores_a_hex_key() {
         let store = mock_store();
 
-        let key = secret_store(&store).content_key().unwrap();
+        let key = secret_store(&store)
+            .content_key(IfMissing::Generate)
+            .unwrap();
 
         assert_ne!(key, [0u8; KEY_LEN]);
         assert_eq!(entry(&store).get_password().unwrap(), hex::encode(key));
@@ -486,10 +537,15 @@ mod tests {
         let store = mock_store();
         let secrets = secret_store(&store);
 
-        let first = secrets.content_key().unwrap();
+        let first = secrets.content_key(IfMissing::Generate).unwrap();
 
-        assert_eq!(secrets.content_key().unwrap(), first);
-        assert_eq!(secret_store(&store).content_key().unwrap(), first);
+        assert_eq!(secrets.content_key(IfMissing::Generate).unwrap(), first);
+        assert_eq!(
+            secret_store(&store)
+                .content_key(IfMissing::Generate)
+                .unwrap(),
+            first
+        );
     }
 
     #[test]
@@ -498,7 +554,12 @@ mod tests {
         let existing = [0xa5u8; KEY_LEN];
         entry(&store).set_password(&hex::encode(existing)).unwrap();
 
-        assert_eq!(secret_store(&store).content_key().unwrap(), existing);
+        assert_eq!(
+            secret_store(&store)
+                .content_key(IfMissing::Generate)
+                .unwrap(),
+            existing
+        );
         assert_eq!(entry(&store).get_password().unwrap(), hex::encode(existing));
     }
 
@@ -510,7 +571,12 @@ mod tests {
             .set_password(&hex::encode_upper(existing))
             .unwrap();
 
-        assert_eq!(secret_store(&store).content_key().unwrap(), existing);
+        assert_eq!(
+            secret_store(&store)
+                .content_key(IfMissing::Generate)
+                .unwrap(),
+            existing
+        );
     }
 
     #[test]
@@ -522,7 +588,9 @@ mod tests {
             let store = mock_store();
             entry(&store).set_password(stored).unwrap();
 
-            let err = secret_store(&store).content_key().unwrap_err();
+            let err = secret_store(&store)
+                .content_key(IfMissing::Generate)
+                .unwrap_err();
 
             assert!(err.reason().contains("left unchanged"), "{err}");
             assert_eq!(err.code(), cs_core::rpc::codes::KEYCHAIN_UNAVAILABLE);
@@ -536,7 +604,9 @@ mod tests {
         let raw = [0xffu8; KEY_LEN];
         entry(&store).set_secret(&raw).unwrap();
 
-        let err = secret_store(&store).content_key().unwrap_err();
+        let err = secret_store(&store)
+            .content_key(IfMissing::Generate)
+            .unwrap_err();
 
         assert!(err.reason().contains("not valid text"), "{err}");
         assert_eq!(entry(&store).get_secret().unwrap(), raw);
@@ -548,7 +618,9 @@ mod tests {
         let almost = "c0ffee".repeat(10);
         entry(&store).set_password(&almost).unwrap();
 
-        let err = secret_store(&store).content_key().unwrap_err();
+        let err = secret_store(&store)
+            .content_key(IfMissing::Generate)
+            .unwrap_err();
 
         assert!(!err.reason().contains("c0ffee"), "{err}");
     }
@@ -561,7 +633,9 @@ mod tests {
             KeyringError::NoStorageAccess(Box::new(io::Error::other("keychain is locked"))),
         );
 
-        let err = secret_store(&store).content_key().unwrap_err();
+        let err = secret_store(&store)
+            .content_key(IfMissing::Generate)
+            .unwrap_err();
 
         assert!(err.reason().contains("keychain is locked"), "{err}");
         assert!(err.reason().contains("content capture stays off"), "{err}");
@@ -574,7 +648,7 @@ mod tests {
         // store that refuses writes stands in for it here.
         let secrets = KeyringSecretStore::new(Arc::new(RefusesWrites));
 
-        let err = secrets.content_key().unwrap_err();
+        let err = secrets.content_key(IfMissing::Generate).unwrap_err();
 
         assert!(err.reason().contains("write refused"), "{err}");
         assert_eq!(err.code(), cs_core::rpc::codes::KEYCHAIN_UNAVAILABLE);
@@ -587,7 +661,7 @@ mod tests {
             |_| None,
         );
 
-        let err = secrets.content_key().unwrap_err();
+        let err = secrets.content_key(IfMissing::Generate).unwrap_err();
 
         assert!(err.reason().contains("no keychain daemon"), "{err}");
     }
@@ -629,10 +703,59 @@ mod tests {
             KeyringError::NoStorageAccess(Box::new(io::Error::other(
                 "org.freedesktop.DBus.Error.NameHasNoOwner: no owner",
             ))),
-            KeyringError::NoStorageAccess(Box::new(io::Error::other(
-                "SS error: result not returned from SS API",
-            ))),
         ]
+    }
+
+    fn no_default_collection() -> KeyringError {
+        KeyringError::NoStorageAccess(Box::new(io::Error::other(
+            "SS error: result not returned from SS API",
+        )))
+    }
+
+    #[test]
+    fn a_provider_without_a_default_collection_is_not_unreachable() {
+        let err = no_default_collection();
+        assert!(!secret_service::is_unreachable(&err));
+        assert!(secret_service::has_no_default_collection(&err));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn os_keychain_reports_a_missing_default_keyring() {
+        let secrets =
+            KeyringSecretStore::opening(|| Err(no_default_collection()), platform::explain);
+
+        let err = secrets.content_key(IfMissing::Generate).unwrap_err();
+
+        assert_eq!(err.reason(), NO_DEFAULT_KEYRING);
+    }
+
+    #[test]
+    fn a_missing_key_is_not_replaced_unless_the_caller_allows_it() {
+        let store = mock_store();
+
+        let err = secret_store(&store)
+            .content_key(IfMissing::Fail)
+            .unwrap_err();
+
+        assert_eq!(err.reason(), KEY_MISSING);
+        assert_eq!(err.code(), cs_core::rpc::codes::KEYCHAIN_UNAVAILABLE);
+        assert!(matches!(
+            entry(&store).get_password(),
+            Err(KeyringError::NoEntry)
+        ));
+    }
+
+    #[test]
+    fn an_existing_key_is_returned_whatever_the_caller_allows() {
+        let store = mock_store();
+        let existing = [0x5au8; KEY_LEN];
+        entry(&store).set_password(&hex::encode(existing)).unwrap();
+
+        assert_eq!(
+            secret_store(&store).content_key(IfMissing::Fail).unwrap(),
+            existing
+        );
     }
 
     #[test]
@@ -652,7 +775,7 @@ mod tests {
                 platform::explain,
             );
 
-            let err = secrets.content_key().unwrap_err();
+            let err = secrets.content_key(IfMissing::Generate).unwrap_err();
 
             assert_eq!(err.reason(), NO_SECRET_SERVICE, "case {index}");
             assert_eq!(err.code(), cs_core::rpc::codes::KEYCHAIN_UNAVAILABLE);
@@ -686,7 +809,7 @@ mod tests {
             platform::explain,
         );
 
-        let err = secrets.content_key().unwrap_err();
+        let err = secrets.content_key(IfMissing::Generate).unwrap_err();
 
         assert!(err.reason().contains("AccessDenied: not allowed"), "{err}");
         assert!(err.reason().contains("content capture stays off"), "{err}");
@@ -697,8 +820,8 @@ mod tests {
         let key = [7u8; KEY_LEN];
         let secrets = InMemorySecretStore::new(key);
 
-        assert_eq!(secrets.content_key().unwrap(), key);
-        assert_eq!(secrets.content_key().unwrap(), key);
+        assert_eq!(secrets.content_key(IfMissing::Generate).unwrap(), key);
+        assert_eq!(secrets.content_key(IfMissing::Generate).unwrap(), key);
         assert!(!format!("{secrets:?}").contains('7'));
     }
 
@@ -707,7 +830,7 @@ mod tests {
         let secrets = InMemorySecretStore::unavailable("no keychain in this test");
 
         for _ in 0..2 {
-            let err = secrets.content_key().unwrap_err();
+            let err = secrets.content_key(IfMissing::Generate).unwrap_err();
             assert_eq!(err.reason(), "no keychain in this test");
             assert_eq!(err.to_string(), "no keychain in this test");
             assert_eq!(err.code(), cs_core::rpc::codes::KEYCHAIN_UNAVAILABLE);
