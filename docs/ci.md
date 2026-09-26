@@ -24,6 +24,11 @@ pnpm -r test
 pnpm check-types
 ```
 
+`pnpm audit` and the advisory part of `cargo deny check` read live advisory
+databases, so `main` can turn red with no code change when a new advisory is
+published. That is the gate working, not a flake: update or replace the
+affected dependency, or record a reasoned exception.
+
 ## Blocking merges (repository setting)
 
 A workflow reports failures but cannot block a merge by itself. Merging is
@@ -57,6 +62,8 @@ blocked.
 - Node comes from `.node-version`; pnpm comes from `packageManager` in the root
   `package.json`; Rust comes from `rust-toolchain.toml`.
 - No caches: every run starts from a clean install.
+- cargo-deny is the prebuilt release binary, verified against a SHA-256 pinned
+  in the workflow; update the version and the hash together.
 
 ## Sources
 

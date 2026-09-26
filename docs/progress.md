@@ -204,8 +204,9 @@ lists the gates and the ruleset steps.
 Hardening from issue #9: `permissions: {}` at the top with `contents: read`
 per job; `persist-credentials: false`; every action pinned by full SHA
 (including `actions/*`); no caches (`package-manager-cache: false`);
-cargo-deny installed with `cargo install --locked cargo-deny@0.20.2` instead of
-its Docker action, whose image ships Rust 1.85, older than the pinned 1.98.
+cargo-deny is the prebuilt 0.20.2 release binary checked against a pinned
+SHA-256 (first run built it from source, ~3 minutes; review on PR #27), not its
+Docker action, whose image ships Rust 1.85, older than the pinned 1.98.
 
 Checked locally: `actionlint` 1.7.12 reports nothing; `cargo deny check` passes
 and fails when `Unicode-3.0` is removed from the allow list; the **CI passed**
@@ -224,5 +225,8 @@ Sources:
 - GitHub docs (github/docs `main`): available rules for rulesets, creating
   rulesets for a repository
 
+`docs/ci.md` notes that `pnpm audit` and cargo-deny read live advisory
+databases, so `main` can turn red without a code change.
+
 Follow-ups: Dependabot/Renovate and zizmor were left out by owner choice; the
-Electron update policy (#8) needs one of them later.
+SHA pins and the Electron update policy (#8) need one of them later.
