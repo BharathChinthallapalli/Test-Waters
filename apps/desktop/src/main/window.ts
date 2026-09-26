@@ -23,6 +23,8 @@ export function createWindowOptions(
       experimentalFeatures: false,
       webviewTag: false,
       navigateOnDragDrop: false,
+      // The built-in spellchecker downloads dictionaries from a Google CDN (#33).
+      spellcheck: false,
     },
   };
 }

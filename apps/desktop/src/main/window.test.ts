@@ -17,6 +17,7 @@ test("every window gets the hardened web preferences", () => {
     experimentalFeatures: false,
     webviewTag: false,
     navigateOnDragDrop: false,
+    spellcheck: false,
   });
 });
 

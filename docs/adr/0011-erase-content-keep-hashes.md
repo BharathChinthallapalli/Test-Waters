@@ -43,9 +43,12 @@ feature 02.
   erasures.
 - What was said is gone after an erasure, but the fact that events happened remains. That
   metadata is kept by design, and PRIVACY.md says so.
-- Copies left by the storage device, the filesystem or backups made before the erasure are
-  outside Callsheet's control; PRIVACY.md says so. Backups (feature 14) use `VACUUM INTO`,
-  so they carry no deleted residue.
+- Files Callsheet itself creates never keep erased content: its own migration backups are
+  deleted once a migrated database has started cleanly, and erasure removes any that remain.
+  An erasure reports success only after the WAL has been truncated as well.
+- Copies left by the storage device, the filesystem, or backups and exports the user made
+  before the erasure (including feature 14's) are outside Callsheet's control; PRIVACY.md
+  says so. Feature 14's backups use `VACUUM INTO`, so they carry no deleted residue.
 - Metadata fields must never become content in disguise (for example tool arguments or file
   paths in event bodies); feature 03's design has to check this for each field it records.
 
