@@ -10,3 +10,22 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+cs-core = { version = "0.1.0", path = "../cs-core" }
+cs-store = { version = "0.1.0", path = "../cs-store" }
+etcetera = "0.11.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
+serde = "1.0.229"
+serde_json = "1.0.151"
+subtle = "2.6.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

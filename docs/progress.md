@@ -405,3 +405,19 @@ Checked in the running app (local run as root, so `--no-sandbox`):
 | Session spellchecker | `true` | `false` |
 | Request to an off-machine URL | `ERR_TUNNEL_CONNECTION_FAILED` (it tried to leave) | `ERR_BLOCKED_BY_CLIENT` |
 | `app://renderer/index.html` | 200 | 200, title "Callsheet" |
+
+## 2026-09-26 — 02 daemon-and-store: design approved, shared foundation (task 0)
+
+The owner approved the design (#42 merged) and chose to implement it with parallel workers
+in waves; `tasks.md` records the order.
+
+- The resolved tree grows to about 190 crates. `cargo deny` needed exactly the two licences
+  the design predicted: BSD-3-Clause (subtle, and matchit via axum) and Zlib (foldhash).
+- keyring-core 1.0.0 has no `mock` feature: `keyring_core::mock` is always built.
+- zbus-secret-service-keyring-store uses `rt-tokio-crypto-rust`, so no OpenSSL.
+- ts-rs maps `i64`/`u64` to `bigint`; wire integers that stay below 2^53 carry
+  `#[ts(type = "number")]`.
+- `cs-daemon` gained a library target, so modules land before `main` uses them without
+  dead-code warnings.
+- Blocked: the default port. `www.iana.org` is denied by this environment's network policy,
+  so the registry couldn't be checked (task 0.5).

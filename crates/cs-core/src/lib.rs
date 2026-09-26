@@ -4,3 +4,5 @@
 //! `pnpm gen-types` writes them to `packages/api-types` (ADR 0009).
 
 pub mod control;
+pub mod event;
+pub mod rpc;
