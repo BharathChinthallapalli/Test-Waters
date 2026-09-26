@@ -36,8 +36,9 @@ The other jobs run on Linux (`ubuntu-24.04`). Behaviour that differs by
 platform (file permissions, locks, signals; requirement 7.2 of feature 02) also
 needs a test on Windows, so **Rust on Windows** runs on the pinned
 `windows-2025` image, with the same checkout and toolchain steps as the Linux
-Rust job. For now it runs clippy for `cs-store` and the owner-only file tests
-(`fsperm`: a protected DACL that grants only the current user). Later feature 02
+Rust job. It runs clippy for the whole workspace and the owner-only file tests
+(`fsperm`: owned by the current user, with a protected DACL that grants only
+that user). Later feature 02
 tasks extend it with the lock and signal tests for `cs-store` and `cs-daemon`.
 **CI passed** fails unless this job succeeded too.
 
