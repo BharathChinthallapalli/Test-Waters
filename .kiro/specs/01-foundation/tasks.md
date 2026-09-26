@@ -22,9 +22,9 @@
   - [x] 4.2 Export one sample type from cs-core into packages/api-types via `gen-types`
   - _Requirements: 3.1, 3.2, 3.3_
 
-- [ ] 5. Add CI quality gates
-  - [ ] 5.1 ci.yml with rust, ts and types jobs; read-only permissions; SHA-pinned actions
-  - [ ] 5.2 deny.toml for licences, advisories, bans
+- [x] 5. Add CI quality gates
+  - [x] 5.1 ci.yml with rust, ts and types jobs; read-only permissions; SHA-pinned actions
+  - [x] 5.2 deny.toml for licences, advisories, bans
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
 - [ ] 6. Add open-source files

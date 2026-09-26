@@ -190,3 +190,39 @@ Follow-up: CI (task 5) runs `pnpm check-types` in the types job.
   404 after.
 - Source: https://github.com/electron/electron/blob/v44.4.5/docs/api/session.md
   (`setPermissionCheckHandler`, `setDevicePermissionHandler`).
+
+## 2026-09-26 — 01 foundation, task 5 (Add CI quality gates)
+
+Done: `.github/workflows/ci.yml` with jobs Rust (fmt, clippy, test), Rust
+dependencies (cargo-deny), TypeScript (Biome, typecheck, test, `pnpm audit`),
+Generated types are current (`gen-types --check`), and **CI passed**, an
+always-run job that fails unless every other job succeeded. `deny.toml` allows
+MIT, Apache-2.0 and Unicode-3.0, denies yanked crates, wildcards and unknown
+registries or git sources. `.node-version` pins Node 22.22.2. `docs/ci.md`
+lists the gates and the ruleset steps.
+
+Hardening from issue #9: `permissions: {}` at the top with `contents: read`
+per job; `persist-credentials: false`; every action pinned by full SHA
+(including `actions/*`); no caches (`package-manager-cache: false`);
+cargo-deny installed with `cargo install --locked cargo-deny@0.20.2` instead of
+its Docker action, whose image ships Rust 1.85, older than the pinned 1.98.
+
+Checked locally: `actionlint` 1.7.12 reports nothing; `cargo deny check` passes
+and fails when `Unicode-3.0` is removed from the allow list; the **CI passed**
+logic succeeds only when every result is `success` (a `skipped`, `failure` or
+`cancelled` result fails it).
+
+Needs the owner (repository setting): create the `main` ruleset requiring
+**CI passed** (steps in `docs/ci.md`). Until then CI reports but does not block.
+
+Sources:
+- `action.yml` of actions/checkout v7.0.1 (`3d3c42e5`), actions/setup-node
+  v7.0.0 (`82076278`), pnpm/action-setup v6.1.0 (`ea17c68d`)
+- https://github.com/EmbarkStudios/cargo-deny/tree/0.20.2/docs/src/checks
+- rustup CHANGELOG (`rustup toolchain install` with no arguments installs the
+  active toolchain)
+- GitHub docs (github/docs `main`): available rules for rulesets, creating
+  rulesets for a repository
+
+Follow-ups: Dependabot/Renovate and zizmor were left out by owner choice; the
+Electron update policy (#8) needs one of them later.
