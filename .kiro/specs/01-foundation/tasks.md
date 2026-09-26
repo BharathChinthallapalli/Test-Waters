@@ -1,9 +1,9 @@
 # Tasks — 01 foundation
 
-- [ ] 1. Set up workspaces
-  - [ ] 1.1 Root Cargo.toml (resolver 3, workspace.package, workspace.lints) and stub crates cs-core, cs-store, cs-proxy, cs-daemon
-  - [ ] 1.2 rust-toolchain.toml and .gitignore
-  - [ ] 1.3 pnpm-workspace.yaml, root package.json scripts, biome.json
+- [x] 1. Set up workspaces
+  - [x] 1.1 Root Cargo.toml (resolver 3, workspace.package, workspace.lints) and stub crates cs-core, cs-store, cs-proxy, cs-daemon
+  - [x] 1.2 rust-toolchain.toml and .gitignore
+  - [x] 1.3 pnpm-workspace.yaml, root package.json scripts, biome.json
   - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
 - [ ] 2. Record architecture decisions

@@ -1,0 +1,11 @@
+[package]
+name = "cs-daemon"
+description = "Callsheet daemon binary and control API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

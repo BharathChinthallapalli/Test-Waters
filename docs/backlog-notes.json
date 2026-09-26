@@ -68,9 +68,7 @@
         "CSP forbids remote script and inline script",
         "biome.json at repo root; typecheck passes"
       ],
-      "dependsOn": [
-        "BB-001"
-      ],
+      "dependsOn": ["BB-001"],
       "verify": [
         "pnpm biome check .",
         "pnpm -r typecheck",
@@ -91,10 +89,7 @@
         "Regenerating produces no git diff",
         "Generator choice documented with source URLs"
       ],
-      "dependsOn": [
-        "BB-001",
-        "BB-002"
-      ],
+      "dependsOn": ["BB-001", "BB-002"],
       "verify": [
         "cargo test -p bb-core",
         "pnpm --filter api-types typecheck",
@@ -116,10 +111,7 @@
         "All actions pinned by SHA",
         "Workflow token permissions set to read-only by default"
       ],
-      "dependsOn": [
-        "BB-003",
-        "BB-004"
-      ],
+      "dependsOn": ["BB-003", "BB-004"],
       "verify": [
         "cargo deny check",
         "cargo fmt --all --check",
@@ -143,9 +135,7 @@
         "Data dir created with owner-only permissions on Unix",
         "Graceful shutdown on SIGINT/SIGTERM"
       ],
-      "dependsOn": [
-        "BB-005"
-      ],
+      "dependsOn": ["BB-005"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -169,9 +159,7 @@
         "Token file is 0600 on Unix",
         "health and version callable from a TS test client using generated types"
       ],
-      "dependsOn": [
-        "BB-101"
-      ],
+      "dependsOn": ["BB-101"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -198,9 +186,7 @@
         "Identical message content across calls is stored once (tested)",
         "Editing or deleting any stored event is detected by a verify function (tested)"
       ],
-      "dependsOn": [
-        "BB-101"
-      ],
+      "dependsOn": ["BB-101"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -226,9 +212,7 @@
         "Upstream errors are passed through unchanged",
         "Redaction test: key never appears in logs or DB"
       ],
-      "dependsOn": [
-        "BB-101"
-      ],
+      "dependsOn": ["BB-101"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -237,9 +221,7 @@
       "priority": 13,
       "passes": false,
       "notes": "",
-      "references": [
-        "https://tokio.rs/tokio/tutorial/setup"
-      ]
+      "references": ["https://tokio.rs/tokio/tutorial/setup"]
     },
     {
       "id": "BB-105",
@@ -254,10 +236,7 @@
         "Bounded channel with a tested full-channel path that drops, counts, and does not block",
         "dropped_events visible through the health method"
       ],
-      "dependsOn": [
-        "BB-103",
-        "BB-104"
-      ],
+      "dependsOn": ["BB-103", "BB-104"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -282,9 +261,7 @@
         "adapters/claude-code/README.md documents setup and how to confirm routing",
         "Manual check: an agent session works end to end through the proxy"
       ],
-      "dependsOn": [
-        "BB-105"
-      ],
+      "dependsOn": ["BB-105"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -306,9 +283,7 @@
         "verify-log reports the first tampered event and the last valid checkpoint",
         "ADR records: tamper-evident, not tamper-proof against local root compromise"
       ],
-      "dependsOn": [
-        "BB-105"
-      ],
+      "dependsOn": ["BB-105"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -334,9 +309,7 @@
         "External modification detected and rejected (tested)",
         "Policy changes only via a control-API method"
       ],
-      "dependsOn": [
-        "BB-106"
-      ],
+      "dependsOn": ["BB-106"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -359,9 +332,7 @@
         "Unknown model produces an explicit 'unpriced' state, never zero cost",
         "ADR records the source decision"
       ],
-      "dependsOn": [
-        "BB-106"
-      ],
+      "dependsOn": ["BB-106"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -384,10 +355,7 @@
         "Retried request with the same idempotency key reserves once (tested)",
         "Reconciliation report lists and releases orphaned reservations"
       ],
-      "dependsOn": [
-        "BB-201",
-        "BB-202"
-      ],
+      "dependsOn": ["BB-201", "BB-202"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -411,9 +379,7 @@
         "Error body matches the provider's documented error format",
         "Every enforcement decision is recorded as a span event"
       ],
-      "dependsOn": [
-        "BB-203"
-      ],
+      "dependsOn": ["BB-203"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -434,9 +400,7 @@
         "Client SDK fixture parses the truncated stream without error",
         "Truncation reason recorded"
       ],
-      "dependsOn": [
-        "BB-204"
-      ],
+      "dependsOn": ["BB-204"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -457,9 +421,7 @@
         "Retry-After value is correct for the limiter state",
         "Draft header format cited from the IETF draft"
       ],
-      "dependsOn": [
-        "BB-204"
-      ],
+      "dependsOn": ["BB-204"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -483,9 +445,7 @@
         "Legitimate retries after a 5xx do not trigger it",
         "Detection event recorded for later replay"
       ],
-      "dependsOn": [
-        "BB-204"
-      ],
+      "dependsOn": ["BB-204"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -507,9 +467,7 @@
         "AGENTS.md stays under 60 lines",
         "No code copied from LGPL-licensed PI-Desktop; ideas only"
       ],
-      "dependsOn": [
-        "BB-002"
-      ],
+      "dependsOn": ["BB-002"],
       "verify": [
         "test -f AGENTS.md",
         "test -f SECURITY.md",
@@ -535,11 +493,7 @@
         "README quick start works on a clean machine in under 5 minutes",
         "CHANGELOG.md entry for v0.1"
       ],
-      "dependsOn": [
-        "BB-206",
-        "BB-207",
-        "BB-006"
-      ],
+      "dependsOn": ["BB-206", "BB-207", "BB-006"],
       "verify": [
         "cargo fmt --all --check",
         "cargo clippy --workspace --all-targets -- -D warnings",
@@ -564,9 +518,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Integration details verified against each runtime's official docs/repo, with URLs in notes"
       ],
-      "dependsOn": [
-        "BB-208"
-      ],
+      "dependsOn": ["BB-208"],
       "verify": [],
       "priority": 30,
       "passes": false,
@@ -583,9 +535,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Integration details verified against each runtime's official docs/repo, with URLs in notes"
       ],
-      "dependsOn": [
-        "BB-300"
-      ],
+      "dependsOn": ["BB-300"],
       "verify": [],
       "priority": 40,
       "passes": false,
@@ -605,9 +555,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-400"
-      ],
+      "dependsOn": ["BB-400"],
       "verify": [],
       "priority": 50,
       "passes": false,
@@ -632,9 +580,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-500"
-      ],
+      "dependsOn": ["BB-500"],
       "verify": [],
       "priority": 55,
       "passes": false,
@@ -653,9 +599,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-550"
-      ],
+      "dependsOn": ["BB-550"],
       "verify": [],
       "priority": 60,
       "passes": false,
@@ -672,16 +616,12 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-560"
-      ],
+      "dependsOn": ["BB-560"],
       "verify": [],
       "priority": 65,
       "passes": false,
       "notes": "",
-      "references": [
-        "https://github.com/NousResearch/hermes-agent SOUL.md"
-      ]
+      "references": ["https://github.com/NousResearch/hermes-agent SOUL.md"]
     },
     {
       "id": "BB-600",
@@ -693,9 +633,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-570"
-      ],
+      "dependsOn": ["BB-570"],
       "verify": [],
       "priority": 70,
       "passes": false,
@@ -714,16 +652,12 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-600"
-      ],
+      "dependsOn": ["BB-600"],
       "verify": [],
       "priority": 80,
       "passes": false,
       "notes": "",
-      "references": [
-        "https://wyag.thb.lt/"
-      ]
+      "references": ["https://wyag.thb.lt/"]
     },
     {
       "id": "BB-800",
@@ -735,9 +669,7 @@
         "Tasks added to tasks.json with dependsOn, verify, acceptanceCriteria, each sized for one session",
         "Every integration detail verified against official docs/repos, URLs in notes"
       ],
-      "dependsOn": [
-        "BB-700"
-      ],
+      "dependsOn": ["BB-700"],
       "verify": [],
       "priority": 90,
       "passes": false,

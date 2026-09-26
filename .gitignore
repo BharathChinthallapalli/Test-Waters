@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Node dependencies and build output
+node_modules/
+dist/
+out/
+*.tsbuildinfo
+coverage/
+
+# Local databases (SQLite and its WAL/shared-memory files)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local environment and editor state
+.env
+.env.*
+.DS_Store
