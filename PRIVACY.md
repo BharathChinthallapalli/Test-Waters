@@ -94,11 +94,11 @@ What Callsheet does:
 4. **Removes Callsheet's own migration backups.** Before a schema upgrade
    Callsheet makes a backup copy of the database, and deletes it once the
    upgraded database has started cleanly. Erasure deletes any that remain.
-5. **Reports success only once every copy in Callsheet's own files is
-   gone.** If the write-ahead log can't be truncated or a backup can't be removed yet, Callsheet reports
-   "erasure pending" instead, and retries every 30 seconds and at the next
-   start until it succeeds. The daemon's health report shows the erasure as
-   pending meanwhile.
+5. **Reports success only once every copy in Callsheet's own files is gone.** If
+   the write-ahead log can't be truncated or a backup can't be removed yet,
+   Callsheet reports "erasure pending" instead, and retries every 30 seconds and
+   at the next start until it succeeds. The daemon's health report shows the
+   erasure as pending meanwhile.
 6. **Keeps every event and hash**, and records a `content.erased` event listing
    what was erased and which runs were affected. Verification still passes and
    reports the affected events as "content erased".
