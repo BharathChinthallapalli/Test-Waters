@@ -1,6 +1,7 @@
 {
   "name": "@callsheet/desktop",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {

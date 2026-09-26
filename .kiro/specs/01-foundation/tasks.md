@@ -27,10 +27,10 @@
   - [x] 5.2 deny.toml for licences, advisories, bans
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
-- [ ] 6. Add open-source files
-  - [ ] 6.1 README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, issue and PR templates
-  - [ ] 6.2 AGENTS.md (under 60 lines) and PRIVACY.md
-  - [ ] 6.3 No LICENSE until ADR 0008 is Accepted
+- [x] 6. Add open-source files
+  - [x] 6.1 README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, issue and PR templates
+  - [x] 6.2 AGENTS.md (under 60 lines) and PRIVACY.md
+  - [x] 6.3 No LICENSE until ADR 0008 is Accepted
   - _Requirements: 6.1, 6.2, 6.3, 6.4_
 
 - [ ] 7. Checkpoint: fresh clone passes every quality gate; record result in docs/progress.md

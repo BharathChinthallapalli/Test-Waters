@@ -1,14 +1,14 @@
 # 0008. Choose the project licence
 
-- Status: Proposed — owner decision required
+- Status: Accepted (owner decision, 2026-09-26: MIT)
 - Date: 2026-09-26
 
 ## Context
 
 Callsheet is a personal open-source project. The licence is an owner decision
 (`.kiro/steering/product.md`: "Licence and final name are owner decisions;
-never pick them in a session"). This ADR lists the options so the owner can
-decide; it does not choose.
+never pick them in a session"). This ADR listed the options; the owner chose
+MIT on 2026-09-26 (issue #4).
 
 Feature 01 requirement 6.4 says no LICENSE file is added while this ADR is
 Proposed. However, the repository already contains an MIT `LICENSE` from its
@@ -30,12 +30,13 @@ Options:
 
 ## Decision
 
-None yet. The owner picks one option and changes this ADR's status to
-Accepted.
+The project is licensed under **MIT** (option 1). The existing `LICENSE` file
+from the initial commit already holds the MIT text and stays. Manifests carry
+the SPDX identifier `MIT`.
 
 ## Consequences
 
-Once decided:
+Done with this decision:
 
 - Keep or replace the existing `LICENSE` file to match (with Apache-2.0 or
   dual licensing, add `LICENSE-APACHE` and, for dual, `LICENSE-MIT`).
@@ -46,7 +47,7 @@ Once decided:
   be compatible with the choice.
 - State the licence in README and CONTRIBUTING (feature 01, task 6.1).
 
-Until then, feature 01 task 6.3 stays blocked on this ADR.
+Feature 01 task 6.3 is unblocked.
 
 ## Sources
 

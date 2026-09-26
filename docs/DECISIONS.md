@@ -1,27 +1,33 @@
 # Decisions
 
-## Taken (to be recorded as ADRs in 01-foundation)
-1. Rust daemon runs independently of the UI; not a stdio sidecar.
-2. SQLite (WAL) owned only by the daemon.
-3. Control API: JSON-RPC 2.0 over localhost HTTP, per-install token, loopback only.
+## Taken (ADR in brackets where one records it)
+1. Rust daemon runs independently of the UI; not a stdio sidecar (ADR 0001).
+2. SQLite (WAL) owned only by the daemon (ADR 0002).
+3. Control API: JSON-RPC 2.0 over localhost HTTP, per-install token, loopback only (ADR 0003).
 4. TS types generated from Rust; never hand-mirrored.
-5. Event log append-only and hash-chained from day one; signed C2SP checkpoints.
-6. Two capture modes: passive (proxy + OTLP) and hosted (ACP).
+5. Event log append-only and hash-chained from day one; signed C2SP checkpoints (ADR 0007).
+6. Two capture modes: passive (proxy + OTLP) and hosted (ACP) (ADR 0006).
 7. Ephemeral workers only: fresh session per task, released at wrap.
 8. Workers never hold keys; the daemon signs on their behalf.
 9. Daemon + CLI ships first (v0.1); desktop UI after.
 10. One spec at a time, Kiro format, approval between requirements, design and tasks.
-11. No circuit breaker or retries in passthrough mode.
+11. No circuit breaker or retries in passthrough mode (ADR 0010).
 12. Python only from the replay feature.
 13. TS types generated with ts-rs (owner-approved 2026-09-26; ADR 0009).
+14. Licence: MIT (owner decision 2026-09-26; ADR 0008, issue #4).
+15. Lint and format for TS: Biome (ADR 0004).
+16. First provider for the proxy: Anthropic Messages (roadmap feature 03). An
+    OpenAI Responses proxy for Codex is tracked in issue #5.
+17. The repository stays private for now (owner decision 2026-09-26, issue #28).
+    On GitHub Free a private repository has no rulesets, so requirement 4.2
+    (CI blocks merge) holds by convention until it goes public, and private
+    vulnerability reporting starts at publication (see `docs/ci.md`,
+    `SECURITY.md`).
 
 ## Open (owner decisions — sessions must not guess)
 | Decision | Options | Blocks |
 |---|---|---|
 | Project name | Callsheet (proposed) or other | Crate prefix, README, repo going public |
-| Licence | MIT or Apache-2.0 (patent grant) | LICENSE file (ADR 0008) |
-| Lint for TS | Biome (proposed, Rust-based) or ESLint | 01-foundation task 1.3 |
-| First provider for the proxy | Anthropic (proposed) | Feature 03 |
 | Price source | Official provider pages or models.dev | Feature 05 |
 | OpenClaw as delegation target | Via its gateway, or observe-only | Feature 10 |
 
