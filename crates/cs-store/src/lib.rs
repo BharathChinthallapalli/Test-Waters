@@ -1,9 +1,13 @@
-//! SQLite store and append-only event log, owned by the daemon.
+//! SQLite store and append-only event log, owned by the daemon (ADR 0002).
 //!
-//! Stub created by feature 01 (foundation); behaviour arrives with later features.
+//! Each module's doc comment states its contract and which feature 02 unit
+//! (`.kiro/specs/02-daemon-and-store/tasks.md`) implements it.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds_and_runs_tests() {}
-}
+pub mod content;
+pub mod db;
+pub mod erase;
+pub mod fsperm;
+pub mod migrate;
+pub mod secrets;
+pub mod verify;
+pub mod writer;
