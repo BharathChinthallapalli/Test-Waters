@@ -1,0 +1,17 @@
+{
+  "name": "@callsheet/desktop",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "pnpm build && electron .",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "electron": "44.4.5",
+    "typescript": "7.0.2"
+  }
+}

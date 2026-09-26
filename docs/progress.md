@@ -89,3 +89,52 @@ Follow-ups:
 - ADR 0003: exact `Host` value, `Authorization: Bearer`, token held only by the
   Electron main process.
 - ADR 0008 links issue #4 (licence decision).
+
+## 2026-09-26 — 01 foundation, task 3 (Build the hardened desktop shell)
+
+Done: `apps/desktop` (Electron 44.4.5, TypeScript 7.0.2, `@types/node` 24).
+- `src/main/window.ts`: one pure `createWindowOptions()`; contextIsolation,
+  sandbox, webSecurity on; nodeIntegration (all three), webviewTag,
+  experimentalFeatures, allowRunningInsecureContent, navigateOnDragDrop off.
+- `src/main/navigation.ts`: every `will-navigate` prevented and every
+  `window.open` denied, applied to all web contents via `web-contents-created`.
+- Renderer served from a custom `app://renderer/` scheme (no `file://`, no
+  `bypassCSP` privilege) with the CSP as a response header; the same policy is
+  in the page's `<meta>` tag, and a test keeps them identical. Path traversal
+  and unknown file types return 404. All permission requests are denied.
+- `src/preload/index.cts`: CommonJS (sandboxed preloads cannot use ESM),
+  exposes a frozen, empty, typed `window.callsheet` (`CallsheetApi`).
+- Unit tests use Node's built-in runner (`node --test`, native type stripping in
+  Node 22.22): 13 tests, no test-framework dependency. They import no Electron
+  runtime code, so CI can run them without the Electron binary.
+
+Rendering check (Playwright `_electron` under Xvfb, driver kept outside the
+repo): window renders; `window.callsheet` is a frozen empty object; `require`
+and `process` are undefined in the page; inline and remote scripts are blocked;
+`eval` and `new Function` throw `EvalError` from page code; navigation and
+`window.open` are blocked; the served page carries the CSP header; a missing
+file and an encoded `..` path return 404. The container runs as root, so
+Electron was launched with `--no-sandbox` for this check: the app's
+`sandbox: true` renderer mode was exercised, the OS-level Chromium sandbox was
+not.
+
+Gates: `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test` and the Rust
+gates pass. New dependencies are MIT, ISC or Apache-2.0; `pnpm audit` found no
+known vulnerabilities.
+
+Sources (Electron docs at tag `v44.4.5`, commit `694f45852a0f`):
+- https://github.com/electron/electron/blob/v44.4.5/docs/tutorial/security.md
+  (items 3, 4, 5, 6, 7, 13, 14, 18)
+- https://github.com/electron/electron/blob/v44.4.5/docs/tutorial/esm.md
+- https://github.com/electron/electron/blob/v44.4.5/docs/tutorial/sandbox.md
+- https://github.com/electron/electron/blob/v44.4.5/docs/api/protocol.md
+- https://github.com/electron/electron/blob/v44.4.5/docs/api/structures/web-preferences.md
+- https://github.com/nodejs/node/blob/v22.22.2/doc/api/typescript.md and
+  `doc/api/test.md`
+
+Follow-ups:
+- Pin Node (Electron's installer requires `>= 22.12.0`) in CI with task 5.
+- The compiled preload keeps TypeScript's CommonJS `exports` marker; it runs
+  fine in the sandboxed preload (verified above), but switch to a bundler if
+  the preload ever needs more than `require("electron")`.
+- Packaging (fuses, code signing, `asar`) belongs to the release feature.

@@ -11,10 +11,10 @@
   - [x] 2.2 ADR 0008 licence with status Proposed (owner decision)
   - _Requirements: 5.1, 5.2, 5.3_
 
-- [ ] 3. Build the hardened desktop shell
-  - [ ] 3.1 Window factory with hardened webPreferences plus unit test asserting every flag
-  - [ ] 3.2 Block navigation and window.open plus tests
-  - [ ] 3.3 CSP (meta + header) and typed empty preload API
+- [x] 3. Build the hardened desktop shell
+  - [x] 3.1 Window factory with hardened webPreferences plus unit test asserting every flag
+  - [x] 3.2 Block navigation and window.open plus tests
+  - [x] 3.3 CSP (meta + header) and typed empty preload API
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
 
 - [ ] 4. Generate shared types
