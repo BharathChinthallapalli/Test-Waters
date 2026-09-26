@@ -287,3 +287,41 @@ Sources:
 
 Follow-up: the security and conduct contact is an issue-based request for a
 private channel; add a dedicated contact address when the owner wants one.
+
+## 2026-09-26 — 01 foundation, task 7 (Checkpoint: fresh clone passes every gate)
+
+Fresh clone of `main` at `e4eb7f4` from GitHub into an empty directory, with
+its own `CARGO_TARGET_DIR`. Toolchain: rustc 1.98.1 (from
+`rust-toolchain.toml`), Node 22.22.2, pnpm 12.6.0, cargo-deny 0.20.2.
+
+| Gate | Result |
+|---|---|
+| `rustup toolchain install` | ok |
+| `cargo build --workspace --locked` (req 1.1) | ok |
+| `cargo fmt --all --check` | ok |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | ok |
+| `cargo test --workspace --locked` | ok, 5 tests |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+| `pnpm install --frozen-lockfile` (req 1.3) | ok |
+| `pnpm biome check .` | ok, 25 files |
+| `pnpm -r typecheck` | ok (desktop, api-types) |
+| `pnpm -r test` | ok, 17 tests |
+| `pnpm audit` | no known vulnerabilities |
+| `pnpm check-types` (req 3.2) | ok |
+
+The working tree was still clean after all gates (no generated drift). GitHub
+Actions on the same commit (push to `main`, run 7) passed every job including
+**CI passed** (req 4.1).
+
+Desktop app built from the fresh clone and launched under Xvfb (`--no-sandbox`
+because the container runs as root): it renders `app://renderer/index.html`;
+the hardened web preferences, CSP header, blocked navigation and
+`window.open`, frozen empty `window.callsheet`, denied permissions and 404s for
+missing, escaping and malformed paths all hold.
+
+Feature 01 is done; `docs/ROADMAP.md` marks it `done`. Known gaps carried
+forward, by owner decision: requirement 4.2 (merge blocking) holds by convention
+while the repository is private (#28), and SECURITY.md uses a private contact
+request instead of private vulnerability reporting (6.1) until publication.
+Next: feature 02 (daemon-and-store) starts with `requirements.md` for owner
+approval.

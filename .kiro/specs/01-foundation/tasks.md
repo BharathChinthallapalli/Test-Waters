@@ -33,5 +33,5 @@
   - [x] 6.3 No LICENSE until ADR 0008 is Accepted
   - _Requirements: 6.1, 6.2, 6.3, 6.4_
 
-- [ ] 7. Checkpoint: fresh clone passes every quality gate; record result in docs/progress.md
+- [x] 7. Checkpoint: fresh clone passes every quality gate; record result in docs/progress.md
   - _Requirements: 1.1, 4.1_
