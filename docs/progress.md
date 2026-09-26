@@ -387,3 +387,21 @@ The resolved tree is 178 crates. `deny.toml` will need `BSD-3-Clause` (subtle) a
 - There's a clear message and docs for Linux without Secret Service (WSL, servers).
 - JSON-RPC batches follow section 6: an empty array gets one -32600 error, notifications
   get no entries, and an all-notification batch gets HTTP 204.
+
+## 2026-09-26 — desktop: renderer session stays on the machine (issue #33)
+
+The renderer made a network request of its own: Chromium's spellchecker was on for the
+session and tried to download a dictionary from a Google CDN.
+
+- `webPreferences.spellcheck` is `false`, and `session.setSpellCheckerEnabled(false)` turns it
+  off for the whole session (the window flag alone left the session spellchecker on).
+- `keepSessionOnMachine` (`apps/desktop/src/main/network.ts`) cancels every session request
+  whose URL isn't `app://`.
+
+Checked in the running app (local run as root, so `--no-sandbox`):
+
+| | Before | After |
+|---|---|---|
+| Session spellchecker | `true` | `false` |
+| Request to an off-machine URL | `ERR_TUNNEL_CONNECTION_FAILED` (it tried to leave) | `ERR_BLOCKED_BY_CLIENT` |
+| `app://renderer/index.html` | 200 | 200, title "Callsheet" |
