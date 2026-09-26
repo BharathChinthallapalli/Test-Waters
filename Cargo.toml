@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.98"
 repository = "https://github.com/BharathChinthallapalli/Test-Waters"
 publish = false
-# `license` is intentionally unset until ADR 0008 (licence) is Accepted.
+license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

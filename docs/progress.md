@@ -249,3 +249,41 @@ Still open for the owner (#15): the Biome row in `DECISIONS.md` (ADR 0004 is
 Accepted), the first proxy provider (with #5), and whether "no circuit breaker
 or retries in passthrough" gets its own ADR. From #11: the "no code copied from
 LGPL PI-Desktop" rule (CS-006) belongs in CONTRIBUTING (task 6.1).
+
+## 2026-09-26 — 01 foundation, task 6 (Add open-source files) and owner decisions
+
+Owner decisions recorded (2026-09-26):
+- Licence **MIT** (issue #4): ADR 0008 Accepted; `license = "MIT"` in
+  `[workspace.package]` (inherited by all four crates) and in the three
+  `package.json` files; the existing `LICENSE` stays. `deny.toml` now checks the
+  workspace's own crates against the allow list too (no `private.ignore`).
+- Repository stays **private** (issue #28, option 1): requirement 4.2 holds by
+  convention until publication (`docs/ci.md`); `SECURITY.md` uses a
+  "private contact request" issue until private vulnerability reporting can
+  be enabled at publication. This is the recorded deviation from 6.1's
+  "private vulnerability reporting".
+- "Decide what's best" for the rest of #15: Biome row closed (ADR 0004);
+  first proxy provider Anthropic (roadmap 03), OpenAI Responses stays in #5;
+  "no retries or circuit breaker in passthrough" recorded as ADR 0010.
+  `DECISIONS.md` now names the ADR next to each taken decision.
+
+Task 6 files: `README.md`, `CONTRIBUTING.md` (one task per PR, gates, licence
+of contributions, no LGPL/GPL copying from #11), `SECURITY.md`,
+`CODE_OF_CONDUCT.md` (Contributor Covenant 3.0 as published at
+EthicalSource/contributor_covenant `7255a28`, with only its two placeholders
+filled or removed), `AGENTS.md` (49 lines, points to `.kiro/steering`),
+`PRIVACY.md` (nothing leaves the machine by default; telemetry only ever
+opt-in), `.github/ISSUE_TEMPLATE/{bug_report,feature_request,config}.yml`,
+`.github/pull_request_template.md`.
+
+Checked: every relative link in the new docs resolves; issue forms have the
+required `name`/`description`/`body`, names over 3 characters and unique ids;
+`cargo metadata` reports MIT for all crates; all gates pass.
+
+Sources:
+- https://github.com/EthicalSource/contributor_covenant/blob/7255a28d23d5bc296de2e4e4e9bb5ee1126f1345/content/version/3/0/code_of_conduct.md
+- GitHub docs (github/docs `main`): syntax for issue forms, form schema,
+  configuring issue templates (`config.yml`), creating a pull request template.
+
+Follow-up: the security and conduct contact is an issue-based request for a
+private channel; add a dedicated contact address when the owner wants one.

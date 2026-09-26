@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in Callsheet doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't include API keys, auth headers, prompts or other private data.
+        Security problems go through [SECURITY.md](https://github.com/BharathChinthallapalli/Test-Waters/blob/main/SECURITY.md), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: e.g. main at 1a2b3c4
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Daemon, proxy or store (Rust)
+        - Desktop app
+        - Generated types
+        - CI or tooling
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 16, Windows 11, Ubuntu 24.04
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Remove any secrets or private content first.
+      render: text

@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a change or a new capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Callsheet is built one roadmap feature at a time ([docs/ROADMAP.md](https://github.com/BharathChinthallapalli/Test-Waters/blob/main/docs/ROADMAP.md)).
+        Ideas are welcome; they are scheduled against that order.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Callsheet do? Include sources (specs, docs) where relevant.
+    validations:
+      required: true
+  - type: input
+    id: roadmap
+    attributes:
+      label: Related roadmap feature
+      placeholder: e.g. 05 budgets
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

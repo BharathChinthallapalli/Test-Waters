@@ -1,6 +1,7 @@
 {
   "name": "@callsheet/api-types",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

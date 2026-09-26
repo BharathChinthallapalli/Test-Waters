@@ -36,6 +36,12 @@ blocked only when a ruleset on `main` requires the check. Required checks pass
 on `success`, `skipped` or `neutral`, so require only **CI passed**: it runs
 even when another job is skipped and fails if any job did not succeed.
 
+**While the repository is private, this is not available.** On GitHub Free,
+rulesets and branch protection need a public repository (or GitHub Pro). The
+owner chose to stay private for now (issue #28), so until publication the rule
+is a convention: merge only when **CI passed** is green. Set up the ruleset
+below as part of making the repository public.
+
 This is a GitHub setting, not a file, so a repository admin sets it once:
 
 1. Open the repository on GitHub and click **Settings**.
