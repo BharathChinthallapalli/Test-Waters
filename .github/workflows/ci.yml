@@ -47,7 +47,7 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
-      - run: cargo clippy -p cs-store --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test -p cs-store --locked fsperm
 
   cargo-deny:

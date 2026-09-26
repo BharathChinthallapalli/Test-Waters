@@ -87,9 +87,9 @@ mod imp {
 /// There is never a NULL DACL: the SDDL format cannot express one, and a
 /// descriptor without our ACE is never passed to a create call.
 ///
-/// Paths are made absolute and given the `\\?\` prefix the way `std::fs` does
-/// (`get_long_path` in `library/std/src/sys/path/windows.rs`), so paths longer
-/// than `MAX_PATH` work here exactly when they work for `std::fs`.
+/// Paths are made absolute and always given the `\\?\` prefix, like std's
+/// `get_long_path` (`library/std/src/sys/path/windows.rs`) except that std leaves
+/// short absolute paths unprefixed; either way paths longer than `MAX_PATH` work.
 #[cfg(windows)]
 #[allow(unsafe_code)] // FFI to Win32; each unsafe block states why it is sound.
 mod imp {
@@ -227,7 +227,10 @@ mod imp {
             Kind::Directory => "OICI",
             Kind::File => "",
         };
-        descriptor_from_sddl(&format!("D:P(A;{ace_flags};FA;;;{sid})"))
+        // `O:` makes the user the owner too. Without it an elevated process's
+        // objects are owned by BUILTIN\Administrators, and owners implicitly get
+        // READ_CONTROL and WRITE_DAC.
+        descriptor_from_sddl(&format!("O:{sid}D:P(A;{ace_flags};FA;;;{sid})"))
     }
 
     fn descriptor_from_sddl(sddl: &str) -> io::Result<LocalBuf> {
@@ -360,9 +363,9 @@ mod imp {
         Ok(wide)
     }
 
-    /// `path` as `std::fs` passes it to Windows (`get_long_path` with
-    /// `prefer_verbatim` in `library/std/src/sys/path/windows.rs`, Rust 1.98.1):
-    /// made absolute with `GetFullPathNameW` (through `std::path::absolute`),
+    /// `path` in verbatim form, like std's `get_long_path` with
+    /// `prefer_verbatim` (`library/std/src/sys/path/windows.rs`, Rust 1.98.1) but
+    /// for every length: made absolute with `GetFullPathNameW` (through `std::path::absolute`),
     /// then given the `\\?\` or `\\?\UNC\` prefix, which lifts the `MAX_PATH`
     /// limit (Microsoft Learn, "Naming Files, Paths, and Namespaces"). Paths that
     /// are already verbatim are passed unchanged.
@@ -415,9 +418,19 @@ mod imp {
             ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
             SE_FILE_OBJECT,
         };
-        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
 
         pub(in super::super) fn dacl_sddl(path: &Path) -> io::Result<String> {
+            security_sddl(path, DACL_SECURITY_INFORMATION)
+        }
+
+        pub(in super::super) fn owner_sddl(path: &Path) -> io::Result<String> {
+            security_sddl(path, OWNER_SECURITY_INFORMATION)
+        }
+
+        fn security_sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> io::Result<String> {
             let path = wide_path(path)?;
             let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
             // SAFETY: `path` is NUL-terminated; the SID and ACL out pointers may
@@ -426,7 +439,7 @@ mod imp {
                 GetNamedSecurityInfoW(
                     path.as_ptr(),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
+                    info,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -437,14 +450,18 @@ mod imp {
             if status != 0 {
                 return Err(io::Error::from_raw_os_error(status as i32));
             }
-            dacl_to_sddl(&LocalBuf(descriptor))
+            to_sddl(&LocalBuf(descriptor), info)
         }
 
         pub(in super::super) fn normalise(sddl: &str) -> io::Result<String> {
-            dacl_to_sddl(&descriptor_from_sddl(sddl)?)
+            to_sddl(&descriptor_from_sddl(sddl)?, DACL_SECURITY_INFORMATION)
         }
 
-        fn dacl_to_sddl(descriptor: &LocalBuf) -> io::Result<String> {
+        pub(in super::super) fn normalise_owner(sddl: &str) -> io::Result<String> {
+            to_sddl(&descriptor_from_sddl(sddl)?, OWNER_SECURITY_INFORMATION)
+        }
+
+        fn to_sddl(descriptor: &LocalBuf, info: OBJECT_SECURITY_INFORMATION) -> io::Result<String> {
             let mut string: *mut u16 = ptr::null_mut();
             // SAFETY: `descriptor` holds a valid descriptor; `string` is a valid
             // out pointer; the length out pointer may be null.
@@ -452,7 +469,7 @@ mod imp {
                 ConvertSecurityDescriptorToStringSecurityDescriptorW(
                     descriptor.0,
                     SDDL_REVISION_1,
-                    DACL_SECURITY_INFORMATION,
+                    info,
                     &mut string,
                     ptr::null_mut(),
                 )
@@ -558,10 +575,14 @@ mod tests {
         (flags.to_owned(), aces)
     }
 
-    /// The DACL of `path` is protected and holds exactly one ACE: allow full
-    /// access to the current user, with `ace_flags`.
+    /// `path` is owned by the current user, and its DACL is protected and holds
+    /// exactly one ACE: allow full access to the current user, with `ace_flags`.
     fn assert_owner_only(path: &Path, ace_flags: &str) {
         assert_single_ace(path, ace_flags, true);
+        let sid = current_user_sid().unwrap();
+        let expected = inspect::normalise_owner(&format!("O:{sid}")).unwrap();
+        let actual = inspect::owner_sddl(path).unwrap();
+        assert_eq!(actual, expected, "owner of {}", path.display());
     }
 
     /// The DACL of `path` holds exactly one ACE, allowing full access to the

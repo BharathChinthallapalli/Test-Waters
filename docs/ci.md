@@ -6,7 +6,7 @@
 | Job | Gates |
 |---|---|
 | Rust (fmt, clippy, test) | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` |
-| Rust on Windows (owner-only files) | `cargo clippy -p cs-store --all-targets --locked -- -D warnings`, `cargo test -p cs-store --locked fsperm` on `windows-2025` |
+| Rust on Windows (owner-only files) | `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test -p cs-store --locked fsperm` on `windows-2025` |
 | Rust dependencies (cargo-deny) | `cargo deny check` (licences, advisories, bans, sources; see `deny.toml`) |
 | TypeScript (Biome, typecheck, test, audit) | `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test`, `pnpm audit` |
 | Generated types are current | `node scripts/gen-types.ts --check` (ADR 0009) |
