@@ -226,7 +226,9 @@ fn read_id(object: &Map<String, Value>) -> IdMember {
         // Fractions and integers a JavaScript client can't hold exactly can't be
         // echoed back faithfully, so the request is invalid.
         Some(Value::Number(number)) => match number.as_i64() {
-            Some(id) if id.abs() <= MAX_SAFE_ID => IdMember::Valid(Some(RequestId::Number(id))),
+            Some(id) if (-MAX_SAFE_ID..=MAX_SAFE_ID).contains(&id) => {
+                IdMember::Valid(Some(RequestId::Number(id)))
+            }
             _ => IdMember::Unreadable,
         },
         Some(_) => IdMember::Unreadable,
@@ -392,6 +394,9 @@ pub(crate) mod tests {
             r#"{"jsonrpc":"2.0","method":"echo","id":18446744073709551615}"#,
             r#"{"jsonrpc":"2.0","method":"echo","id":9007199254740992}"#,
             r#"{"jsonrpc":"2.0","method":"echo","id":-9007199254740992}"#,
+            // i64::MIN has no positive counterpart; `abs()` on it overflows.
+            r#"{"jsonrpc":"2.0","method":"echo","id":-9223372036854775808}"#,
+            r#"{"jsonrpc":"2.0","method":"echo","id":9223372036854775807}"#,
             r#"{"jsonrpc":"1.0","method":"echo"}"#,
             r#"{"foo":"boo"}"#,
         ];

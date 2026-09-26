@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cs_daemon::http::{HttpConfig, StaticToken, router};
 use cs_daemon::rpc::{Handler, RpcError};
@@ -23,12 +24,20 @@ impl Handler for Version {
     }
 }
 
+/// Fails instead of hanging CI if a regression keeps the connection open.
+const EXCHANGE_LIMIT: Duration = Duration::from_secs(5);
+
 async fn exchange(addr: SocketAddr, raw_request: String) -> String {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream.write_all(raw_request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    response
+    let round_trip = async {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw_request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    };
+    tokio::time::timeout(EXCHANGE_LIMIT, round_trip)
+        .await
+        .expect("the server kept the connection open")
 }
 
 fn post(addr: SocketAddr, authorization: &str, body: &str) -> String {
