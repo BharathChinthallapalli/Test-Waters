@@ -75,3 +75,17 @@ Follow-ups:
 - Owner review: ADRs 0001–0007 are marked Accepted because they restate
   decisions already in `.kiro/steering/`; the specific pins in 0005 and the
   Merkle-tree consequence in 0007 are new detail worth a look.
+
+### PR #3 review changes (task 2)
+
+- ADR 0005: Trace Context now pins Level 1 from the `level-1` branch (commit
+  `6f387678`), `sampled` flag only; the `main` branch is the Level 3 draft.
+- ADR 0007: event hashing fully fixed (one chain per run, hash input = JCS of
+  the event without `event_hash`, hex encoding, all-zero genesis, Merkle leaves
+  in daemon commit order). Separate root key (DSSE only) and checkpoint key
+  (signed notes only); hire records bind the worker public key.
+- ADR 0006: content blobs addressed by HMAC-SHA-256 with a per-install key;
+  no content reference at all when capture is off.
+- ADR 0003: exact `Host` value, `Authorization: Bearer`, token held only by the
+  Electron main process.
+- ADR 0008 links issue #4 (licence decision).

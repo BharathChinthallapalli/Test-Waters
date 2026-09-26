@@ -25,7 +25,7 @@ The GenAI pin is therefore a commit of that repository.
 | OTel GenAI semantic conventions | semantic-conventions-genai commit `e57c543b4889619eb2a05702471937db5119165d` (2026-09-24) | Development |
 | MCP | revision `2026-07-28`, tag `2026-07-28`, commit `5f5440bb26a62e2cf3440b92da5a667efa03b267` | Current revision (`LATEST_PROTOCOL_VERSION`) |
 | ACP | wire protocol version `1`; JSON Schema `schema-v1.23.0` (commit `6d08f412a7a1370d3cc9a124e3be3d6acf92641e`); read at repo tag `v1.9.1` (commit `7e87dc205a7325bd07d0249fd20bb7486ee6ba95`) | Stable; v2 schema is `2.0.0-alpha.5` and is not used |
-| W3C Trace Context | Trace Context Level 1 (W3C Recommendation), `traceparent` version `00` | Recommendation |
+| W3C Trace Context | Trace Context Level 1 (W3C Recommendation), `traceparent` version `00`, `sampled` flag only; read at w3c/trace-context branch `level-1`, commit `6f387678ddd3c8eaadc1248e28f48e44b5815532` | Recommendation |
 | Rate limiting | HTTP 429 (RFC 6585 §4) with `Retry-After` (RFC 9110 §10.2.3) | Both Standards Track |
 | Rate-limit headers | `draft-ietf-httpapi-ratelimit-headers-11`, informational only | Internet-Draft |
 | Attestations | in-toto Statement v1 (`_type` `https://in-toto.io/Statement/v1`), attestation repo `v1.2.0` | Stable |
@@ -60,9 +60,11 @@ Rules that follow from these pins:
   and RateLimit-Policy headers from draft-11 may be added as information for
   clients; nothing depends on them. When both are sent, `Retry-After` takes
   precedence, as draft-11 requires.
-- **Trace Context.** Propagate `traceparent` version `00`: 32 lowercase hex
-  trace-id, 16 lowercase hex parent-id, 2 hex trace-flags; all-zero ids are
-  invalid.
+- **Trace Context.** Propagate `traceparent` version `00` as defined by
+  Level 1: 32 lowercase hex trace-id, 16 lowercase hex parent-id, 2 hex
+  trace-flags; all-zero ids are invalid. Level 1 defines only the `sampled`
+  flag (`0x01`). Callsheet does not set or rely on the `random` flag from
+  later levels; adopting it means pinning Level 2 in this ADR first.
 - **Watch, don't depend.** The agent-identity individual drafts (AIMS, AIP,
   PEDIGREE) are not pinned; nothing may depend on them.
 
@@ -110,11 +112,15 @@ environment, so the Git sources were used):
   ("The current stable ACP protocol version is `1`"),
   `docs/protocol/v1/transports.mdx`, `docs/protocol/v1/overview.mdx`,
   `schema/v1/Cargo.toml` (`1.23.0`) and `schema/v1/meta.json` (`"version": 1`).
-- W3C Trace Context: https://www.w3.org/TR/trace-context-1/ — source
+- W3C Trace Context Level 1: https://www.w3.org/TR/trace-context-1/ —
+  Recommendation status stated in
   https://github.com/w3c/trace-context/blob/acab820be9db7b3433668baa5cdd43f57f4c4be0/README.md
-  ("Trace Context v1 has W3C Recommendation status") and
-  `spec/20-http_request_header_format.md` (traceparent grammar for version
-  `00`, read from the editor's draft at that commit).
+  ("Trace Context v1 has W3C Recommendation status"). The `traceparent`
+  grammar and flags were read from the Level 1 maintenance branch:
+  https://github.com/w3c/trace-context/blob/6f387678ddd3c8eaadc1248e28f48e44b5815532/spec/20-http_header_format.md
+  ("The current version of this specification (`00`) only supports a single
+  flag called `sampled`"). The repository's `main` branch is the Level 3
+  editor's draft and was not used for this pin.
 - RFC 6585 §4 (429): https://www.rfc-editor.org/rfc/rfc6585#section-4 —
   read from https://github.com/httpwg/httpwg.github.io/blob/main/specs/rfc6585.html
 - RFC 9110 §10.2.3 (Retry-After): https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3 —

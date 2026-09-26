@@ -26,11 +26,16 @@ connection.
 
 - The control API is JSON-RPC 2.0 carried over HTTP on 127.0.0.1 only.
 - Each install generates a random token at first start, stored in a file
-  readable only by the owning OS user. Every request must present it; the
-  daemon compares it in constant time and never logs it.
+  readable only by the owning OS user. Every request must present it as
+  `Authorization: Bearer <token>`; the daemon compares it in constant time
+  and never logs it.
+- In the desktop app, only the Electron main process reads the token file and
+  calls the daemon. The renderer never sees the token; it reaches the daemon
+  only through the narrow preload API.
 - The daemon rejects requests whose `Origin` header is present and not an
-  allowed Callsheet client, and requests whose `Host` is not the loopback
-  address it bound.
+  allowed Callsheet client, and requests whose `Host` header is not exactly
+  `127.0.0.1:<bound port>`. Clients connect by that address, not by
+  `localhost`, so no other `Host` value is accepted.
 - Method names, parameters and errors are Rust types in `cs-core`, exported to
   TypeScript (feature 01, task 4). The first methods are `health` and
   `version` (feature 02).

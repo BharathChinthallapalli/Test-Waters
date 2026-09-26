@@ -39,7 +39,14 @@ over OTLP.
   ids, and cost. Storing message bodies requires an explicit user setting.
 - When content capture is on, content comes from Callsheet's own proxy (or,
   in hosted mode, from the ACP stream), never from OTLP content attributes.
-  Each message is stored once, content-addressed by SHA-256.
+  Each message is stored once, addressed by HMAC-SHA-256 keyed with a
+  per-install secret held in the OS keychain. A plain SHA-256 address would
+  let anyone holding the log confirm a guessed low-entropy message (a short
+  prompt, a common system prompt, a known file) and would link identical
+  content across installs; the keyed address still de-duplicates within one
+  install.
+- With content capture off, events carry no content reference and no content
+  hash of any kind.
 - API keys and auth headers are never recorded in either mode.
 
 ## Consequences
@@ -54,6 +61,9 @@ over OTLP.
   guarantees apply in which mode.
 - Two ingestion paths (proxy and OTLP) can describe the same call; features
   03 and 09 must de-duplicate them, for example by trace and span id.
+- Content addresses can only be recomputed with the install's content key,
+  so backup and restore (feature 14) must carry that key, and an export meant
+  for independent verification must include the content itself.
 
 ## Sources
 
@@ -61,6 +71,9 @@ over OTLP.
   attributes (`gen_ai.input.messages`, `gen_ai.output.messages`,
   `gen_ai.system_instructions`, `gen_ai.tool.definitions`) marked `Opt-In`:
   https://github.com/open-telemetry/semantic-conventions-genai/blob/e57c543b4889619eb2a05702471937db5119165d/docs/gen-ai/gen-ai-spans.md
+- HMAC (RFC 2104): https://www.rfc-editor.org/rfc/rfc2104 — not reachable
+  from the authoring environment; the feature that implements content
+  capture reads it and picks a maintained library.
 - ACP v1 client methods (`session/request_permission`, `fs/read_text_file`,
   `fs/write_text_file`, `terminal/*`):
   https://github.com/agentclientprotocol/agent-client-protocol/blob/v1.9.1/docs/protocol/v1/overview.mdx

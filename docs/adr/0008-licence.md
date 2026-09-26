@@ -13,7 +13,8 @@ decide; it does not choose.
 Feature 01 requirement 6.4 says no LICENSE file is added while this ADR is
 Proposed. However, the repository already contains an MIT `LICENSE` from its
 initial commit, created before the spec existed. That file was left
-untouched; resolving the conflict is part of this decision.
+untouched; resolving the conflict is part of this decision. Tracked in
+issue #4.
 
 Options:
 
