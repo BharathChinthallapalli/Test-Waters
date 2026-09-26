@@ -6,9 +6,9 @@
   - [x] 1.3 pnpm-workspace.yaml, root package.json scripts, biome.json
   - _Requirements: 1.1, 1.2, 1.3, 1.4_
 
-- [ ] 2. Record architecture decisions
-  - [ ] 2.1 docs/adr/template.md and ADRs 0001–0007 with sources
-  - [ ] 2.2 ADR 0008 licence with status Proposed (owner decision)
+- [x] 2. Record architecture decisions
+  - [x] 2.1 docs/adr/template.md and ADRs 0001–0007 with sources
+  - [x] 2.2 ADR 0008 licence with status Proposed (owner decision)
   - _Requirements: 5.1, 5.2, 5.3_
 
 - [ ] 3. Build the hardened desktop shell
