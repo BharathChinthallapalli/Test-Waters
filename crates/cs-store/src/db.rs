@@ -3,11 +3,16 @@
 //! Owned by unit `schema`: the writer connection and the read-only connection, each
 //! with `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and
 //! `secure_delete=ON`. The database file is created owner-only through
-//! [`crate::fsperm`] before SQLite opens it; SQLite gives its `-wal` and `-shm`
-//! files the same permissions as the database file.
+//! [`crate::fsperm`] before SQLite opens it. Its `-wal` and `-shm` files are
+//! owner-only too, for a different reason on each platform:
+//! - On Windows, `winOpen` passes no security descriptor to `CreateFileW`, so they
+//!   inherit the data directory's inheritable ACEs. That is owner-only only for a
+//!   data directory created by `fsperm` (a protected DACL with `OICI`); the daemon
+//!   creates its data directory that way (task 8).
+//! - On Unix, SQLite gives them the database file's permissions.
 //!
-//! How that holds, in the SQLite 3.53.2 source bundled by `libsqlite3-sys` 0.38.2
-//! (`sqlite3/sqlite3.c`):
+//! How the Unix case holds, in the SQLite 3.53.2 source bundled by
+//! `libsqlite3-sys` 0.38.2 (`sqlite3/sqlite3.c`):
 //! - `findCreateFileMode` gives a file opened with `SQLITE_OPEN_WAL` or
 //!   `SQLITE_OPEN_MAIN_JOURNAL` the mode, uid and gid of its database file.
 //! - `unixOpenSharedMemory` creates `-shm` with `sStat.st_mode & 0777` of the
@@ -54,8 +59,9 @@ pub enum OpenError {
         expected: &'static str,
         found: String,
     },
-    /// The schema is newer than this build knows; the file was left untouched
-    /// (R3.3).
+    /// The schema is newer than this build knows. The database file and the
+    /// contents of its WAL were left unchanged (R3.3); SQLite may have created
+    /// empty `-wal`/`-shm` files beside it.
     UnsupportedSchema(UnsupportedSchema),
 }
 
@@ -93,9 +99,14 @@ pub fn database_path(data_dir: &Path) -> PathBuf {
 /// if there is none.
 ///
 /// Refuses a database whose schema is newer than this build knows before any
-/// pragma runs, reading its version through a read-only connection, which never
-/// writes to the file (not even a checkpoint on close). The schema itself is
-/// brought up to date by `crate::migrate::migrate`.
+/// pragma runs, reading its version through a read-only connection. That
+/// connection never changes the database file or its WAL's contents (not even a
+/// checkpoint on close), though SQLite may create empty `-wal`/`-shm` files. The
+/// one exception is a hot rollback journal left by a crash, which a read-only
+/// connection can't recover (`SQLITE_READONLY_ROLLBACK`): the version is then
+/// read through a read-write connection, which rolls the unfinished transaction
+/// back first, as any SQLite client would. The schema itself is brought up to
+/// date by `crate::migrate::migrate`.
 pub fn open_writer(data_dir: &Path) -> Result<Connection, OpenError> {
     let path = database_path(data_dir);
     create_owner_only_if_missing(&path)?;
@@ -155,10 +166,29 @@ fn create_owner_only_if_missing(path: &Path) -> Result<(), OpenError> {
 }
 
 fn refuse_unsupported_schema(path: &Path) -> Result<(), OpenError> {
-    let probe = open_read_only(path)?;
-    let found = migrate::schema_version(&probe).map_err(sqlite_error(path))?;
+    let found = match schema_version_at(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Err(error) if needs_rollback(&error) => {
+            schema_version_at(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        }
+        other => other,
+    }
+    .map_err(sqlite_error(path))?;
     migrate::ensure_supported(found).map_err(OpenError::UnsupportedSchema)?;
     Ok(())
+}
+
+fn schema_version_at(path: &Path, access: OpenFlags) -> rusqlite::Result<i64> {
+    let conn = Connection::open_with_flags(path, access | common_flags())?;
+    migrate::schema_version(&conn)
+}
+
+/// A hot rollback journal that a read-only connection can't roll back.
+fn needs_rollback(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+    )
 }
 
 /// Sets the four pragmas and reads each one back.
@@ -313,6 +343,46 @@ mod tests {
             std::fs::read(&path).unwrap() == before,
             "database file changed"
         );
+    }
+
+    /// A crash in rollback-journal mode (for example a restored `VACUUM INTO`
+    /// backup, before its first switch to WAL) leaves a hot `-journal`. A
+    /// read-only probe can't roll it back (`SQLITE_READONLY_ROLLBACK`), which
+    /// must not block every later startup.
+    #[test]
+    fn a_hot_rollback_journal_is_recovered_not_fatal() {
+        let crashed = tempfile::tempdir().unwrap();
+        let path = crashed.path().join(DATABASE_FILE_NAME);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA cache_size=1;
+             CREATE TABLE t (v BLOB); INSERT INTO t VALUES (zeroblob(100000));",
+        )
+        .unwrap();
+        // A transaction big enough to spill to the database file, so the journal
+        // is hot; copying both files mid-transaction is what a crash leaves.
+        conn.execute_batch("BEGIN; UPDATE t SET v = zeroblob(200000);")
+            .unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        for name in ["callsheet.db", "callsheet.db-journal"] {
+            std::fs::copy(crashed.path().join(name), copy.path().join(name)).unwrap();
+        }
+        drop(conn);
+        let probe = schema_version_at(
+            &copy.path().join(DATABASE_FILE_NAME),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        );
+        assert!(
+            probe.as_ref().is_err_and(needs_rollback),
+            "the copy should need a rollback: {probe:?}"
+        );
+
+        let writer = open_writer(copy.path()).unwrap();
+
+        let size: i64 = writer
+            .query_row("SELECT length(v) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(size, 100_000, "the unfinished update was rolled back");
     }
 
     /// A newer daemon that crashed leaves committed frames in `-wal`. A read-write

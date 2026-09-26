@@ -93,6 +93,9 @@ pub enum MigrateError {
     UnsupportedSchema(UnsupportedSchema),
     /// Reading the schema version or contents failed; nothing was changed.
     Sqlite(rusqlite::Error),
+    /// The file has tables but no Callsheet schema version: some other
+    /// program's SQLite database. Nothing was changed.
+    NotCallsheet { objects: i64 },
     /// Replacing or creating the backup file failed; nothing was migrated.
     BackupFile { path: PathBuf, source: io::Error },
     /// `VACUUM INTO` the backup failed; nothing was migrated.
@@ -113,6 +116,11 @@ impl fmt::Display for MigrateError {
         match self {
             Self::UnsupportedSchema(inner) => inner.fmt(f),
             Self::Sqlite(source) => write!(f, "cannot read the database schema: {source}"),
+            Self::NotCallsheet { objects } => write!(
+                f,
+                "the database holds {objects} schema objects but no Callsheet schema version, \
+                 so it is not a Callsheet database; refusing to modify it"
+            ),
             Self::BackupFile { path, source } => {
                 write!(f, "cannot create backup {}: {source}", path.display())
             }
@@ -159,8 +167,10 @@ pub fn ensure_supported(found: i64) -> Result<u32, UnsupportedSchema> {
 
 /// Brings the writer connection's database to [`CURRENT_SCHEMA_VERSION`].
 ///
-/// A fresh database (version 0 and no schema) is migrated directly. An existing
-/// one with pending migrations is first copied to `<data dir>/backup-v<from>.db`.
+/// A fresh database (version 0 and no schema) is migrated directly; version 0
+/// with tables is some other program's database and is refused. An existing
+/// Callsheet database with pending migrations is first copied to
+/// `<data dir>/backup-v<from>.db`.
 /// Running it again on an up-to-date database changes nothing (R3.2).
 pub fn migrate(conn: &mut Connection, data_dir: &Path) -> Result<Migrated, MigrateError> {
     migrate_with(conn, data_dir, MIGRATIONS)
@@ -230,7 +240,15 @@ fn migrate_with(
         });
     }
 
-    let backup = if is_fresh(conn, from)? {
+    if from == 0 {
+        // Migration 1 runs in one transaction, so a Callsheet database at
+        // version 0 is always empty.
+        let objects = schema_objects(conn)?;
+        if objects > 0 {
+            return Err(MigrateError::NotCallsheet { objects });
+        }
+    }
+    let backup = if from == 0 {
         None
     } else {
         Some(back_up(conn, data_dir, from)?)
@@ -248,15 +266,9 @@ fn migrate_with(
     })
 }
 
-/// Version 0 with nothing in `sqlite_schema`: a database created just now.
-fn is_fresh(conn: &Connection, version: u32) -> Result<bool, MigrateError> {
-    if version != 0 {
-        return Ok(false);
-    }
-    let objects: i64 = conn
-        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
-        .map_err(MigrateError::Sqlite)?;
-    Ok(objects == 0)
+fn schema_objects(conn: &Connection) -> Result<i64, MigrateError> {
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .map_err(MigrateError::Sqlite)
 }
 
 /// Writes `backup-v<from>.db` through `backup-v<from>-next.db`. A backup of the
@@ -286,7 +298,22 @@ fn back_up(conn: &Connection, data_dir: &Path, from: u32) -> Result<PathBuf, Mig
         return Err(MigrateError::Backup { path: next, source });
     }
     fs::rename(&next, &path).map_err(file_error(&path))?;
+    // The migration commits with synchronous=FULL; make the backup's name just as
+    // durable first, so a power cut can't leave a migrated database without it.
+    sync_dir(data_dir).map_err(file_error(&path))?;
     Ok(path)
+}
+
+/// Makes a rename in `dir` durable (POSIX needs an fsync of the directory).
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// `MoveFileExW`, which `fs::rename` uses, needs no directory flush on Windows.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -337,6 +364,24 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn another_programs_database_is_refused_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(dir.path());
+        conn.execute_batch("CREATE TABLE notes (text TEXT); INSERT INTO notes VALUES ('x');")
+            .unwrap();
+
+        let error = migrate(&mut conn, dir.path()).unwrap_err();
+
+        assert!(
+            matches!(error, MigrateError::NotCallsheet { objects: 1 }),
+            "{error}"
+        );
+        assert_eq!(schema_version(&conn).unwrap(), 0);
+        assert_eq!(count(&conn, "notes"), 1);
+        assert!(!backup_path(dir.path(), 0).exists());
     }
 
     #[test]
