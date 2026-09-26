@@ -25,7 +25,7 @@
     `SECURITY.md`).
 18. Deleting erases stored content and keeps event hashes, so the chain and checkpoints
     always verify; erased events show "content erased" (owner decision 2026-09-26,
-    issue #7; ADR in feature 02's design).
+    issue #7; ADR 0011).
 
 ## Open (owner decisions — sessions must not guess)
 | Decision | Options | Blocks |

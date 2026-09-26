@@ -356,3 +356,20 @@ content is erased (a new event records the erasure).
   `VACUUM INTO` before migrations, request size and timeout limits, stale discovery file
   (pid and start time, check the instance lock), and exercising capture-enabled paths on CI
   without a keychain (injectable secret store in tests).
+
+## 2026-09-26 — 02 daemon-and-store: design drafted
+
+`.kiro/specs/02-daemon-and-store/design.md` and ADR 0011 (erase content, keep hashes) are
+ready for owner approval; `tasks.md` waits for it.
+
+Choices worth knowing:
+- Hand-written JSON-RPC over axum 0.8.9 instead of jsonrpsee.
+- One writer thread for SQLite, with triggers that forbid UPDATE/DELETE on `events`.
+- `etcetera` instead of `directories`, which pulls MPL-2.0 `option-ext`.
+- std `File::try_lock` instead of `fs4`.
+- keyring-core with per-platform stores and its `mock` store in tests.
+- Unix-millisecond timestamps, safe under 2^53.
+- `VACUUM INTO` backup before migrations.
+
+The resolved tree is 178 crates. `deny.toml` will need `BSD-3-Clause` (subtle) and `Zlib`
+(foldhash).
