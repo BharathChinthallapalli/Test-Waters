@@ -138,3 +138,19 @@ Follow-ups:
   fine in the sandboxed preload (verified above), but switch to a bundler if
   the preload ever needs more than `require("electron")`.
 - Packaging (fuses, code signing, `asar`) belongs to the release feature.
+
+## 2026-09-26 — Imported planning docs
+
+Added `docs/README.md`, `docs/VISION.md`, `docs/RESEARCH.md` and
+`docs/DECISIONS.md` verbatim from the owner's planning archive
+(`callsheet-complete.zip`, commit `eca1392`). The archive's other files were
+older copies of files already here, so the repository versions were kept.
+
+Needs an owner look (the imported text was not edited):
+- `DECISIONS.md` lists "Lint for TS: Biome or ESLint" as open, but task 1.3
+  already uses Biome and ADR 0004 records it as Accepted. Either close that row
+  or supersede ADR 0004.
+- `DECISIONS.md` lists "Type generator: ts-rs or schemars" as an owner
+  decision; task 4.1 depends on it.
+- The "Taken" list says the decisions are "to be recorded as ADRs"; they now
+  are (ADRs 0001–0007).
