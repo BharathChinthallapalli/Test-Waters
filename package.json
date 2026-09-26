@@ -5,6 +5,7 @@
   "scripts": {
     "check": "biome check .",
     "format": "biome format --write .",
+    "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
