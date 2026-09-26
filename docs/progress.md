@@ -341,3 +341,18 @@ Inputs used: ADRs 0001–0003, 0006, 0007, 0009; backlog CS-101–CS-103; issues
 Differences from the backlog: content addresses are HMAC-SHA-256 with a per-install key
 (ADR 0006), not plain SHA-256; the event log never updates or deletes rows even when
 content is erased (a new event records the erasure).
+
+### 02 requirements amended after the owner's review on PR #32
+
+- R2.4: any request carrying an `Origin` header is rejected (no allowlist to configure).
+- R2.9 (new): token rotation invalidates the old token at once; clients re-read the token
+  file once after a 401 (ADR 0003).
+- R4.3/R4.5: the global commit order is gap-free, so verification catches removals anywhere
+  except at its very end; R4.6 (new) documents that tail truncation is only detectable from
+  feature 04's signed checkpoints.
+- R6.1/R6.2: erasure lists the other runs sharing the content first, erases only after
+  confirmation, and has a dry run.
+- Left for design.md: timestamp wire format (no `u64` nanoseconds over JSON), backup via
+  `VACUUM INTO` before migrations, request size and timeout limits, stale discovery file
+  (pid and start time, check the instance lock), and exercising capture-enabled paths on CI
+  without a keychain (injectable secret store in tests).
