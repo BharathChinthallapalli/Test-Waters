@@ -44,6 +44,13 @@ pnpm --filter @callsheet/desktop start   # opens the desktop shell
 
 All quality gates and how CI runs them: [docs/ci.md](docs/ci.md).
 
+Platform note: content capture (off by default) needs an operating-system
+keychain: macOS Keychain, Windows Credential Manager, or a Secret Service
+provider on Linux. Without one, Callsheet keeps content capture off and never
+falls back to keeping its content key in a file. On Linux without a Secret
+Service provider it says: "No Secret Service keychain was found (common on WSL
+and servers), so content capture stays off." Details: [PRIVACY.md](PRIVACY.md).
+
 ## Contributing, security and privacy
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to work on a task

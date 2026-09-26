@@ -26,6 +26,22 @@ explanation, as quickly as a one-person project allows.
 Callsheet is pre-alpha and has no releases yet. Only the `main` branch is
 supported.
 
+## Local control API
+
+The Callsheet daemon (feature 02, being built) is controlled through a small
+JSON-RPC API ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)). It is
+reachable only by programs on your machine that can read your token:
+
+- It listens on `127.0.0.1` only. The daemon refuses to start with any other
+  listen address.
+- Every request needs a bearer token. The token is random (256 bits), kept in
+  a file only your user account can read, and never written to logs.
+- Any request with an `Origin` header, or with a `Host` header other than
+  exactly `127.0.0.1:<port>`, is rejected, so web pages open in a browser
+  can't use the API.
+- The token can be rotated (the `token.rotate` call; there is no command-line
+  or desktop control for it yet). The old token stops working at once.
+
 ## Scope and design limits
 
 Callsheet runs locally. Some limits are deliberate and documented rather than
@@ -33,9 +49,18 @@ hidden:
 
 - Any process running as the same operating-system user can read the local
   control-API token ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)).
-- The event log is **tamper-evident, not tamper-proof**: someone with full
-  control of the machine and its keychain can rewrite history, but not without
-  breaking checkpoints that were already exported
-  ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)).
+- The event log is **tamper-evident, not tamper-proof**
+  ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)). Each run's events
+  are hash-chained and every event records its place in the daemon's global
+  commit order, so verification detects an event that was edited, reordered
+  or inserted, or removed from the middle of the log.
+- Until signed checkpoints exist (feature 04), a hash chain has no outside
+  anchor to compare against. So **removing the most recent events** (the end
+  of the global commit order) cannot be detected, and someone who can write
+  the database can change events and recompute every hash after them without
+  verification noticing.
+- Once checkpoints exist, someone with full control of the machine and its
+  keychain can still rewrite history, but not without breaking checkpoints
+  that were already exported.
 
 Reports that show these limits being worse than documented are in scope.
