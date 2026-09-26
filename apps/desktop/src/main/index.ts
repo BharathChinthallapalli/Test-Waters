@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, protocol, session } from "electron";
 import { CONTENT_SECURITY_POLICY } from "./csp.ts";
 import { blockNavigation } from "./navigation.ts";
+import { denyAllPermissions } from "./permissions.ts";
 import {
   APP_SCHEME,
   RENDERER_URL,
@@ -44,9 +45,7 @@ async function serveRendererFile(request: Request): Promise<Response> {
 
 async function start(): Promise<void> {
   await app.whenReady();
-  session.defaultSession.setPermissionRequestHandler(
-    (_contents, _permission, callback) => callback(false),
-  );
+  denyAllPermissions(session.defaultSession);
   protocol.handle(APP_SCHEME, serveRendererFile);
 
   const window = new BrowserWindow(createWindowOptions(preloadPath));

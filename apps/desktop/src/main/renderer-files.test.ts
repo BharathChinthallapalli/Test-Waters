@@ -35,6 +35,12 @@ test("encoded paths that escape the renderer directory are refused", () => {
   }
 });
 
+test("malformed percent-escapes are refused, not thrown", () => {
+  for (const url of ["app://renderer/%", "app://renderer/%E0%A4%A"]) {
+    assert.equal(resolveRendererFile(url, root), null, url);
+  }
+});
+
 test("other hosts, schemes and file types are refused", () => {
   assert.equal(resolveRendererFile("app://other/index.html", root), null);
   assert.equal(resolveRendererFile("https://renderer/index.html", root), null);
