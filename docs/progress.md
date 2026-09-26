@@ -230,3 +230,22 @@ databases, so `main` can turn red without a code change.
 
 Follow-ups: Dependabot/Renovate and zizmor were left out by owner choice; the
 SHA pins and the Electron update policy (#8) need one of them later.
+
+## 2026-09-26 — Docs fixes from issues #15 and #11
+
+- ADR 0005: MCP Streamable HTTP request headers (`MCP-Protocol-Version`,
+  required `Mcp-Method`, `Mcp-Name` for `tools/call`/`resources/read`/
+  `prompts/get`; `HeaderMismatchError` -32020 with HTTP 400), re-verified at the
+  pinned tag `5f5440bb`.
+- `docs/README.md` points at the first unticked task instead of "task 1".
+- `docs/backlog-notes.json`: project renamed to Callsheet, `BB-*` ids to
+  `CS-*` (including `dependsOn`), `bb-*` crates to `cs-*`,
+  `blackbox.cost.*` to `callsheet.cost.*`; `CONTEXT.md` and `tasks.json`
+  references now point at `.kiro/steering/` and `.kiro/specs/<feature>/tasks.md`;
+  every story has a `roadmapFeature`. Checked: all 30 stories are identical to
+  the previous file apart from these renames.
+
+Still open for the owner (#15): the Biome row in `DECISIONS.md` (ADR 0004 is
+Accepted), the first proxy provider (with #5), and whether "no circuit breaker
+or retries in passthrough" gets its own ADR. From #11: the "no code copied from
+LGPL PI-Desktop" rule (CS-006) belongs in CONTRIBUTING (task 6.1).

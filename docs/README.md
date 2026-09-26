@@ -11,5 +11,5 @@
 | ../.kiro/steering/ | Always-loaded rules for any coding agent: product, tech, structure, workflow |
 | ../.kiro/specs/01-foundation/ | The only active spec: requirements → design → tasks |
 
-**How to work:** open `.kiro/specs/01-foundation/tasks.md`, run task 1 on its own, follow
-`.kiro/steering/workflow.md`. Write the next spec only when the current one is done.
+**How to work:** open the active spec's `tasks.md`, run the first unticked task on its own,
+follow `.kiro/steering/workflow.md`. Write the next spec only when the current one is done.
