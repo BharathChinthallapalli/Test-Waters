@@ -21,6 +21,6 @@ pub mod observe;
 pub mod recorder;
 pub mod trace;
 
-pub use forward::{Proxy, ProxyBody, ProxyConfig, Upstream, UpstreamError};
+pub use forward::{Proxy, ProxyBody, ProxyConfig, Upstream, UpstreamBodyFailed, UpstreamError};
 pub use observe::{Observed, ResponseObserver};
 pub use recorder::{CallSink, PendingCall, Recorder, RecorderStats};

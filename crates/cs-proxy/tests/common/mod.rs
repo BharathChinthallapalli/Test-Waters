@@ -152,6 +152,74 @@ impl MockUpstream {
     }
 }
 
+/// A raw TCP upstream, for framings hyper's server won't produce: for each
+/// connection it reads one request, writes `response` exactly as given, then
+/// closes the connection (a FIN, since the request was read in full).
+pub struct RawUpstream {
+    pub addr: SocketAddr,
+}
+
+impl RawUpstream {
+    pub async fn start(response: impl Into<Bytes>) -> Self {
+        let response = response.into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    if read_request(&stream).await.is_ok() {
+                        let _ = write_all(&stream, &response).await;
+                    }
+                });
+            }
+        });
+        Self { addr }
+    }
+
+    pub fn base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+/// Reads one request with a `content-length` body (or none).
+async fn read_request(stream: &TcpStream) -> io::Result<()> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                return Ok(());
+            }
+        }
+        stream.readable().await?;
+        match stream.try_read(&mut chunk) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => request.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn write_all(stream: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(bytes) {
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// A complete response body.
 pub fn full(body: impl Into<Bytes>) -> MockBody {
     Full::new(body.into())
@@ -303,16 +371,20 @@ impl RawClient {
         }
     }
 
-    pub async fn send(&self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            self.stream.writable().await?;
-            match self.stream.try_write(bytes) {
-                Ok(n) => bytes = &bytes[n..],
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
-            }
+    pub async fn send(&self, bytes: &[u8]) -> io::Result<()> {
+        write_all(&self.stream, bytes).await
+    }
+
+    /// Bytes read but not yet parsed.
+    pub fn take_buffered(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Reads until at least `len` bytes are buffered past what was parsed.
+    pub async fn fill_to(&mut self, len: usize) {
+        while self.buf.len() < len {
+            self.fill_or_eof().await;
         }
-        Ok(())
     }
 
     /// Reads more bytes into the buffer; `false` at end of stream.

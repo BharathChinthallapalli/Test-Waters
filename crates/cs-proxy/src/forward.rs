@@ -25,9 +25,17 @@
 //! dropping it drops the upstream response, which closes that connection.
 //! hyper also drops a body without polling it to the end once a
 //! `content-length` response is fully written, so the body counts relayed
-//! bytes against the upstream's length to tell that apart from a cancel. A
+//! bytes against the length the client was told (so a `content-length` the
+//! upstream sent next to `transfer-encoding` is ignored, as
+//! [`crate::headers::to_client`] drops it). hyper likewise stops after a
+//! trailers frame, the last frame there is, so one ends the body normally. A
 //! client that leaves before the upstream's response head arrives is recorded
 //! as `clientCancelled` with status 0 (`AwaitingResponse`).
+//!
+//! The observer is another task's code running on every chunk, so it runs
+//! behind `catch_unwind` (`GuardedObserver`): a panic turns it off for that
+//! call, is logged once without the body, and the call is still recorded with
+//! the bytes the proxy counted. The client's stream never sees it.
 //!
 //! The upstream client is reqwest 0.13.5 with rustls on ring. reqwest's
 //! `rustls-no-provider` feature needs a process-wide rustls provider installed
@@ -42,18 +50,22 @@
 //! the one header the upstream can see that the client didn't send, besides
 //! `host`.
 //!
-//! [`ProxyBody`]'s error type is `Infallible`, so an upstream failure part-way
-//! through a body can only end the client's body early. For a
-//! `content-length` response hyper then closes the connection (short body),
-//! which the client sees. A response without one goes out chunked and ends with
-//! a normal last chunk: an SSE stream then lacks `message_stop`, which Claude
-//! Code treats as a dropped connection [GWP], but a chunked JSON body just
-//! looks truncated. The record says `incomplete` either way. Signalling it to
-//! the client needs an error type in `ProxyBody` (a follow-up).
+//! An upstream failure part-way through a body ends the client's body with an
+//! [`UpstreamBodyFailed`] error, never a normal end: hyper 1.11.1 then closes
+//! the client connection without ending the body (`poll_write` returns the
+//! error before `end_body`, `proto/h1/dispatch.rs`), so a chunked response gets
+//! no last chunk and a `content-length` one stays short (RFC 9112, section 8:
+//! the client must treat it as incomplete). hyper aborts without flushing what
+//! it buffered in the same write pass, which can include the head and the last
+//! chunk (when a chunk and the failure are ready together, as HTTP/2's DATA and
+//! RST_STREAM can be), so the body first yields `Pending` once, with a wake-up,
+//! to let hyper flush, then fails. That flush is best-effort: bytes a full
+//! client socket didn't take are lost with the connection. The record says
+//! `incomplete`.
 
-use std::convert::Infallible;
 use std::fmt;
 use std::net::IpAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -93,7 +105,21 @@ const RECORDED_PREFIX: &str = "/v1/";
 const _: () = assert!(MAX_CONTENT_ITEMS >= 2);
 
 /// The body of every proxy response.
-pub type ProxyBody = BoxBody<Bytes, Infallible>;
+pub type ProxyBody = BoxBody<Bytes, UpstreamBodyFailed>;
+
+/// A response body stopped part-way because the provider's body ended with an
+/// error. The server closes the client connection without ending the body, so
+/// the client sees a broken response, never a complete one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamBodyFailed;
+
+impl fmt::Display for UpstreamBodyFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the provider's response ended part-way")
+    }
+}
+
+impl std::error::Error for UpstreamBodyFailed {}
 
 /// Where calls are forwarded: an `https` base URL, or `http` to a loopback
 /// address (tests only).
@@ -376,28 +402,22 @@ impl Proxy {
         let ttfb_ms = elapsed_ms(started);
         let (upstream, upstream_body) =
             http::Response::<reqwest::Body>::from(response).into_parts();
+        let client_headers = headers::to_client(&upstream.headers);
         let expected_bytes = if parts.method == Method::HEAD || !may_have_body(upstream.status) {
             Some(0)
         } else {
-            content_length(&upstream.headers)
+            content_length(&client_headers)
         };
         let recording = call.take().map(|call| Recording {
-            observer: ResponseObserver::new(upstream.status, &upstream.headers),
+            observer: GuardedObserver::new(upstream.status, &upstream.headers),
             status: upstream.status.as_u16(),
             ttfb_ms,
             call,
         });
-        let body = RelayBody {
-            upstream: Some(upstream_body),
-            unobserved: None,
-            relayed_bytes: 0,
-            expected_bytes,
-            ended: None,
-            recording,
-        };
+        let body = RelayBody::new(upstream_body, expected_bytes, recording);
         let mut response = Response::new(BoxBody::new(body));
         *response.status_mut() = upstream.status;
-        *response.headers_mut() = headers::to_client(&upstream.headers);
+        *response.headers_mut() = client_headers;
         response
     }
 
@@ -643,9 +663,112 @@ impl Capture {
 /// A recorded call whose response is streaming.
 struct Recording {
     call: CallStart,
-    observer: ResponseObserver,
+    observer: GuardedObserver,
     status: u16,
     ttfb_ms: u64,
+}
+
+/// Where the observer was when it panicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObserverStage {
+    Start,
+    Feed,
+    Finish,
+}
+
+impl ObserverStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Feed => "feed",
+            Self::Finish => "finish",
+        }
+    }
+}
+
+/// [`ResponseObserver`] behind `catch_unwind` (see the module docs). After a
+/// panic the observer is gone for this call and [`GuardedObserver::finish`]
+/// reports only the bytes fed.
+struct GuardedObserver {
+    observer: Option<ResponseObserver>,
+    fed_bytes: u64,
+}
+
+impl GuardedObserver {
+    fn new(status: StatusCode, headers: &HeaderMap) -> Self {
+        Self {
+            observer: guarded(ObserverStage::Start, || {
+                ResponseObserver::new(status, headers)
+            }),
+            fed_bytes: 0,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.fed_bytes += chunk.len() as u64;
+        let Some(observer) = &mut self.observer else {
+            return;
+        };
+        if guarded(ObserverStage::Feed, || observer.feed(chunk)).is_none() {
+            self.observer = None;
+        }
+    }
+
+    fn finish(self) -> Observed {
+        let fed_bytes = self.fed_bytes;
+        self.observer
+            .and_then(|observer| guarded(ObserverStage::Finish, || observer.finish()))
+            .unwrap_or_else(|| Observed {
+                response_bytes: fed_bytes,
+                ..Observed::default()
+            })
+    }
+}
+
+/// Runs one observer step, `None` if it panicked. The panic is logged without
+/// its payload, which could quote the body.
+fn guarded<T>(stage: ObserverStage, step: impl FnOnce() -> T) -> Option<T> {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        observer_panic_hook::trigger(stage);
+        step()
+    }));
+    match result {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            // Dropping a payload can itself panic; this path is rare enough to
+            // leak it instead, so a panic here can't become a double panic in
+            // `RelayBody::drop`.
+            std::mem::forget(payload);
+            tracing::error!(
+                stage = stage.as_str(),
+                "response observer panicked; this call is recorded without its metadata"
+            );
+            None
+        }
+    }
+}
+
+/// Makes the observer panic at a chosen stage, on this thread (unit tests).
+#[cfg(test)]
+mod observer_panic_hook {
+    use std::cell::Cell;
+
+    use super::ObserverStage;
+
+    thread_local! {
+        static PANIC_AT: Cell<Option<ObserverStage>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn set(stage: Option<ObserverStage>) {
+        PANIC_AT.with(|cell| cell.set(stage));
+    }
+
+    pub(super) fn trigger(stage: ObserverStage) {
+        if PANIC_AT.with(Cell::get) == Some(stage) {
+            panic!("test observer panic at {stage:?}");
+        }
+    }
 }
 
 /// How the upstream body ended.
@@ -665,10 +788,28 @@ struct RelayBody {
     /// The body length the client expects, when known.
     expected_bytes: Option<u64>,
     ended: Option<UpstreamEnd>,
+    /// The upstream failed; the next poll fails the client's body.
+    abort_pending: bool,
     recording: Option<Recording>,
 }
 
 impl RelayBody {
+    fn new(
+        upstream: reqwest::Body,
+        expected_bytes: Option<u64>,
+        recording: Option<Recording>,
+    ) -> Self {
+        Self {
+            upstream: Some(upstream),
+            unobserved: None,
+            relayed_bytes: 0,
+            expected_bytes,
+            ended: None,
+            abort_pending: false,
+            recording,
+        }
+    }
+
     fn observe_unobserved(&mut self) {
         let Some(chunk) = self.unobserved.take() else {
             return;
@@ -694,14 +835,18 @@ impl RelayBody {
 
 impl Body for RelayBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = UpstreamBodyFailed;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, UpstreamBodyFailed>>> {
         let this = self.get_mut();
         this.observe_unobserved();
+        if this.abort_pending {
+            this.abort_pending = false;
+            return Poll::Ready(Some(Err(UpstreamBodyFailed)));
+        }
         let Some(upstream) = &mut this.upstream else {
             return Poll::Ready(None);
         };
@@ -710,6 +855,10 @@ impl Body for RelayBody {
                 if let Some(chunk) = frame.data_ref() {
                     this.relayed_bytes += chunk.len() as u64;
                     this.unobserved = Some(chunk.clone());
+                } else if frame.is_trailers() {
+                    // The last frame; hyper stops polling after it.
+                    this.upstream = None;
+                    this.ended = Some(UpstreamEnd::Complete);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -717,7 +866,10 @@ impl Body for RelayBody {
                 tracing::warn!(error = %error_chain(&error), "provider response ended with an error");
                 this.upstream = None;
                 this.ended = Some(UpstreamEnd::Failed);
-                Poll::Ready(None)
+                // Let hyper flush what it buffered this pass before it aborts.
+                this.abort_pending = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
             None => {
                 this.upstream = None;
@@ -728,7 +880,7 @@ impl Body for RelayBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.upstream.is_none()
+        self.upstream.is_none() && !self.abort_pending
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -754,8 +906,9 @@ impl Drop for RelayBody {
     }
 }
 
-/// A body that ended normally is `upstreamError` when the status is 400 or
-/// more or the observer saw an error (an SSE `error` event).
+/// A body that ended normally is `completed` for a status below 400 (2xx, or
+/// a 3xx passed through) and `upstreamError` when the status is 400 or more or
+/// the observer saw an error (an SSE `error` event).
 fn with_upstream_error(outcome: CallOutcome, status: u16, observed: &Observed) -> CallOutcome {
     if outcome == CallOutcome::Completed && (status >= 400 || observed.error_type.is_some()) {
         CallOutcome::UpstreamError
@@ -797,7 +950,7 @@ fn error_body(error_type: &str, message: &str) -> Bytes {
 }
 
 fn json_response(status: StatusCode, body: Bytes) -> Response<ProxyBody> {
-    let mut response = Response::new(Full::new(body).boxed());
+    let mut response = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
     *response.status_mut() = status;
     response.headers_mut().insert(
         http::header::CONTENT_TYPE,
@@ -1035,42 +1188,176 @@ mod tests {
     }
 
     /// A listener whose accept queue is full drops new SYNs (Linux), so
-    /// connecting to it hangs until the client's connect timeout.
+    /// connecting to it hangs until the client's connect timeout. The outer
+    /// timeout keeps a kernel that answers anyway from hanging the suite.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_connect_timeout_is_a_504() {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let listener = socket.listen(1).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut queued = Vec::new();
-        for _ in 0..64 {
-            let connect = tokio::net::TcpStream::connect(addr);
-            match tokio::time::timeout(Duration::from_millis(200), connect).await {
-                Ok(Ok(stream)) => queued.push(stream),
-                _ => break,
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = socket.listen(1).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut queued = Vec::new();
+            for _ in 0..64 {
+                let connect = tokio::net::TcpStream::connect(addr);
+                match tokio::time::timeout(Duration::from_millis(200), connect).await {
+                    Ok(Ok(stream)) => queued.push(stream),
+                    _ => break,
+                }
             }
+
+            let upstream = Upstream::parse(&format!("http://{addr}")).unwrap();
+            let timeout = Duration::from_millis(300);
+            let client = build_client(&upstream, timeout).unwrap();
+            let started = Instant::now();
+            let error = client
+                .get(format!("http://{addr}/v1/models"))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(started.elapsed() >= timeout);
+            assert!(error.is_connect(), "{}", error_chain(&error));
+            assert_eq!(
+                unreachable_reply(&error),
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout_error",
+                    "the connection timed out"
+                )
+            );
+            drop(queued);
+        })
+        .await
+        .expect("the connect-timeout test hung");
+    }
+
+    /// Over HTTP/2 a DATA frame and a stream reset can be ready together, so
+    /// the relay sees a chunk and the failure in one hyper write pass. The
+    /// chunk (and the head) must still reach the client, then the connection
+    /// closes with no last chunk. reqwest's HTTP/1 client can't produce this
+    /// (it reads on only after the body asks), hence a unit test.
+    #[tokio::test]
+    async fn a_chunk_and_a_failure_ready_together_reach_the_client_as_chunk_then_abort() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(|_request: Request<Incoming>| async {
+                let upstream = reqwest::Body::wrap_stream(futures_util::stream::iter(vec![
+                    Ok(Bytes::from_static(b"hello")),
+                    Err(std::io::Error::other("stream reset")),
+                ]));
+                let body = RelayBody::new(upstream, None, None);
+                Ok::<_, std::convert::Infallible>(Response::new(BoxBody::new(body)))
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.writable().await.unwrap();
+        stream
+            .try_write(b"GET /v1/messages HTTP/1.1\r\nhost: x\r\n\r\n")
+            .unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut chunk = [0u8; 4096];
+            loop {
+                stream.readable().await.unwrap();
+                match stream.try_read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // A reset after the data also ends the response.
+                    Err(_) => return,
+                }
+            }
+        })
+        .await
+        .expect("the connection stayed open");
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text:?}");
+        assert!(
+            text.ends_with("\r\n\r\n5\r\nhello\r\n"),
+            "the chunk, then nothing: {text:?}"
+        );
+    }
+
+    /// A sink that keeps every call (unit tests).
+    #[derive(Default)]
+    struct KeepCalls(std::sync::Mutex<Vec<PendingCall>>);
+
+    impl CallSink for KeepCalls {
+        fn submit(&self, call: PendingCall) {
+            self.0.lock().unwrap().push(call);
+        }
+    }
+
+    /// A recorded relay over `chunks`, as `handle` builds it.
+    fn recorded_relay(sink: &Arc<KeepCalls>, chunks: &[&'static [u8]]) -> RelayBody {
+        let stream = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from_static(chunk)))
+                .collect::<Vec<_>>(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let call = CallStart {
+            sink: Arc::clone(sink) as Arc<dyn CallSink>,
+            run_id: "r".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            started: Instant::now(),
+            started_at_ms: unix_ms(),
+            request_bytes: 2,
+            trace_id: "t".into(),
+            user_agent: None,
+            capture: None,
+        };
+        let recording = Recording {
+            observer: GuardedObserver::new(StatusCode::OK, &headers),
+            status: 200,
+            ttfb_ms: 0,
+            call,
+        };
+        RelayBody::new(reqwest::Body::wrap_stream(stream), None, Some(recording))
+    }
+
+    #[tokio::test]
+    async fn an_observer_panic_neither_breaks_the_stream_nor_loses_the_record() {
+        let chunks: &[&'static [u8]] = &[b"event: a\n\n", b"event: b\n\n", b"event: c\n\n"];
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        for stage in [
+            ObserverStage::Start,
+            ObserverStage::Feed,
+            ObserverStage::Finish,
+        ] {
+            let sink = Arc::new(KeepCalls::default());
+            observer_panic_hook::set(Some(stage));
+            let relay = recorded_relay(&sink, chunks);
+            let body = relay.collect().await.expect("the client's body failed");
+            observer_panic_hook::set(None);
+            assert_eq!(body.to_bytes(), chunks.concat(), "{stage:?}");
+
+            let calls = sink.0.lock().unwrap();
+            assert_eq!(calls.len(), 1, "{stage:?}: recorded once");
+            let record = &calls[0].record;
+            assert_eq!(record.outcome, CallOutcome::Completed, "{stage:?}");
+            assert_eq!(record.status, 200, "{stage:?}");
+            assert_eq!(record.response_bytes, total as u64, "{stage:?}");
+            // The observer's own findings are gone (the stub's `streamed`).
+            assert!(!record.streamed, "{stage:?}");
         }
 
-        let upstream = Upstream::parse(&format!("http://{addr}")).unwrap();
-        let timeout = Duration::from_millis(300);
-        let client = build_client(&upstream, timeout).unwrap();
-        let started = Instant::now();
-        let error = client
-            .get(format!("http://{addr}/v1/models"))
-            .send()
-            .await
-            .unwrap_err();
-        assert!(started.elapsed() >= timeout);
-        assert!(error.is_connect(), "{}", error_chain(&error));
-        assert_eq!(
-            unreachable_reply(&error),
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                "timeout_error",
-                "the connection timed out"
-            )
-        );
-        drop(queued);
+        // Without a panic the observer's findings are kept.
+        let sink = Arc::new(KeepCalls::default());
+        recorded_relay(&sink, chunks).collect().await.unwrap();
+        assert!(sink.0.lock().unwrap()[0].record.streamed);
     }
 }

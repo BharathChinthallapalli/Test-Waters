@@ -139,6 +139,8 @@ async fn a_json_call_passes_byte_for_byte_both_ways() {
     let mut expected: Vec<(&str, &str)> = kept.to_vec();
     expected.push(("host", &upstream_host));
     expected.push(("content-length", &content_length));
+    // Replaces the client's `accept-encoding: gzip, deflate, br`.
+    expected.push(("accept-encoding", "identity"));
     assert_eq!(sorted_map(&got.headers), sorted_pairs(&expected));
 
     // Client side.
@@ -379,6 +381,55 @@ async fn origin_or_a_foreign_host_gets_403() {
         2,
         "refused requests aren't recorded"
     );
+}
+
+#[tokio::test]
+async fn a_foreign_authority_in_the_request_target_or_a_second_host_gets_403() {
+    let upstream = ok_upstream().await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let host = proxy.host();
+    let port = proxy.addr.port();
+
+    let refused = [
+        // Absolute-form to someone else, with our own `Host`.
+        request_bytes("GET", "http://evil.example/v1/models", &host, &[], b""),
+        request_bytes(
+            "GET",
+            &format!("http://evil.example:{port}/v1/models"),
+            &host,
+            &[],
+            b"",
+        ),
+        // Authority-form: a tunnel request.
+        request_bytes("CONNECT", "evil.example:443", &host, &[], b""),
+        // Two `Host` headers, both ours.
+        request_bytes("GET", "/v1/models", &host, &[("host", &host)], b""),
+        // A trailing dot is another name.
+        request_bytes("GET", "/v1/models", &format!("localhost.:{port}"), &[], b""),
+    ];
+    for request in refused {
+        let (head, body) = RawClient::exchange(proxy.addr, &request).await;
+        assert_eq!(head.status, 403, "{}", String::from_utf8_lossy(&request));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+    }
+    assert!(
+        upstream.received().is_empty(),
+        "nothing reached the upstream"
+    );
+
+    // Absolute-form to our own address is forwarded as origin-form.
+    let request = request_bytes(
+        "GET",
+        &format!("http://127.0.0.1:{port}/v1/models?limit=1"),
+        &host,
+        &[],
+        b"",
+    );
+    let (head, body) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 200);
+    assert_eq!(body, b"{}");
+    assert_eq!(upstream.received()[0].target, "/v1/models?limit=1");
 }
 
 // ------------------------------------------------------------ body cap
@@ -632,13 +683,182 @@ async fn an_upstream_failure_mid_body_is_incomplete() {
         .send(Err(io::Error::other("connection reset")))
         .await
         .unwrap();
-    // The client's body ends after the bytes that did arrive.
+    // The proxy closes the connection without the last chunk: the client can
+    // tell the body is incomplete.
     assert!(head.is_chunked());
-    assert_eq!(client.next_chunk().await, None);
+    assert!(client.closed_by_peer().await, "the connection stayed open");
+    assert_eq!(
+        client.take_buffered(),
+        b"",
+        "nothing may follow the chunks that arrived"
+    );
 
     let record = &proxy.sink.wait_for(1).await[0].record;
     assert_eq!(record.outcome, CallOutcome::Incomplete);
     assert_eq!(record.response_bytes, first.len() as u64);
+}
+
+/// An upstream that sends part of a body and closes at once: the data and the
+/// failure reach the proxy together, so this also checks that the data is
+/// flushed to the client before the connection is aborted.
+#[tokio::test]
+async fn an_upstream_failure_mid_body_aborts_the_client_connection_in_either_framing() {
+    let first: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+    let chunked = [
+        &b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"[..],
+        format!("{:x}\r\n", first.len()).as_bytes(),
+        first,
+        b"\r\n",
+    ]
+    .concat();
+    let length = [
+        &b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n"[..],
+        first,
+    ]
+    .concat();
+
+    for (framing, upstream_response) in [("chunked", chunked), ("content-length", length)] {
+        let upstream = RawUpstream::start(upstream_response).await;
+        let proxy = TestProxy::start(&upstream.base(), false).await;
+        let mut client = RawClient::connect(proxy.addr).await;
+        client
+            .send(&request_bytes(
+                "POST",
+                "/v1/messages",
+                &proxy.host(),
+                &[],
+                b"{}",
+            ))
+            .await
+            .unwrap();
+        let head = client.read_head().await;
+        assert_eq!(head.status, 200, "{framing}");
+        if framing == "chunked" {
+            assert!(head.is_chunked());
+            assert_eq!(client.next_chunk().await.as_deref(), Some(first));
+        } else {
+            assert_eq!(head.content_length(), Some(1000));
+            client.fill_to(first.len()).await;
+        }
+        assert!(
+            client.closed_by_peer().await,
+            "{framing}: the connection stayed open"
+        );
+        let rest = client.take_buffered();
+        if framing == "chunked" {
+            assert_eq!(rest, b"", "chunked: no last chunk");
+        } else {
+            assert_eq!(rest, first, "content-length: short body, then closed");
+        }
+
+        let record = &proxy.sink.wait_for(1).await[0].record;
+        assert_eq!(record.outcome, CallOutcome::Incomplete, "{framing}");
+        assert_eq!(record.response_bytes, first.len() as u64, "{framing}");
+    }
+}
+
+/// RFC 9112, section 6.3: `transfer-encoding` overrides `content-length`, and
+/// the proxy must not pass both on.
+#[tokio::test]
+async fn a_content_length_next_to_transfer_encoding_is_dropped() {
+    let upstream = RawUpstream::start(
+        &b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\na\r\n0123456789\r\n0\r\n\r\n"[..],
+    )
+    .await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let request = request_bytes("POST", "/v1/messages", &proxy.host(), &[], b"{}");
+    let (head, body) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 200);
+    assert_eq!(head.get("content-length"), None);
+    assert!(head.is_chunked());
+    assert_eq!(body, b"0123456789");
+
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.outcome, CallOutcome::Completed);
+    assert_eq!(record.response_bytes, 10);
+}
+
+/// hyper stops polling a body after its trailers, the last frame there is.
+#[tokio::test]
+async fn a_body_with_trailers_is_completed() {
+    let upstream = RawUpstream::start(
+        &b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\ntrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: 1\r\n\r\n"[..],
+    )
+    .await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let request = request_bytes("POST", "/v1/messages", &proxy.host(), &[], b"{}");
+    let (head, body) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 200);
+    assert_eq!(body, b"hello", "the body ends with a last chunk");
+
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.outcome, CallOutcome::Completed);
+    assert_eq!(record.response_bytes, 5);
+}
+
+/// A client that stops reading stalls the upstream: the proxy holds only what
+/// fits in its buffers, never the whole body.
+#[tokio::test]
+async fn a_client_that_stops_reading_stalls_the_upstream() {
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = 256 * 1024 * 1024;
+    let (upstream, mut senders) =
+        streaming_upstream(200, &[("content-type", "application/octet-stream")]).await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let mut client = RawClient::connect(proxy.addr).await;
+    client
+        .send(&request_bytes(
+            "POST",
+            "/v1/messages",
+            &proxy.host(),
+            &[],
+            b"{}",
+        ))
+        .await
+        .unwrap();
+    let upstream_tx = tokio::time::timeout(WAIT, senders.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = sent.clone();
+    let producer = tokio::spawn(async move {
+        let chunk = Bytes::from(vec![b'x'; CHUNK]);
+        while counter.load(std::sync::atomic::Ordering::SeqCst) < TOTAL {
+            if upstream_tx.send(Ok(chunk.clone())).await.is_err() {
+                return;
+            }
+            counter.fetch_add(CHUNK, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let head = client.read_head().await;
+    assert_eq!(head.status, 200);
+
+    // Stop reading until the upstream's sends stop making progress.
+    let mut stalled_at = sent.load(std::sync::atomic::Ordering::SeqCst);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = sent.load(std::sync::atomic::Ordering::SeqCst);
+        if now == stalled_at {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the upstream never stalled");
+        stalled_at = now;
+    }
+    assert!(!producer.is_finished(), "the upstream finished sending");
+    // Socket buffers on both sides plus hyper's: far below the body.
+    assert!(
+        stalled_at < 64 * 1024 * 1024,
+        "{stalled_at} bytes left the upstream while the client read none"
+    );
+
+    // Leaving cancels the call and the upstream's sends fail.
+    drop(client);
+    tokio::time::timeout(WAIT, producer).await.unwrap().unwrap();
+    assert!(sent.load(std::sync::atomic::Ordering::SeqCst) < TOTAL);
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.outcome, CallOutcome::ClientCancelled);
 }
 
 #[tokio::test]

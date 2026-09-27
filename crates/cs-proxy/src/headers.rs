@@ -6,11 +6,20 @@
 //! `transfer-encoding`, `upgrade`) plus every name listed in `connection`.
 //! Everything else passes in its original order, multiple values included:
 //! `anthropic-*`, `authorization` and `x-api-key` are forwarded as they came.
+//!
+//! Two framing rules sit on top. Upstream, the client's `accept-encoding` is
+//! replaced by `accept-encoding: identity`: an absent header means any coding
+//! is acceptable (RFC 9110, section 12.5.3), and the observer needs the body
+//! uncompressed. To the client, a response that carried `transfer-encoding`
+//! loses its `content-length`: the transfer coding framed the body, and a
+//! sender must not send both (RFC 9112, sections 6.1 and 6.3).
 
 use std::collections::HashSet;
 
 use http::HeaderMap;
-use http::header::{ACCEPT_ENCODING, CONNECTION, HOST, HeaderName};
+use http::header::{
+    ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue, TRANSFER_ENCODING,
+};
 
 /// Callsheet's own request headers start with this and are never forwarded.
 pub const CALLSHEET_PREFIX: &str = "x-callsheet-";
@@ -37,27 +46,32 @@ const HOP_BY_HOP: [&str; 8] = [
 ];
 
 /// Headers to send upstream: every request header except hop-by-hop ones,
-/// `host`, `accept-encoding` and `x-callsheet-*`.
+/// `host` and `x-callsheet-*`, with the client's `accept-encoding` replaced by
+/// `accept-encoding: identity` (last).
 ///
-/// `accept-encoding` goes so the upstream answers uncompressed and the observer
-/// can read usage (a documented deviation from pure passthrough).
+/// `identity` makes the upstream answer uncompressed so the observer can read
+/// usage (a documented deviation from pure passthrough).
 pub fn to_upstream(request: &HeaderMap) -> HeaderMap {
     let named = connection_named(request);
-    filtered(request, |name| {
+    let mut headers = filtered(request, |name| {
         !is_hop_by_hop(name)
             && !named.contains(name)
             && name != HOST
             && name != ACCEPT_ENCODING
             && !name.as_str().starts_with(CALLSHEET_PREFIX)
-    })
+    });
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    headers
 }
 
 /// Headers to send the client: every upstream response header except
-/// hop-by-hop ones.
+/// hop-by-hop ones, and except `content-length` when the upstream framed the
+/// body with `transfer-encoding`.
 pub fn to_client(response: &HeaderMap) -> HeaderMap {
     let named = connection_named(response);
+    let transfer_coded = response.contains_key(TRANSFER_ENCODING);
     filtered(response, |name| {
-        !is_hop_by_hop(name) && !named.contains(name)
+        !is_hop_by_hop(name) && !named.contains(name) && !(transfer_coded && name == CONTENT_LENGTH)
     })
 }
 
@@ -138,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn to_upstream_drops_hop_by_hop_host_encoding_and_callsheet_headers() {
+    fn to_upstream_drops_hop_by_hop_host_and_callsheet_headers_and_asks_for_identity() {
         let request = map(&[
             ("host", "127.0.0.1:4000"),
             ("connection", "keep-alive, X-Hop"),
@@ -181,6 +195,15 @@ mod tests {
                 ),
                 ("content-type".into(), "application/json".into()),
                 ("content-length".into(), "2".into()),
+                ("accept-encoding".into(), "identity".into()),
+            ]
+        );
+        // Added when the client sent none, too.
+        assert_eq!(
+            pairs(&to_upstream(&map(&[("x-api-key", "k")]))),
+            vec![
+                ("x-api-key".into(), "k".into()),
+                ("accept-encoding".into(), "identity".into()),
             ]
         );
     }
@@ -209,6 +232,27 @@ mod tests {
                 ("set-cookie".into(), "b=2".into()),
                 ("content-encoding".into(), "gzip".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn to_client_drops_content_length_when_a_transfer_coding_framed_the_body() {
+        for coding in ["chunked", "gzip, chunked", "gzip"] {
+            let response = map(&[
+                ("content-type", "application/json"),
+                ("content-length", "4"),
+                ("transfer-encoding", coding),
+            ]);
+            assert_eq!(
+                pairs(&to_client(&response)),
+                vec![("content-type".into(), "application/json".into())],
+                "{coding}"
+            );
+        }
+        let length_only = map(&[("content-length", "4")]);
+        assert_eq!(
+            pairs(&to_client(&length_only)),
+            vec![("content-length".into(), "4".into())]
         );
     }
 

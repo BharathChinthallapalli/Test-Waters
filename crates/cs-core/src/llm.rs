@@ -18,13 +18,15 @@ pub const LLM_CALL_KIND: &str = "llm.call";
 #[cfg_attr(test, derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "camelCase")]
 pub enum CallOutcome {
-    /// The upstream answered with a 2xx status and the body ended normally,
-    /// with no `error` event in a stream.
+    /// The upstream answered with a status below 400 (2xx, or a 3xx passed
+    /// through to the client) and the body ended normally, with no `error`
+    /// event in a stream.
     Completed,
     /// The upstream answered with a status of 400 or more, or a stream carried
     /// an `error` event.
     UpstreamError,
-    /// The client went away before the response ended.
+    /// The client went away before the response ended. If it left before the
+    /// response head, the record's `status` is 0.
     ClientCancelled,
     /// The proxy could not reach the upstream (connect error or timeout); the
     /// client got the proxy's own 502 or 504.
@@ -60,7 +62,8 @@ pub struct LlmCallRecord {
     pub method: String,
     /// The request path without its query, such as `/v1/messages`.
     pub path: String,
-    /// The status the client received (the upstream's, or the proxy's own).
+    /// The status the client received (the upstream's, or the proxy's own);
+    /// 0 when the client got no response (it left before the response head).
     pub status: u16,
     pub outcome: CallOutcome,
     /// The response was `text/event-stream`.

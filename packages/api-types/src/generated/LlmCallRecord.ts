@@ -15,7 +15,8 @@ provider: string, method: string,
  */
 path: string, 
 /**
- * The status the client received (the upstream's, or the proxy's own).
+ * The status the client received (the upstream's, or the proxy's own);
+ * 0 when the client got no response (it left before the response head).
  */
 status: number, outcome: CallOutcome, 
 /**
