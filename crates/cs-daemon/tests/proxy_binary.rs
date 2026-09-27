@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,7 @@ impl MockUpstream {
         self.received.lock().unwrap().clone()
     }
 
+    #[cfg(unix)]
     fn wait_for_requests(&self, count: usize) {
         let started = Instant::now();
         while self.received().len() < count {
@@ -346,7 +347,8 @@ impl Running {
     }
 
     /// Waits for the process to exit by itself.
-    fn wait(mut self) -> (ExitStatus, Output) {
+    #[cfg(unix)]
+    fn wait(mut self) -> (std::process::ExitStatus, Output) {
         let mut child = self.child.take().unwrap();
         let started = Instant::now();
         loop {
@@ -418,14 +420,14 @@ fn data_dir_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 // ---------------------------------------------------------------- tests
 
-#[cfg(unix)]
-#[test]
-fn calls_through_the_proxy_are_listed_counted_and_drained_at_sigterm() {
-    let upstream = MockUpstream::start();
-    let (_root, dir) = temp_data_dir();
+/// Starts a daemon in `dir` in front of `upstream`, sends a streamed call (API
+/// key, `x-callsheet-run: wire-run`) and a non-streamed one (bearer token,
+/// Claude Code session `sess-42`) through its proxy, and checks what the
+/// upstream received, `health.proxy` and `calls.list`.
+fn start_and_send_two_calls(upstream: &MockUpstream, dir: &Path) -> (Running, SocketAddrV4) {
     let first = Running::spawn(
-        daemon(&dir).args(["--proxy-upstream", &upstream.base()]),
-        &dir,
+        daemon(dir).args(["--proxy-upstream", &upstream.base()]),
+        dir,
     );
 
     // daemon.json names the proxy on the port saved in the data directory.
@@ -483,13 +485,13 @@ fn calls_through_the_proxy_are_listed_counted_and_drained_at_sigterm() {
     );
 
     // health.proxy counts both, and calls.list shows them newest first.
-    let health = first.wait_recorded(&dir, 2);
+    let health = first.wait_recorded(dir, 2);
     let proxy_health = health.proxy.unwrap();
     assert_eq!(proxy_health.address, proxy);
     assert_eq!(proxy_health.calls_recorded, 2);
     assert_eq!(proxy_health.records_dropped, 0);
 
-    let listed = first.calls(&dir).calls;
+    let listed = first.calls(dir).calls;
     assert_eq!(listed.len(), 2, "{listed:?}");
     let (newest, oldest) = (&listed[0], &listed[1]);
     assert!(newest.global_pos > oldest.global_pos);
@@ -537,6 +539,31 @@ fn calls_through_the_proxy_are_listed_counted_and_drained_at_sigterm() {
             cache_read_input_tokens: None,
         })
     );
+    (first, proxy)
+}
+
+#[test]
+fn calls_through_the_proxy_are_listed_and_counted_without_credentials_in_logs() {
+    let upstream = MockUpstream::start();
+    let (_root, dir) = temp_data_dir();
+    let (running, _proxy) = start_and_send_two_calls(&upstream, &dir);
+
+    // Killed, so this also runs on Windows; the rows were written already.
+    let logs = stderr(&running.kill());
+
+    assert!(logs.contains("Callsheet daemon listening"), "{logs}");
+    assert_no_secret_or_body("the daemon's log", logs.as_bytes());
+    for (path, bytes) in data_dir_files(&dir) {
+        assert_no_secret_or_body(&path.display().to_string(), &bytes);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn calls_at_sigterm_are_drained_and_the_next_start_reuses_the_port() {
+    let upstream = MockUpstream::start();
+    let (_root, dir) = temp_data_dir();
+    let (first, proxy) = start_and_send_two_calls(&upstream, &dir);
 
     let first_started_at_ms = first.discovery.started_at_ms;
     // A call answered just before SIGTERM, and a slow stream still running when
