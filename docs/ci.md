@@ -35,12 +35,18 @@ says how to run it locally.
 ## The daemon client test
 
 `packages/api-types/test/daemon.integration.test.ts` (feature 02, R2.8 and
-R2.9) starts the built `cs-daemon` binary with a temporary `--data-dir` and the
-default listen address (port 0), reads `daemon.json` and the token, calls
-`health` and `version` typed with the generated types, checks 401 for a missing
-or wrong token, rotates the token (the old one gets 401, a client re-reads the
-file once and succeeds), then sends `SIGTERM` and checks exit status 0 and that
-`daemon.json` is gone. It uses only Node built-ins.
+R2.9; feature 03, requirement 7) starts a mock Anthropic API on loopback
+(`node:http`), then the built `cs-daemon` binary with a temporary `--data-dir`,
+the default listen address (port 0) and `--proxy-upstream` pointing at the mock.
+It reads `daemon.json` (including `proxyAddress`, which must match the saved
+`proxy-port`) and the token, calls `health` and `version` typed with the
+generated types, sends one `POST /v1/messages` through the proxy with a fake
+`x-api-key` and reads it back with `calls.list` (run, model, usage, outcome)
+and `health.proxy.callsRecorded`, checks 401 for a missing or wrong token,
+rotates the token (the old one gets 401, a client re-reads the file once and
+succeeds), then sends `SIGTERM` and checks exit status 0 and that `daemon.json`
+is gone. It uses only Node built-ins, and nothing leaves the machine: the
+proxy's upstream is the loopback mock.
 
 It needs the binary, so it is not part of `pnpm -r test` (the `ts` job has no
 Rust toolchain) and has its own script instead. It fails, never skips, when the

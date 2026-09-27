@@ -1,5 +1,8 @@
-// Integration test (feature 02, R2.8, R2.9): a TypeScript client talks to the
-// built `cs-daemon` binary using only the types generated from Rust.
+// Integration test (feature 02, R2.8, R2.9; feature 03, requirement 7): a
+// TypeScript client talks to the built `cs-daemon` binary using only the types
+// generated from Rust, and sends one model call through the daemon's proxy to a
+// mock upstream on loopback (`--proxy-upstream`), then reads it back with
+// `calls.list`.
 //
 // Needs the binary: `cargo build -p cs-daemon --locked`, then
 // `pnpm -C packages/api-types test:integration`. `CS_DAEMON_BIN` overrides the
@@ -8,13 +11,21 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingHttpHeaders,
+  type Server,
+} from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import type {
+  CallsListParams,
+  CallsListResult,
   Discovery,
   HealthResult,
   NoParams,
@@ -49,8 +60,82 @@ let stderr = "";
 let spawnError: Error | undefined;
 let discovery: Discovery;
 
+/** A fake API key: it goes to the mock upstream and must appear nowhere else. */
+const TEST_API_KEY = "sk-ant-api03-TSINTEGRATIONKEY-not-real";
+/** The mock upstream's JSON reply to `POST /v1/messages`. */
+const MOCK_MESSAGE = JSON.stringify({
+  id: "msg_ts",
+  type: "message",
+  role: "assistant",
+  model: "claude-ts-mock",
+  content: [{ type: "text", text: "hello from the mock" }],
+  stop_reason: "end_turn",
+  usage: { input_tokens: 11, output_tokens: 5 },
+});
+let upstream: Server;
+/** Requests the mock upstream received: path and headers. */
+const upstreamSaw: { url: string; headers: IncomingHttpHeaders }[] = [];
+
+/** A mock Anthropic API on loopback: answers every request with MOCK_MESSAGE. */
+async function startUpstream(): Promise<string> {
+  upstream = createServer((incoming, outgoing) => {
+    upstreamSaw.push({ url: incoming.url ?? "", headers: incoming.headers });
+    incoming.resume();
+    incoming.on("end", () => {
+      outgoing.writeHead(200, {
+        "content-type": "application/json",
+        "request-id": "req_ts_mock",
+        "content-length": Buffer.byteLength(MOCK_MESSAGE),
+      });
+      outgoing.end(MOCK_MESSAGE);
+    });
+  });
+  await new Promise<void>((resolve) =>
+    upstream.listen(0, "127.0.0.1", resolve),
+  );
+  const { port } = upstream.address() as AddressInfo;
+  return `http://127.0.0.1:${port}`;
+}
+
 /** What one HTTP exchange returned. */
 type Reply = { status: number; body: string };
+
+/** Sends a Messages API call to the proxy at `address` (`127.0.0.1:<port>`). */
+function proxyCall(address: string, payload: string): Promise<Reply> {
+  const separator = address.lastIndexOf(":");
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      {
+        // `Host` becomes exactly `127.0.0.1:<port>`, which the proxy requires.
+        host: address.slice(0, separator),
+        port: Number(address.slice(separator + 1)),
+        method: "POST",
+        path: "/v1/messages?beta=true",
+        agent: false,
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload),
+          "anthropic-version": "2023-06-01",
+          "x-api-key": TEST_API_KEY,
+          "x-callsheet-run": "ts-integration",
+        },
+      },
+      (incoming) => {
+        const chunks: Buffer[] = [];
+        incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+        incoming.on("end", () =>
+          resolve({
+            status: incoming.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }),
+        );
+        incoming.on("error", reject);
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(payload);
+  });
+}
 
 function post(
   address: string,
@@ -160,10 +245,14 @@ before(async () => {
   });
   root = await mkdtemp(path.join(tmpdir(), "callsheet-it-"));
   dataDir = path.join(root, "data");
-  // Default `--listen` is 127.0.0.1:0: the OS picks the port.
-  daemon = spawn(DAEMON_BIN, ["--data-dir", dataDir], {
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  const upstreamBase = await startUpstream();
+  // Default `--listen` is 127.0.0.1:0: the OS picks the port. The proxy picks
+  // one too, on this first start, and saves it in the data directory.
+  daemon = spawn(
+    DAEMON_BIN,
+    ["--data-dir", dataDir, "--proxy-upstream", upstreamBase],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
   // Without a listener, an 'error' (spawn or kill failed) would be thrown.
   daemon.on("error", (error) => {
     spawnError = error;
@@ -193,12 +282,21 @@ after(async () => {
     // Windows may hold the files of a process that just ended for a moment.
     await rm(root, { recursive: true, force: true, maxRetries: 5 });
   }
+  if (upstream) {
+    await new Promise((resolve) => upstream.close(resolve));
+  }
 });
 
-test("daemon.json names 127.0.0.1 and the schema version", () => {
+test("daemon.json names 127.0.0.1, the schema version and the proxy", async () => {
   assert.match(discovery.address, /^127\.0\.0\.1:[1-9]\d*$/);
   assert.equal(typeof discovery.startedAtMs, "number");
   assert.ok(discovery.schemaVersion >= 1);
+  assert.ok(discovery.proxyAddress);
+  assert.match(discovery.proxyAddress, /^127\.0\.0\.1:[1-9]\d*$/);
+  assert.notEqual(discovery.proxyAddress, discovery.address);
+  // The port is saved, so the next start reuses it.
+  const saved = await readFile(path.join(dataDir, "proxy-port"), "utf8");
+  assert.equal(`127.0.0.1:${saved.trim()}`, discovery.proxyAddress);
 });
 
 test("health and version answer with the generated types", async () => {
@@ -214,6 +312,11 @@ test("health and version answer with the generated types", async () => {
   assert.equal(result.lastGlobalPosition, 0);
   assert.equal(result.erasurePending, false);
   assert.ok(result.uptimeMs >= 0);
+  assert.deepEqual(result.proxy, {
+    address: discovery.proxyAddress,
+    callsRecorded: 0,
+    recordsDropped: 0,
+  });
 
   const version = await api.call<VersionResult>("version");
   const cargoToml = await readFile(path.join(REPO_ROOT, "Cargo.toml"), "utf8");
@@ -227,6 +330,68 @@ test("health and version answer with the generated types", async () => {
     : undefined;
   assert.ok(workspaceVersion);
   assert.deepEqual(version.result, { daemonVersion: workspaceVersion });
+});
+
+test("a call through the proxy is listed by calls.list", async () => {
+  const proxyAddress = discovery.proxyAddress;
+  assert.ok(proxyAddress);
+  const payload = JSON.stringify({
+    model: "claude-ts-mock",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  const reply = await proxyCall(proxyAddress, payload);
+  assert.equal(reply.status, 200);
+  assert.equal(reply.body, MOCK_MESSAGE, "the body passes unchanged");
+  // Forwarded with the key and without Callsheet's own run header.
+  assert.equal(upstreamSaw.length, 1);
+  assert.equal(upstreamSaw[0]?.url, "/v1/messages?beta=true");
+  assert.equal(upstreamSaw[0]?.headers["x-api-key"], TEST_API_KEY);
+  assert.equal(upstreamSaw[0]?.headers["x-callsheet-run"], undefined);
+
+  // Recording is asynchronous: wait until the call is in the store.
+  const api = client(discovery.address);
+  const deadline = Date.now() + STARTUP_LIMIT_MS;
+  let listed: CallsListResult | undefined;
+  for (;;) {
+    const params: CallsListParams = { limit: 10 };
+    const response = await api.call<CallsListResult, CallsListParams>(
+      "calls.list",
+      params,
+    );
+    assert.equal(response.error, undefined);
+    listed = response.result;
+    if (listed && listed.calls.length > 0) {
+      break;
+    }
+    assert.ok(Date.now() < deadline, "the call was never recorded");
+    await delay(50);
+  }
+  assert.equal(listed.calls.length, 1);
+  const entry = listed.calls[0];
+  assert.ok(entry);
+  assert.equal(entry.runId, "ts-integration");
+  const call = entry.call;
+  assert.equal(call.provider, "anthropic");
+  assert.equal(call.method, "POST");
+  assert.equal(call.path, "/v1/messages");
+  assert.equal(call.status, 200);
+  assert.equal(call.outcome, "completed");
+  assert.equal(call.streamed, false);
+  assert.equal(call.model, "claude-ts-mock");
+  assert.equal(call.requestId, "req_ts_mock");
+  assert.equal(call.stopReason, "end_turn");
+  assert.deepEqual(call.usage, { inputTokens: 11, outputTokens: 5 });
+  assert.equal(call.requestBytes, Buffer.byteLength(payload));
+  assert.equal(call.responseBytes, Buffer.byteLength(MOCK_MESSAGE));
+  assert.match(call.traceId, /^[0-9a-f]{32}$/);
+  assert.equal(listed.nextBefore, undefined);
+
+  const health = await api.call<HealthResult>("health");
+  assert.equal(health.result?.proxy?.callsRecorded, 1);
+  assert.equal(health.result?.proxy?.recordsDropped, 0);
+  assert.ok(!stderr.includes(TEST_API_KEY), "the API key is in the log");
 });
 
 test("a missing or wrong token gets 401", async () => {

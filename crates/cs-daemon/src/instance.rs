@@ -31,8 +31,9 @@
 //! for the life of the process. The holder writes its pid into it. The lock file is
 //! never deleted: deleting it would let two daemons lock two different files.
 //!
-//! **Discovery.** Once the listener is bound, `daemon.json`
-//! (`{ "pid", "startedAtMs", "address", "schemaVersion" }`) is written owner-only
+//! **Discovery.** Once the listeners are bound, `daemon.json`
+//! (`{ "pid", "startedAtMs", "address", "schemaVersion", "proxyAddress" }`, the
+//! last one absent when no proxy runs) is written owner-only
 //! and atomically, and it is removed on graceful shutdown. A crash leaves it
 //! behind; the next daemon removes it right after taking the lock.
 //!
@@ -358,16 +359,26 @@ impl Instance {
         })
     }
 
-    /// Writes `daemon.json` for a listener bound to `address`, owner-only and
-    /// atomically, replacing an earlier one.
-    pub fn publish(&self, address: SocketAddrV4) -> Result<Discovery, InstanceError> {
+    /// When this daemon started, in Unix milliseconds: `startedAtMs` in
+    /// `daemon.json`.
+    pub fn started_at_ms(&self) -> u64 {
+        self.started_at_ms
+    }
+
+    /// Writes `daemon.json` for a control API bound to `address` and, when it
+    /// runs, a proxy bound to `proxy_address`, owner-only and atomically,
+    /// replacing an earlier one.
+    pub fn publish(
+        &self,
+        address: SocketAddrV4,
+        proxy_address: Option<SocketAddrV4>,
+    ) -> Result<Discovery, InstanceError> {
         let discovery = Discovery {
             pid: std::process::id(),
             started_at_ms: self.started_at_ms,
             address,
             schema_version: cs_store::migrate::CURRENT_SCHEMA_VERSION,
-            // Filled by the proxy wiring (feature 03, task 7).
-            proxy_address: None,
+            proxy_address,
         };
         let path = self.data_dir.join(DISCOVERY_FILE_NAME);
         let discovery_error = |source| InstanceError::Discovery {
@@ -529,6 +540,36 @@ mod tests {
             serde_json::from_value::<Discovery>(json).unwrap(),
             discovery
         );
+
+        let with_proxy = Discovery {
+            proxy_address: Some("127.0.0.1:4200".parse().unwrap()),
+            ..discovery
+        };
+        let json = serde_json::to_value(&with_proxy).unwrap();
+        assert_eq!(json["proxyAddress"], "127.0.0.1:4200");
+        assert_eq!(
+            serde_json::from_value::<Discovery>(json).unwrap(),
+            with_proxy
+        );
+    }
+
+    #[test]
+    fn publish_writes_the_proxy_address_and_the_start_time() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = prepare_data_dir(&root.path().join("data")).unwrap();
+        let instance = Instance::acquire(&dir).unwrap();
+        let proxy = "127.0.0.1:4200".parse().unwrap();
+
+        let published = instance
+            .publish("127.0.0.1:4100".parse().unwrap(), Some(proxy))
+            .unwrap();
+
+        assert_eq!(published.proxy_address, Some(proxy));
+        assert_eq!(published.started_at_ms, instance.started_at_ms());
+        let on_disk: Discovery =
+            serde_json::from_slice(&fs::read(dir.join(DISCOVERY_FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(on_disk, published);
+        instance.close().unwrap();
     }
 
     #[test]

@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cs_core::control::{
-    HealthResult, HealthStatus, SetCaptureContentParams, SettingsResult, TokenRotateResult,
-    VersionResult,
+    HealthResult, HealthStatus, ProxyHealth, SetCaptureContentParams, SettingsResult,
+    TokenRotateResult, VersionResult,
 };
 use cs_store::migrate::CURRENT_SCHEMA_VERSION;
 use cs_store::{Store, StoreError};
@@ -30,10 +30,12 @@ use serde_json::Value;
 use crate::rpc::RpcError;
 use crate::token::ControlToken;
 
-/// `health`: the daemon answers, and the store's state.
+/// `health`: the daemon answers, the store's state and, when it runs, the
+/// proxy's (`proxy`, read by the caller from the call recorder).
 pub async fn health(
     store: &Store,
     started: Instant,
+    proxy: Option<ProxyHealth>,
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
     no_params(params)?;
@@ -48,8 +50,7 @@ pub async fn health(
         capture_content: store.capture_content(),
         last_global_position,
         erasure_pending: store.erasure_pending(),
-        // Filled by the proxy wiring (feature 03, task 7).
-        proxy: None,
+        proxy,
     })
 }
 

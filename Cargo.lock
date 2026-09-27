@@ -437,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "cs-core",
+ "cs-proxy",
  "cs-store",
  "etcetera",
  "getrandom 0.4.3",

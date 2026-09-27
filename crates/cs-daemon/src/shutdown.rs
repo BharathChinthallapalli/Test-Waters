@@ -17,10 +17,13 @@
 //!   of `crate::serve::DRAIN_TIMEOUT`.
 //!
 //! [`graceful`] then runs, in this order:
-//! 1. the server stops accepting and lets open connections finish, within
-//!    [`Signal::drain_timeout`], aborting the rest;
-//! 2. the caller's [`DrainHook`] runs: the store's writer is drained and closed
-//!    (unit `writer`, wired in by unit `wire`);
+//! 1. every server (the control API and the proxy) stops accepting at once, and
+//!    each lets its open connections finish, within [`Signal::drain_timeout`],
+//!    aborting the rest; so proxy calls in flight end, and are handed to the
+//!    call recorder, before step 2;
+//! 2. the caller's [`DrainHook`] runs: in the daemon, the proxy's call recorder
+//!    writes what it has queued (feature 03, task 8), then the store's writer is
+//!    drained and closed (unit `writer`, wired in by unit `wire`);
 //! 3. `daemon.json` is removed and `daemon.lock` released
 //!    ([`crate::instance::Instance::close`]);
 //! 4. `main` exits with status 0, or 1 if a step failed.
@@ -39,6 +42,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::instance::Instance;
+use crate::proxy::RECORDER_SHUTDOWN_TIMEOUT;
 use crate::serve::{DRAIN_TIMEOUT, Server};
 
 /// Drains pending work before the daemon exits (step 2 in the module docs).
@@ -60,6 +64,10 @@ pub const SIGNALS_TO_FORCE_EXIT: u32 = 3;
 /// How long connections get after a Windows console close event, leaving the
 /// rest of the 5 s Windows allows to the drain hook and the cleanup.
 pub const CLOSE_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the call recorder gets after a Windows console close event, within
+/// the same 5 s.
+pub const CLOSE_EVENT_RECORDER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A signal that shuts the daemon down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +98,15 @@ impl Signal {
         match self {
             Self::CtrlClose => CLOSE_EVENT_DRAIN_TIMEOUT,
             _ => DRAIN_TIMEOUT,
+        }
+    }
+
+    /// How long the proxy's call recorder gets to write its queue after this
+    /// signal (step 2).
+    pub fn recorder_timeout(self) -> Duration {
+        match self {
+            Self::CtrlClose => CLOSE_EVENT_RECORDER_TIMEOUT,
+            _ => RECORDER_SHUTDOWN_TIMEOUT,
         }
     }
 }
@@ -188,13 +205,21 @@ impl Error for ShutdownError {}
 /// Runs the shutdown steps in order (see the module docs), giving connections
 /// `drain_timeout`. Returns the first failure, after running every step.
 pub async fn graceful(
-    server: Server,
+    servers: Vec<Server>,
     drain_timeout: Duration,
     drain: DrainHook,
     instance: Instance,
 ) -> Result<(), ShutdownError> {
-    server.stop_within(drain_timeout).await;
-    tracing::info!("control API stopped");
+    // Concurrently: each stops accepting as soon as its task sees the signal.
+    let mut stopping = tokio::task::JoinSet::new();
+    for server in servers {
+        stopping.spawn(async move {
+            let name = server.name();
+            server.stop_within(drain_timeout).await;
+            tracing::info!(server = name, "server stopped");
+        });
+    }
+    while stopping.join_next().await.is_some() {}
 
     let drained = drain().await.map_err(ShutdownError::Drain);
     if let Err(error) = &drained {
@@ -214,7 +239,12 @@ mod tests {
 
     #[test]
     fn close_event_leaves_time_for_the_rest_of_the_shutdown() {
-        assert!(Signal::CtrlClose.drain_timeout() < Duration::from_secs(5));
+        let close = Signal::CtrlClose;
+        assert!(close.drain_timeout() + close.recorder_timeout() < Duration::from_secs(5));
         assert_eq!(Signal::Terminate.drain_timeout(), DRAIN_TIMEOUT);
+        assert_eq!(
+            Signal::Terminate.recorder_timeout(),
+            RECORDER_SHUTDOWN_TIMEOUT
+        );
     }
 }

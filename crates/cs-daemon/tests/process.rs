@@ -211,7 +211,9 @@ fn windows_data_dir_with_an_everyone_ace_is_refused_and_left_alone() {
 fn second_instance_is_refused_naming_the_pid() {
     let (_root, dir) = data_dir();
     let first = Instance::acquire(&dir).unwrap();
-    first.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    first
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
 
     let error = Instance::acquire(&dir).unwrap_err();
 
@@ -228,7 +230,9 @@ fn second_instance_is_refused_naming_the_pid() {
 fn lock_is_released_on_close_and_daemon_json_removed() {
     let (_root, dir) = data_dir();
     let first = Instance::acquire(&dir).unwrap();
-    first.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    first
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
     assert!(dir.join(DISCOVERY_FILE_NAME).exists());
 
     first.close().unwrap();
@@ -252,7 +256,9 @@ fn read_discovery_returns_the_live_daemon() {
     let instance = Instance::acquire(&dir).unwrap();
     assert_eq!(read_discovery(&dir).unwrap(), None, "not published yet");
 
-    let published = instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    let published = instance
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
 
     let found = read_discovery(&dir).unwrap().unwrap();
     assert_eq!(found, published);
@@ -272,7 +278,9 @@ fn read_discovery_returns_the_live_daemon() {
 fn read_discovery_refuses_a_stale_file_without_a_lock_holder() {
     let (_root, dir) = data_dir();
     let instance = Instance::acquire(&dir).unwrap();
-    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    instance
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
     let stale = fs::read(dir.join(DISCOVERY_FILE_NAME)).unwrap();
     instance.close().unwrap();
     // What a crash leaves behind: the file, and an unlocked lock file.
@@ -323,7 +331,9 @@ fn unix_lock_and_discovery_files_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let (_root, dir) = data_dir();
     let instance = Instance::acquire(&dir).unwrap();
-    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    instance
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
     let token = ControlToken::load_or_create(&dir).unwrap();
 
     for name in [LOCK_FILE_NAME, DISCOVERY_FILE_NAME, TOKEN_FILE_NAME] {
@@ -530,7 +540,9 @@ async fn requests_still_running_after_the_drain_timeout_are_aborted() {
 /// both files is the same, and nobody holds the lock.
 fn stale_pair(dir: &Path) {
     let instance = Instance::acquire(dir).unwrap();
-    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    instance
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
     let json = fs::read(dir.join(DISCOVERY_FILE_NAME)).unwrap();
     instance.close().unwrap();
     fs::write(dir.join(DISCOVERY_FILE_NAME), json).unwrap();
@@ -583,7 +595,9 @@ fn read_discovery_refuses_addresses_other_than_127_0_0_1_with_a_port() {
 
         assert_eq!(read_discovery(&dir).unwrap(), None, "{address}");
     }
-    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    instance
+        .publish("127.0.0.1:4100".parse().unwrap(), None)
+        .unwrap();
     assert!(read_discovery(&dir).unwrap().is_some());
     instance.close().unwrap();
 }

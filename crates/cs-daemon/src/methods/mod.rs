@@ -13,10 +13,12 @@ pub mod core;
 pub mod erase;
 pub mod verify;
 
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cs_core::control::methods;
+use cs_core::control::{ProxyHealth, methods};
+use cs_proxy::Recorder;
 use cs_store::Store;
 use serde_json::Value;
 
@@ -28,6 +30,27 @@ pub struct Methods {
     store: Arc<Store>,
     token: Arc<ControlToken>,
     started: Instant,
+    proxy: Option<ProxyStatus>,
+}
+
+/// What `health.proxy` reports: where the proxy listens, and its recorder's
+/// counters.
+#[derive(Debug, Clone)]
+pub struct ProxyStatus {
+    pub address: SocketAddrV4,
+    pub recorder: Arc<Recorder>,
+}
+
+impl ProxyStatus {
+    /// `health.proxy` now.
+    pub fn health(&self) -> ProxyHealth {
+        let stats = self.recorder.stats();
+        ProxyHealth {
+            address: self.address,
+            calls_recorded: stats.calls_recorded,
+            records_dropped: stats.records_dropped,
+        }
+    }
 }
 
 impl Methods {
@@ -37,7 +60,14 @@ impl Methods {
             store,
             token,
             started,
+            proxy: None,
         }
+    }
+
+    /// Reports the proxy in `health` (absent without it).
+    pub fn with_proxy(mut self, proxy: ProxyStatus) -> Self {
+        self.proxy = Some(proxy);
+        self
     }
 }
 
@@ -45,7 +75,10 @@ impl Handler for Methods {
     async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, RpcError> {
         let store = &self.store;
         match method {
-            methods::HEALTH => core::health(store, self.started, params).await,
+            methods::HEALTH => {
+                let proxy = self.proxy.as_ref().map(ProxyStatus::health);
+                core::health(store, self.started, proxy, params).await
+            }
             methods::VERSION => core::version(params),
             methods::TOKEN_ROTATE => core::rotate_token(&self.token, params).await,
             methods::SETTINGS_GET => core::settings_get(store, params),
@@ -147,6 +180,70 @@ mod tests {
         assert_eq!(result.last_global_position, 2);
         assert!(!result.erasure_pending);
         assert_eq!(result.erasure_pending, f.store.erasure_pending());
+    }
+
+    fn pending_call() -> cs_proxy::PendingCall {
+        cs_proxy::PendingCall {
+            run_id: "proxy-1".to_owned(),
+            record: cs_core::llm::LlmCallRecord {
+                provider: "anthropic".to_owned(),
+                method: "POST".to_owned(),
+                path: "/v1/messages".to_owned(),
+                status: 200,
+                outcome: cs_core::llm::CallOutcome::Completed,
+                streamed: false,
+                model: None,
+                request_id: None,
+                stop_reason: None,
+                error_type: None,
+                usage: None,
+                started_at_ms: 1_790_000_000_000,
+                ttfb_ms: None,
+                duration_ms: 1,
+                request_bytes: 2,
+                response_bytes: 3,
+                rate_limit_headers: Default::default(),
+                trace_id: "0".repeat(32),
+                user_agent: None,
+                content_truncated: None,
+            },
+            content: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_proxy_and_its_recorder_when_it_runs() {
+        use cs_proxy::CallSink;
+        let f = with_key();
+        let without: Value = f.methods.call("health", None).await.unwrap();
+        assert!(without.get("proxy").is_none(), "{without}");
+
+        let recorder = Arc::new(Recorder::start(Arc::clone(&f.store), 4));
+        let address: SocketAddrV4 = "127.0.0.1:4200".parse().unwrap();
+        let methods = Methods::new(Arc::clone(&f.store), Arc::clone(&f.token), Instant::now())
+            .with_proxy(ProxyStatus {
+                address,
+                recorder: Arc::clone(&recorder),
+            });
+        assert_eq!(
+            health(&methods).await.proxy,
+            Some(ProxyHealth {
+                address,
+                calls_recorded: 0,
+                records_dropped: 0,
+            })
+        );
+
+        recorder.submit(pending_call());
+        recorder.shutdown().await;
+        // Refused once shut down, and counted.
+        recorder.submit(pending_call());
+
+        let value = methods.call("health", None).await.unwrap();
+        assert_eq!(
+            value["proxy"],
+            json!({ "address": "127.0.0.1:4200", "callsRecorded": 1, "recordsDropped": 1 })
+        );
     }
 
     #[tokio::test]
