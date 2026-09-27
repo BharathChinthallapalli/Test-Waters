@@ -19,13 +19,17 @@ test("only app:// URLs are allowed", () => {
   }
 });
 
-test("the session turns the spellchecker off and cancels off-machine requests", () => {
+test("the session turns the spellchecker off, with no dictionary languages, and cancels off-machine requests", () => {
   let listener:
     | Parameters<OnMachineSession["webRequest"]["onBeforeRequest"]>[1]
     | undefined;
   let urls: string[] = [];
   let spellchecker: boolean | undefined;
+  let languages: string[] | undefined;
   keepSessionOnMachine({
+    setSpellCheckerLanguages: (codes) => {
+      languages = codes;
+    },
     setSpellCheckerEnabled: (enable) => {
       spellchecker = enable;
     },
@@ -43,6 +47,7 @@ test("the session turns the spellchecker off and cancels off-machine requests", 
   };
 
   assert.equal(spellchecker, false);
+  assert.deepEqual(languages, []);
   assert.deepEqual(urls, ["<all_urls>"]);
   assert.equal(decide("https://example.com/"), true);
   assert.equal(decide("app://renderer/style.css"), false);
