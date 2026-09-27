@@ -5,12 +5,15 @@
 //! address and leaves the port file alone. Otherwise the port comes from
 //! [`PORT_FILE_NAME`] in the data directory, so the `ANTHROPIC_BASE_URL` a user
 //! exported keeps working across restarts:
-//! - no file: bind `127.0.0.1:0` and save the port the OS picked, owner-only and
-//!   atomically (`cs_store::fsperm::write_owner_only_atomic`, like `daemon.json`);
-//! - a file with a port: bind `127.0.0.1:<port>`. If that fails (another program
-//!   holds the port) startup fails with one line naming the port, the file and
-//!   the fix. A new port would silently break every client configured with the
-//!   old one;
+//! - no file: pick the first free port of [`PORT_BAND`] in [`candidate_ports`]
+//!   order and save it, owner-only and atomically
+//!   (`cs_store::fsperm::write_owner_only_atomic`, like `daemon.json`);
+//! - a file with a port: bind `127.0.0.1:<port>`. If that fails, startup fails
+//!   with one line naming the port, the file, the cause and the fix
+//!   ([`saved_port_error`]): "in use" for `AddrInUse`, "reserved by the system"
+//!   for `PermissionDenied` (Windows' `WSAEACCES` for an excluded port range;
+//!   Rust maps it to `PermissionDenied`, `library/std/src/sys/io/error/windows.rs`).
+//!   A new port would silently break every client configured with the old one;
 //! - a file that doesn't hold a port (not ASCII digits, 0, over 65535, over
 //!   [`MAX_PORT_FILE_BYTES`], not UTF-8): startup fails, and the file is kept.
 //!   It is not replaced with a new port, for the same reason: something other
@@ -19,6 +22,29 @@
 //!
 //! The file holds the port in ASCII decimal and a newline; surrounding ASCII
 //! whitespace is ignored when it is read, so a hand-written `echo 4200 >` works.
+//!
+//! **Why a fixed band, not port 0.** Port 0 gives a port from the OS's
+//! ephemeral range, and a port saved from there can be taken later:
+//! - Windows' dynamic range is 49152–65535 ("Troubleshoot port exhaustion
+//!   issues", Microsoft Learn,
+//!   <https://learn.microsoft.com/windows/client-management/troubleshoot-tcpip-port-exhaust>).
+//!   Hyper-V, WSL2 and WinNAT reserve excluded port ranges from it, which can
+//!   move after a reboot; a bind to an excluded port fails with `WSAEACCES`
+//!   even though no program holds it. Microsoft's workaround is "a port that is
+//!   not included in the default dynamic port range" (KB 3039044,
+//!   <https://learn.microsoft.com/troubleshoot/windows-server/networking/error-10013-wsaeacces-is-returned>).
+//! - Linux's `ip_local_port_range` defaults to 32768–60999: "the local port
+//!   range that is used by TCP and UDP to choose the local port"
+//!   (`Documentation/networking/ip-sysctl.rst`), so any outgoing connection,
+//!   loopback ones included, can take a port there as its source port.
+//! - macOS uses 49152–65535, the IANA dynamic range.
+//!
+//! [`PORT_BAND`], 20000–29999, is above the privileged ports and below all
+//! three ranges. The order is a fixed permutation of the band that starts at a
+//! point derived from the data directory's path, so one data directory always
+//! tries the same ports first and two data directories rarely collide. A port
+//! in use (or reserved) is skipped; if the whole band is taken, startup fails
+//! and names `--proxy-listen`.
 //!
 //! **Serving** ([`start`]). `cs_proxy::Proxy::try_new` builds the proxy's HTTPS
 //! client, so a client that can't be built (no usable root certificates, say)
@@ -46,6 +72,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,15 +102,22 @@ pub enum ProxyError {
     PortFileRead { path: PathBuf, source: io::Error },
     /// The port file doesn't hold a port from 1 to 65535.
     PortFileCorrupt { path: PathBuf },
-    /// The port the OS picked can't be saved.
+    /// The port picked on a first start can't be saved.
     PortFileWrite { path: PathBuf, source: io::Error },
-    /// The saved port can't be bound (usually: another program has it).
+    /// Another program is listening on the saved port (`AddrInUse`).
+    SavedPortInUse { port: u16, path: PathBuf },
+    /// The system reserves the saved port (`PermissionDenied`: Windows'
+    /// `WSAEACCES` for an excluded port range, or a privileged port on Unix).
+    SavedPortReserved { port: u16, path: PathBuf },
+    /// The saved port can't be bound for another reason.
     SavedPortUnavailable {
         port: u16,
         path: PathBuf,
         source: io::Error,
     },
-    /// `--proxy-listen`, or `127.0.0.1:0` on a first start, can't be bound.
+    /// No port of [`PORT_BAND`] is free on a first start.
+    NoFreePort,
+    /// `--proxy-listen`, or a port of the band, can't be bound.
     Bind {
         address: SocketAddrV4,
         source: io::Error,
@@ -109,12 +143,35 @@ impl fmt::Display for ProxyError {
             Self::PortFileWrite { path, source } => {
                 write!(f, "cannot write {}: {source}", path.display())
             }
-            Self::SavedPortUnavailable { port, path, source } => write!(
+            Self::SavedPortInUse { port, path } => write!(
                 f,
-                "cannot listen on 127.0.0.1:{port}, the proxy port saved in {}: {source}; stop \
-                 the program using port {port}, or pass --proxy-listen 127.0.0.1:<port> and \
+                "cannot listen on 127.0.0.1:{port}, the proxy port saved in {}: port {port} is \
+                 in use; stop the program using it, or pass --proxy-listen 127.0.0.1:<port> and \
                  point ANTHROPIC_BASE_URL at it",
                 path.display()
+            ),
+            Self::SavedPortReserved { port, path } => write!(
+                f,
+                "cannot listen on 127.0.0.1:{port}, the proxy port saved in {}: port {port} is \
+                 reserved by the system; pass --proxy-listen 127.0.0.1:<port> with another \
+                 port, or delete {} to pick a new one (then update ANTHROPIC_BASE_URL)",
+                path.display(),
+                path.display()
+            ),
+            Self::SavedPortUnavailable { port, path, source } => write!(
+                f,
+                "cannot listen on 127.0.0.1:{port}, the proxy port saved in {}: {source}; pass \
+                 --proxy-listen 127.0.0.1:<port> with another port, or delete {} to pick a new \
+                 one (then update ANTHROPIC_BASE_URL)",
+                path.display(),
+                path.display()
+            ),
+            Self::NoFreePort => write!(
+                f,
+                "no port from {} to {} is free for the proxy; pass --proxy-listen \
+                 127.0.0.1:<port>",
+                PORT_BAND.start(),
+                PORT_BAND.end()
             ),
             Self::Bind { address, source } => {
                 write!(f, "cannot listen on {address} for the proxy: {source}")
@@ -186,22 +243,66 @@ pub async fn bind(
     if let Some(port) = saved_port(data_dir)? {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
             .await
-            .map_err(|source| ProxyError::SavedPortUnavailable {
-                port,
-                path: data_dir.join(PORT_FILE_NAME),
-                source,
-            })?;
+            .map_err(|source| saved_port_error(port, data_dir.join(PORT_FILE_NAME), source))?;
         let bound = bound_address(&listener)?;
         return Ok((listener, bound));
     }
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-    let listener = TcpListener::bind(address)
-        .await
-        .map_err(|source| ProxyError::Bind { address, source })?;
-    let bound = bound_address(&listener)?;
-    save_port(data_dir, bound.port())?;
-    tracing::info!(port = bound.port(), "proxy port picked and saved");
-    Ok((listener, bound))
+    for port in candidate_ports(data_dir) {
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let listener = match TcpListener::bind(address).await {
+            Ok(listener) => listener,
+            Err(error) if port_taken(&error) => continue,
+            Err(source) => return Err(ProxyError::Bind { address, source }),
+        };
+        let bound = bound_address(&listener)?;
+        save_port(data_dir, bound.port())?;
+        tracing::info!(port = bound.port(), "proxy port picked and saved");
+        return Ok((listener, bound));
+    }
+    Err(ProxyError::NoFreePort)
+}
+
+/// Where a first start picks the proxy's port (see the module docs).
+pub const PORT_BAND: RangeInclusive<u16> = 20000..=29999;
+
+/// A prime that doesn't divide the band's size, so stepping by it visits every
+/// port of the band once.
+const PORT_STRIDE: u32 = 7919;
+
+/// Every port of [`PORT_BAND`] once, in a fixed order that starts at a point
+/// derived from `data_dir` (FNV-1a over its path's bytes).
+pub fn candidate_ports(data_dir: &Path) -> impl Iterator<Item = u16> {
+    let size = u32::from(PORT_BAND.end() - PORT_BAND.start()) + 1;
+    let hash = data_dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        });
+    let start = hash % size;
+    (0..size).map(move |step| {
+        let offset = (start + step * PORT_STRIDE) % size;
+        // `offset < size`, so this stays within the band.
+        PORT_BAND.start() + offset as u16
+    })
+}
+
+/// A bind error that means this port can't be used, and the next one may be.
+fn port_taken(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+    )
+}
+
+/// The startup error for a saved `port` that can't be bound.
+pub fn saved_port_error(port: u16, path: PathBuf, source: io::Error) -> ProxyError {
+    match source.kind() {
+        io::ErrorKind::AddrInUse => ProxyError::SavedPortInUse { port, path },
+        io::ErrorKind::PermissionDenied => ProxyError::SavedPortReserved { port, path },
+        _ => ProxyError::SavedPortUnavailable { port, path, source },
+    }
 }
 
 fn bound_address(listener: &TcpListener) -> Result<SocketAddrV4, ProxyError> {
@@ -359,12 +460,48 @@ mod tests {
 
         let (first, address) = bind(&dir, None).await.unwrap();
         assert_eq!(*address.ip(), Ipv4Addr::LOCALHOST);
-        assert_ne!(address.port(), 0);
+        assert!(PORT_BAND.contains(&address.port()), "{address}");
         assert_eq!(saved_port(&dir).unwrap(), Some(address.port()));
         drop(first);
 
         let (_second, again) = bind(&dir, None).await.unwrap();
         assert_eq!(again, address);
+    }
+
+    #[test]
+    fn candidate_ports_visit_the_whole_band_once_in_a_fixed_order() {
+        let a = Path::new("/data/a");
+
+        let order: Vec<u16> = candidate_ports(a).collect();
+
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, PORT_BAND.collect::<Vec<_>>());
+        assert_eq!(order, candidate_ports(a).collect::<Vec<_>>());
+        assert_ne!(
+            candidate_ports(a).next(),
+            candidate_ports(Path::new("/data/b")).next(),
+            "two data directories start at different ports"
+        );
+        // Outside Linux's (32768-60999) and Windows' and macOS's (49152-65535)
+        // ephemeral ranges, above the privileged ports.
+        assert!(*PORT_BAND.start() > 1024 && *PORT_BAND.end() < 32768);
+    }
+
+    #[tokio::test]
+    async fn a_first_start_skips_a_taken_port_of_the_band() {
+        let (_root, dir) = data_dir();
+        let mut order = candidate_ports(&dir);
+        let first = order.next().unwrap();
+        // Held for the test; if something else holds it already, it's taken all
+        // the same.
+        let _held = std::net::TcpListener::bind(("127.0.0.1", first));
+
+        let (_listener, address) = bind(&dir, None).await.unwrap();
+
+        assert_ne!(address.port(), first);
+        assert!(PORT_BAND.contains(&address.port()), "{address}");
+        assert_eq!(saved_port(&dir).unwrap(), Some(address.port()));
     }
 
     #[tokio::test]
@@ -377,16 +514,53 @@ mod tests {
         let error = bind(&dir, None).await.unwrap_err();
 
         assert!(
-            matches!(error, ProxyError::SavedPortUnavailable { port: p, .. } if p == port),
+            matches!(error, ProxyError::SavedPortInUse { port: p, .. } if p == port),
             "{error}"
         );
         let message = error.to_string();
         assert!(message.contains(&format!("127.0.0.1:{port}")), "{message}");
+        assert!(message.contains("is in use"), "{message}");
         assert!(message.contains(PORT_FILE_NAME), "{message}");
         assert!(message.contains("--proxy-listen"), "{message}");
         assert!(!message.contains('\n'), "{message}");
         // The saved port is kept for when the port is free again.
         assert_eq!(saved_port(&dir).unwrap(), Some(port));
+    }
+
+    #[test]
+    fn bind_errors_on_the_saved_port_name_their_cause() {
+        let path = PathBuf::from("data").join(PORT_FILE_NAME);
+        let error = |kind: io::ErrorKind| saved_port_error(4242, path.clone(), kind.into());
+
+        let reserved = error(io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            reserved,
+            ProxyError::SavedPortReserved { port: 4242, .. }
+        ));
+        let message = reserved.to_string();
+        assert!(
+            message.contains("port 4242 is reserved by the system")
+                && message.contains("--proxy-listen")
+                && message.contains(&format!("delete {}", path.display()))
+                && !message.contains("in use")
+                && !message.contains('\n'),
+            "{message}"
+        );
+
+        let in_use = error(io::ErrorKind::AddrInUse);
+        assert!(matches!(
+            in_use,
+            ProxyError::SavedPortInUse { port: 4242, .. }
+        ));
+        let message = in_use.to_string();
+        assert!(
+            message.contains("port 4242 is in use") && !message.contains("reserved"),
+            "{message}"
+        );
+
+        let other = error(io::ErrorKind::AddrNotAvailable);
+        assert!(matches!(other, ProxyError::SavedPortUnavailable { .. }));
+        assert!(other.to_string().contains("--proxy-listen"));
     }
 
     #[tokio::test]

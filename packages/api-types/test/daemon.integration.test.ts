@@ -247,7 +247,8 @@ before(async () => {
   dataDir = path.join(root, "data");
   const upstreamBase = await startUpstream();
   // Default `--listen` is 127.0.0.1:0: the OS picks the port. The proxy picks
-  // one too, on this first start, and saves it in the data directory.
+  // one from 20000-29999 on this first start and saves it in the data
+  // directory.
   daemon = spawn(
     DAEMON_BIN,
     ["--data-dir", dataDir, "--proxy-upstream", upstreamBase],
@@ -297,6 +298,9 @@ test("daemon.json names 127.0.0.1, the schema version and the proxy", async () =
   // The port is saved, so the next start reuses it.
   const saved = await readFile(path.join(dataDir, "proxy-port"), "utf8");
   assert.equal(`127.0.0.1:${saved.trim()}`, discovery.proxyAddress);
+  // Picked outside every OS's ephemeral port range.
+  const port = Number(saved.trim());
+  assert.ok(port >= 20000 && port <= 29999, `proxy port ${port}`);
 });
 
 test("health and version answer with the generated types", async () => {

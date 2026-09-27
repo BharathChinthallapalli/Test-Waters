@@ -13,13 +13,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use cs_core::control::HealthResult;
 use cs_core::llm::{CallOutcome, CallsListResult, Usage};
 use cs_daemon::instance::{DISCOVERY_FILE_NAME, Discovery, read_discovery};
-use cs_daemon::proxy::PORT_FILE_NAME;
+use cs_daemon::proxy::{PORT_BAND, PORT_FILE_NAME};
 use cs_daemon::token::TOKEN_FILE_NAME;
 use serde_json::Value;
 
@@ -244,6 +244,17 @@ fn json_body() -> String {
 
 // ---------------------------------------------------------------- daemon
 
+/// Held by every test in this file, so they run one at a time: one test picks
+/// a free port and passes it with `--proxy-listen`, another expects a restart
+/// to get its saved port back, and neither may lose that port to a daemon or a
+/// listener started by a test running alongside. (Test binaries themselves run
+/// one after another.)
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    // A failed test poisons it; the next one still runs.
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn temp_data_dir() -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("data");
@@ -433,6 +444,7 @@ fn start_and_send_two_calls(upstream: &MockUpstream, dir: &Path) -> (Running, So
     // daemon.json names the proxy on the port saved in the data directory.
     let proxy = first.proxy();
     assert_eq!(*proxy.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert!(PORT_BAND.contains(&proxy.port()), "{proxy}");
     assert_eq!(
         fs::read_to_string(dir.join(PORT_FILE_NAME)).unwrap().trim(),
         proxy.port().to_string()
@@ -544,6 +556,7 @@ fn start_and_send_two_calls(upstream: &MockUpstream, dir: &Path) -> (Running, So
 
 #[test]
 fn calls_through_the_proxy_are_listed_and_counted_without_credentials_in_logs() {
+    let _serial = serial();
     let upstream = MockUpstream::start();
     let (_root, dir) = temp_data_dir();
     let (running, _proxy) = start_and_send_two_calls(&upstream, &dir);
@@ -561,6 +574,7 @@ fn calls_through_the_proxy_are_listed_and_counted_without_credentials_in_logs() 
 #[cfg(unix)]
 #[test]
 fn calls_at_sigterm_are_drained_and_the_next_start_reuses_the_port() {
+    let _serial = serial();
     let upstream = MockUpstream::start();
     let (_root, dir) = temp_data_dir();
     let (first, proxy) = start_and_send_two_calls(&upstream, &dir);
@@ -631,6 +645,7 @@ fn calls_at_sigterm_are_drained_and_the_next_start_reuses_the_port() {
 
 #[test]
 fn a_taken_saved_port_stops_startup_naming_the_port_and_the_fix() {
+    let _serial = serial();
     let (_root, dir) = temp_data_dir();
     cs_daemon::instance::prepare_data_dir(&dir).unwrap();
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -657,6 +672,7 @@ fn a_taken_saved_port_stops_startup_naming_the_port_and_the_fix() {
 
 #[test]
 fn a_corrupt_port_file_stops_startup_and_is_kept() {
+    let _serial = serial();
     for contents in ["not a port", "0", "65536"] {
         let (_root, dir) = temp_data_dir();
         cs_daemon::instance::prepare_data_dir(&dir).unwrap();
@@ -677,6 +693,7 @@ fn a_corrupt_port_file_stops_startup_and_is_kept() {
 
 #[test]
 fn proxy_listen_is_used_and_leaves_the_port_file_alone() {
+    let _serial = serial();
     let (_root, dir) = temp_data_dir();
     let free = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = free.local_addr().unwrap().to_string();
@@ -695,6 +712,7 @@ fn proxy_listen_is_used_and_leaves_the_port_file_alone() {
 
 #[test]
 fn bad_proxy_flags_exit_2_before_creating_anything() {
+    let _serial = serial();
     for args in [
         ["--proxy-listen", "0.0.0.0:1"],
         ["--proxy-listen", "localhost:1"],

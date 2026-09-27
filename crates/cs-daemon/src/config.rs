@@ -78,8 +78,8 @@ Options:
   --proxy-listen <ip:port>
                        Address of the model-call proxy; the IP must be
                        127.0.0.1. Default: the port saved in proxy-port in the
-                       data directory, picked by the OS on the first start and
-                       reused after, so ANTHROPIC_BASE_URL stays valid.
+                       data directory, picked from 20000-29999 on the first
+                       start and reused after, so ANTHROPIC_BASE_URL stays valid.
   --proxy-upstream <url>
                        Where the proxy forwards calls: an https URL, or http to
                        a loopback IP (tests). Default https://api.anthropic.com.

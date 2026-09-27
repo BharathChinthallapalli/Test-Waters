@@ -23,6 +23,11 @@ fn daemon(data_dir: &Path) -> Command {
     command
         .arg("--data-dir")
         .arg(data_dir)
+        // These tests run in parallel and restart daemons; a port picked by the
+        // OS for each start keeps a restart from finding its saved proxy port
+        // taken by another test's daemon. The saved port is tested, one test at
+        // a time, in `proxy_binary.rs`.
+        .args(["--proxy-listen", "127.0.0.1:0"])
         .env_remove("CALLSHEET_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
