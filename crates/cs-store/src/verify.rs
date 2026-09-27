@@ -39,18 +39,23 @@
 //!
 //! # Erased content (R6.4, ADR 0011)
 //! Erasure (unit `erase`) deletes blobs and appends one event of kind
-//! [`CONTENT_ERASED_KIND`] whose body lists the erased addresses under
-//! `"addresses"`. A missing blob is erased, not missing, if an erasure event
-//! with a **later** `global_pos` than the referencing event lists its address,
-//! in **any** run: erasure removes content shared with other runs too, while
-//! its event is appended to one run only. (The design's "in the same run" would
-//! flag those shared runs; this is a deliberate deviation.) An erasure before
-//! the reference explains nothing: that content was stored again after it.
-//! `erasedEvents` counts the events with at least one such erased address.
+//! [`CONTENT_ERASED_KIND`] to the erased run; its body lists the erased
+//! addresses under `"addresses"` and the other runs that shared that content
+//! under `"affectedRuns"`. A missing blob is erased, not missing, if an erasure
+//! event with a **later** `global_pos` than the referencing event lists its
+//! address **and** either belongs to the referencing event's run or names that
+//! run in `"affectedRuns"`. (The design's "in the same run" alone would flag
+//! the runs that shared the content; this is a deliberate deviation.) Asking
+//! for the run narrows what a forged erasure explains: an unrelated run's
+//! event rewritten into an erasure (see the limits below) explains only the
+//! runs it names. An erasure before the reference explains nothing: that
+//! content was stored again after it. `erasedEvents` counts the events with at
+//! least one such erased address.
 //!
 //! Erasure events are gathered first, in their own chunked pass, into a map
-//! from address to the latest erasure listing it, so memory grows with the
-//! number of erased addresses, not events. An erasure committed while the
+//! from each erased address to the erasure events listing it, each kept once
+//! with its position and runs, so memory grows with the erased addresses and
+//! erasures, not with the events. An erasure committed while the
 //! verification runs is picked up when a later chunk first meets a blob it
 //! removed (the blob's absence and the erasure event commit together): that
 //! chunk reads the erasure events committed since, once.
@@ -73,10 +78,23 @@
 //! position the next chunk reads to the end of its snapshot without a limit.
 //! State carried between chunks is one head per run and the erased addresses.
 //!
-//! # Limit (R4.6)
-//! Events removed from the end of the global order, with the run heads set
-//! back to match, leave no trace: a hash chain has no outside anchor until
-//! feature 04's signed checkpoints. SECURITY.md and PRIVACY.md say so.
+//! # Limits (R4.6)
+//! Until feature 04's signed checkpoints anchor the chains outside the
+//! database, two changes leave no trace, because nothing later commits to what
+//! they change:
+//! - events removed from the end of the global order, with the run heads set
+//!   back to match;
+//! - an edit of the newest event of any run, with its `event_hash` and the
+//!   run's `runs.last_hash` recomputed.
+//!
+//! SECURITY.md and PRIVACY.md say so. The fix is feature 04's anchors, not
+//! more checks here.
+//!
+//! An erasure event is trusted before its own hash is checked, since the
+//! first pass reads it before the scan reaches it. Tampering with an erasure
+//! body is therefore reported at the erasure event
+//! ([`VerifyProblemKind::EventHashMismatch`]) rather than at the event whose
+//! missing content it explains; the result is still `ok: false`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -97,6 +115,10 @@ pub const CONTENT_ERASED_KIND: &str = "content.erased";
 /// The member of a [`CONTENT_ERASED_KIND`] body that lists the erased
 /// addresses (contract with unit `erase`).
 pub const ERASED_ADDRESSES_FIELD: &str = "addresses";
+
+/// The member of a [`CONTENT_ERASED_KIND`] body that lists the other runs
+/// whose content the erasure removed (contract with unit `erase`).
+pub const AFFECTED_RUNS_FIELD: &str = "affectedRuns";
 
 /// Full chunks read past the position that was newest when verification
 /// started before the next chunk reads without a limit; see the module docs.
@@ -132,12 +154,24 @@ pub async fn verify(store: &Store) -> Result<VerifyResult, StoreError> {
     Ok(scan.into_result())
 }
 
-/// Erased addresses, each with the latest erasure event that lists it.
+/// One erasure event: its position and the runs whose references it explains
+/// (its own run and the ones its body names under `"affectedRuns"`).
+#[derive(Debug)]
+struct Erasure {
+    pos: i64,
+    runs: HashSet<String>,
+}
+
+/// The erasure events read so far, by the addresses they list.
 #[derive(Debug)]
 struct Erasures {
-    latest: HashMap<String, i64>,
-    /// First position not looked at yet.
-    next_from: i64,
+    events: Vec<Erasure>,
+    /// For each erased address, the indexes into `events` of the erasures
+    /// listing it.
+    by_address: HashMap<String, Vec<usize>>,
+    /// First position not looked at yet; `None` once an event at `i64::MAX`
+    /// was read, as none can follow it.
+    next_from: Option<i64>,
     /// The newest position when gathering started; `None` before.
     end: Option<i64>,
     /// The first pass is done.
@@ -149,8 +183,9 @@ struct Erasures {
 impl Default for Erasures {
     fn default() -> Self {
         Self {
-            latest: HashMap::new(),
-            next_from: i64::MIN,
+            events: Vec::new(),
+            by_address: HashMap::new(),
+            next_from: Some(i64::MIN),
             end: None,
             gathered: false,
             caught_up: false,
@@ -173,7 +208,8 @@ impl Erasures {
             },
         };
         let count = self.read_range(conn, end, chunk_limit())?;
-        self.gathered = count < CHUNK_EVENTS || self.next_from > end;
+        self.gathered =
+            count < CHUNK_EVENTS || self.next_from.is_none_or(|next_from| next_from > end);
         Ok(())
     }
 
@@ -200,41 +236,70 @@ impl Erasures {
     /// `next_from` to `end`, moves `next_from` past them, and returns how many
     /// events it looked at.
     fn read_range(&mut self, conn: &Connection, end: i64, limit: i64) -> rusqlite::Result<usize> {
+        let Some(from) = self.next_from else {
+            return Ok(0);
+        };
         let mut statement = conn.prepare_cached(
-            "SELECT global_pos, CASE WHEN kind = ?1 THEN body END FROM events
-             WHERE global_pos >= ?2 AND global_pos <= ?3 ORDER BY global_pos LIMIT ?4",
+            "SELECT global_pos, CASE WHEN kind = ?1 THEN run_id END, CASE WHEN kind = ?1 THEN body END
+             FROM events WHERE global_pos >= ?2 AND global_pos <= ?3 ORDER BY global_pos LIMIT ?4",
         )?;
-        let mut rows = statement.query(params![CONTENT_ERASED_KIND, self.next_from, end, limit])?;
+        let mut rows = statement.query(params![CONTENT_ERASED_KIND, from, end, limit])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
             count += 1;
             let pos: i64 = row.get(0)?;
-            if let Some(body) = text(row, 1)? {
-                self.record(pos, &body);
+            if let Some(body) = text(row, 2)? {
+                self.record(pos, text(row, 1)?, &body);
             }
-            self.next_from = pos.saturating_add(1);
+            self.next_from = pos.checked_add(1);
         }
         Ok(count)
     }
 
-    /// Notes the addresses an erasure event at `pos` lists. A body that isn't
-    /// an erasure body explains nothing.
-    fn record(&mut self, pos: i64, body: &str) {
+    /// Notes the addresses an erasure event at `pos` in `run_id` lists, and
+    /// the runs it explains them for. A body that isn't an erasure body
+    /// explains nothing.
+    fn record(&mut self, pos: i64, run_id: Option<String>, body: &str) {
         let Ok(Value::Object(members)) = serde_json::from_str::<Value>(body) else {
             return;
         };
         let Some(Value::Array(addresses)) = members.get(ERASED_ADDRESSES_FIELD) else {
             return;
         };
+        let mut runs: HashSet<String> = match members.get(AFFECTED_RUNS_FIELD) {
+            Some(Value::Array(affected)) => affected
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => HashSet::new(),
+        };
+        runs.extend(run_id);
+        let index = self.events.len();
+        let mut listed = false;
         for address in addresses.iter().filter_map(Value::as_str) {
-            let latest = self.latest.entry(address.to_owned()).or_insert(pos);
-            *latest = (*latest).max(pos);
+            let erasures = self.by_address.entry(address.to_owned()).or_default();
+            if erasures.last() != Some(&index) {
+                erasures.push(index);
+            }
+            listed = true;
+        }
+        if listed {
+            self.events.push(Erasure { pos, runs });
         }
     }
 
-    /// An erasure after `pos` lists `address`.
-    fn explains(&self, address: &str, pos: i64) -> bool {
-        self.latest.get(address).is_some_and(|erased| *erased > pos)
+    /// An erasure after `pos` lists `address` and explains it for `run_id`.
+    fn explains(&self, address: &str, pos: i64, run_id: Option<&str>) -> bool {
+        let Some(run_id) = run_id else {
+            return false;
+        };
+        self.by_address.get(address).is_some_and(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|&index| self.events.get(index))
+                .any(|erasure| erasure.pos > pos && erasure.runs.contains(run_id))
+        })
     }
 }
 
@@ -314,10 +379,12 @@ struct ContentCheck {
 #[derive(Debug)]
 struct Scan {
     erasures: Erasures,
-    /// First position the next chunk reads from.
-    next_from: i64,
-    /// The first position that was not there when verification started.
-    tail_from: i64,
+    /// First position the next chunk reads from; `None` once an event at
+    /// `i64::MAX` was read, as none can follow it.
+    next_from: Option<i64>,
+    /// The first position that was not there when verification started;
+    /// `None` if none can follow.
+    tail_from: Option<i64>,
     /// Chunks started at or past `tail_from`.
     tail_chunks: u32,
     /// The position the next event should have.
@@ -335,7 +402,7 @@ impl Scan {
             tail_from: erasures.next_from,
             tail_chunks: 0,
             erasures,
-            next_from: i64::MIN,
+            next_from: Some(i64::MIN),
             expected_pos: 1,
             heads: HashMap::new(),
             events_checked: 0,
@@ -349,7 +416,10 @@ impl Scan {
     /// run heads in the same transaction.
     fn chunk(&mut self, conn: &Connection) -> rusqlite::Result<()> {
         self.erasures.new_transaction();
-        if self.next_from >= self.tail_from {
+        let Some(from) = self.next_from else {
+            return self.finish(conn);
+        };
+        if self.tail_from.is_some_and(|tail_from| from >= tail_from) {
             self.tail_chunks += 1;
         }
         let limit = if self.tail_chunks > MAX_TAIL_CHUNKS {
@@ -361,20 +431,26 @@ impl Scan {
             "SELECT global_pos, run_id, seq, kind, ts_ms, body, prev_hash, event_hash
              FROM events WHERE global_pos >= ?1 ORDER BY global_pos LIMIT ?2",
         )?;
-        let mut rows = statement.query(params![self.next_from, limit])?;
+        let mut rows = statement.query(params![from, limit])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
             count += 1;
             let stored = StoredEvent::read(row)?;
-            self.next_from = stored.pos.saturating_add(1);
+            self.next_from = stored.pos.checked_add(1);
             self.check_event(conn, &stored)?;
         }
-        if limit == NO_LIMIT || count < CHUNK_EVENTS {
-            if self.first_problem.is_none() {
-                self.first_problem = self.run_head_problem(conn)?;
-            }
-            self.finished = true;
+        if limit == NO_LIMIT || count < CHUNK_EVENTS || self.next_from.is_none() {
+            self.finish(conn)?;
         }
+        Ok(())
+    }
+
+    /// The last event was read: checks the run heads in the same transaction.
+    fn finish(&mut self, conn: &Connection) -> rusqlite::Result<()> {
+        if self.first_problem.is_none() {
+            self.first_problem = self.run_head_problem(conn)?;
+        }
+        self.finished = true;
         Ok(())
     }
 
@@ -409,7 +485,8 @@ impl Scan {
             self.heads.insert(run_id.clone(), head);
         }
 
-        let content = self.check_content(conn, stored.pos, body.as_ref())?;
+        let content =
+            self.check_content(conn, stored.pos, stored.run_id.as_deref(), body.as_ref())?;
         if content.erased {
             self.erased_events += 1;
         }
@@ -444,11 +521,13 @@ impl Scan {
     }
 
     /// Checks that the body's `content` array and the `event_content` rows
-    /// agree, and that every address has a blob or was erased later.
+    /// agree, and that every address has a blob or was erased later for the
+    /// event's run.
     fn check_content(
         &mut self,
         conn: &Connection,
         pos: i64,
+        run_id: Option<&str>,
         body: Option<&Value>,
     ) -> rusqlite::Result<ContentCheck> {
         let mut check = ContentCheck::default();
@@ -478,11 +557,11 @@ impl Scan {
             if has_blob(conn, address)? {
                 continue;
             }
-            if !self.erasures.explains(address, pos) {
+            if !self.erasures.explains(address, pos, run_id) {
                 // An erasure committed since the first pass may explain it.
                 self.erasures.catch_up(conn)?;
             }
-            if self.erasures.explains(address, pos) {
+            if self.erasures.explains(address, pos, run_id) {
                 check.erased = true;
             } else {
                 check.problem = true;
@@ -631,6 +710,7 @@ fn integer(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::RangeInclusive;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1242,6 +1322,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_erasure_explains_its_own_run_and_the_runs_it_names_only() {
+        // Appended to run b without naming a: b's reference is erased, a's
+        // is missing.
+        let dir = tempfile::tempdir().unwrap();
+        let store = shared_content(dir.path()).await;
+        let shared = address(b"shared");
+        store.append(erasure("b", &[&shared], &[])).await.unwrap();
+        let store = tampered(store, dir.path(), delete_blob(shared)).await;
+        let result = verified(&store).await;
+        assert_eq!(
+            result.first_problem,
+            problem_at(VerifyProblemKind::ContentMissing, 1, "a")
+        );
+        assert_eq!(result.erased_events, 1);
+
+        // Appended to a third run that names both: both are erased.
+        let dir = tempfile::tempdir().unwrap();
+        let store = shared_content(dir.path()).await;
+        let shared = address(b"shared");
+        store
+            .append(erasure("c", &[&shared], &["a", "b"]))
+            .await
+            .unwrap();
+        let store = tampered(store, dir.path(), delete_blob(shared)).await;
+        let result = verified(&store).await;
+        assert!(result.ok, "{result:?}");
+        assert_eq!(result.erased_events, 2);
+    }
+
+    #[tokio::test]
+    async fn an_erasure_in_an_unrelated_run_explains_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = shared_content(dir.path()).await;
+        let shared = address(b"shared");
+        store
+            .append(erasure("c", &[&shared], &["c"]))
+            .await
+            .unwrap();
+        let store = tampered(store, dir.path(), delete_blob(shared)).await;
+        let result = verified(&store).await;
+        assert_eq!(
+            result.first_problem,
+            problem_at(VerifyProblemKind::ContentMissing, 1, "a")
+        );
+        assert_eq!(result.erased_events, 0);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_erasure_is_reported_at_the_erasure_event() {
+        // An unrelated run's erasure rewritten to name runs a and b: the
+        // references pass as erased, the rewritten erasure itself doesn't.
+        let dir = tempfile::tempdir().unwrap();
+        let store = shared_content(dir.path()).await;
+        let shared = address(b"shared");
+        store
+            .append(erasure("c", &[&shared], &["c"]))
+            .await
+            .unwrap();
+        let forged = erasure("c", &[&shared], &["a", "b"]).body;
+        let forged = String::from_utf8(event::canonical_json(&forged).unwrap()).unwrap();
+        let store = tampered(store, dir.path(), |conn| {
+            conn.execute("UPDATE events SET body = ?1 WHERE global_pos = 4", [forged])
+                .unwrap();
+            delete_blob(shared)(conn);
+        })
+        .await;
+        let result = verified(&store).await;
+        assert_eq!(
+            result.first_problem,
+            problem_at(VerifyProblemKind::EventHashMismatch, 4, "c")
+        );
+        assert_eq!(result.erased_events, 2);
+    }
+
+    #[tokio::test]
     async fn an_index_that_disagrees_with_the_body_is_content_missing() {
         let dir = tempfile::tempdir().unwrap();
         let store = shared_content(dir.path()).await;
@@ -1321,8 +1476,17 @@ mod tests {
         open(dir).close().await.unwrap();
         let mut conn = raw(dir);
         let tx = conn.transaction().unwrap();
+        insert_runs(&tx, 1..=count, runs);
+        tx.commit().unwrap();
+        drop(conn);
+        open(dir)
+    }
+
+    /// Writes valid events at `positions` for `runs` new runs `run-0`, ...,
+    /// with their `runs` rows.
+    fn insert_runs(tx: &rusqlite::Connection, positions: RangeInclusive<u64>, runs: u64) {
         let mut heads: HashMap<String, (u64, String)> = HashMap::new();
-        for pos in 1..=count {
+        for pos in positions {
             let run_id = format!("run-{}", pos % runs);
             let (seq, prev) = match heads.get(&run_id) {
                 None => (1, ZERO_HASH.to_owned()),
@@ -1337,7 +1501,7 @@ mod tests {
                 .unwrap();
             }
             let hash = insert_hashed(
-                &tx,
+                tx,
                 &HashedEvent {
                     run_id: &run_id,
                     seq,
@@ -1357,9 +1521,6 @@ mod tests {
             )
             .unwrap();
         }
-        tx.commit().unwrap();
-        drop(conn);
-        open(dir)
     }
 
     const MANY: u64 = 25_000;
@@ -1487,6 +1648,66 @@ mod tests {
                 first_problem: None,
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erasure_past_the_first_gathered_chunk_explains_an_earlier_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = shared_content(dir.path()).await;
+        let shared = address(b"shared");
+        // A full chunk of other events after the references, so the erasure
+        // is read by the second chunk of the first pass.
+        store.close().await.unwrap();
+        drop(store);
+        let filler = CHUNK_EVENTS as u64;
+        let mut conn = raw(dir.path());
+        let tx = conn.transaction().unwrap();
+        insert_runs(&tx, 4..=3 + filler, RUNS);
+        tx.commit().unwrap();
+        drop(conn);
+        let store = open(dir.path());
+        store
+            .append(erasure("b", &[&shared], &["a", "b"]))
+            .await
+            .unwrap();
+        let store = tampered(store, dir.path(), delete_blob(shared)).await;
+        let result = verified(&store).await;
+        assert_eq!(
+            result,
+            VerifyResult {
+                ok: true,
+                events_checked: filler + 4,
+                erased_events: 2,
+                first_problem: None,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_at_the_largest_position_is_read_once() {
+        // A full chunk whose last event sits at `i64::MAX`: nothing can
+        // follow it, so the scan ends there instead of reading it again.
+        let dir = tempfile::tempdir().unwrap();
+        let count = CHUNK_EVENTS as u64;
+        let store = written_log(dir.path(), count, RUNS).await;
+        let store = tampered(store, dir.path(), |conn| {
+            conn.execute(
+                "UPDATE events SET global_pos = ?1 WHERE global_pos = ?2",
+                params![i64::MAX, count as i64],
+            )
+            .unwrap();
+        })
+        .await;
+        let result = verified(&store).await;
+        assert_eq!(
+            result.first_problem,
+            problem_at(
+                VerifyProblemKind::GlobalPositionGap,
+                i64::MAX as u64,
+                &run_at(count)
+            )
+        );
+        assert_eq!(result.events_checked, count);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
