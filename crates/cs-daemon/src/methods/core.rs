@@ -48,6 +48,8 @@ pub async fn health(
         capture_content: store.capture_content(),
         last_global_position,
         erasure_pending: store.erasure_pending(),
+        // Filled by the proxy wiring (feature 03, task 7).
+        proxy: None,
     })
 }
 

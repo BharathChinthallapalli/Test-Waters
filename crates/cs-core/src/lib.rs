@@ -5,4 +5,5 @@
 
 pub mod control;
 pub mod event;
+pub mod llm;
 pub mod rpc;

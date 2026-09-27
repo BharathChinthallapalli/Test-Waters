@@ -11,8 +11,10 @@ unmaintained = "workspace"
 # Licences allowed for dependencies and for the workspace's own crates, which
 # are MIT (ADR 0008). Every entry must be compatible with shipping under MIT.
 # BSD-3-Clause: subtle, and matchit via axum. Zlib: foldhash via rusqlite and
-# zbus (feature 02 design).
-allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "Zlib"]
+# zbus (feature 02 design). ISC: ring, untrusted and rustls-webpki, the TLS stack
+# the proxy uses to reach the provider (feature 03). CDLA-Permissive-2.0:
+# webpki-root-certs, Mozilla's root certificate data used by that stack.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "Zlib", "ISC", "CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"

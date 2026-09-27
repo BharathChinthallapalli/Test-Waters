@@ -248,6 +248,8 @@ impl Instance {
             started_at_ms: self.started_at_ms,
             address,
             schema_version: cs_store::migrate::CURRENT_SCHEMA_VERSION,
+            // Filled by the proxy wiring (feature 03, task 7).
+            proxy_address: None,
         };
         let path = self.data_dir.join(DISCOVERY_FILE_NAME);
         let discovery_error = |source| InstanceError::Discovery {
@@ -391,6 +393,7 @@ mod tests {
             started_at_ms: 1_700_000_000_000,
             address: "127.0.0.1:4100".parse().unwrap(),
             schema_version: 1,
+            proxy_address: None,
         };
 
         let json = serde_json::to_value(&discovery).unwrap();

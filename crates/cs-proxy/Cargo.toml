@@ -8,5 +8,28 @@ repository.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[dependencies]
+bytes = "1.12.1"
+cs-core = { version = "0.1.0", path = "../cs-core" }
+cs-store = { version = "0.1.0", path = "../cs-store" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+# Pinned to the versions cs-daemon already uses (src/serve.rs there).
+hyper = { version = "1.11.1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["http1", "server", "service", "tokio"] }
+# rustls with ring, not aws-lc-rs: no C toolchain or cmake needed to build it on
+# Windows and macOS. Roots come from the OS (rustls-platform-verifier), which also
+# honours SSL_CERT_FILE on Linux; HTTPS_PROXY is honoured (system-proxy).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream", "http2", "system-proxy"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true
