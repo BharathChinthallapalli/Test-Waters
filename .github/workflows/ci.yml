@@ -177,6 +177,18 @@ jobs:
       # package, so a failed download fails this step and not the check.
       - name: Download the Electron binary
         run: pnpm -C apps/desktop exec install-electron
+      # Ubuntu 23.10 and later restrict unprivileged user namespaces with
+      # AppArmor, so Chromium uses its setuid sandbox helper, which must be
+      # owned by root with mode 4755 (Chromium's
+      # docs/security/apparmor-userns-restrictions.md and
+      # docs/linux/suid_sandbox_development.md). The app keeps its sandbox;
+      # --no-sandbox is never used here.
+      - name: Set up Chromium's setuid sandbox helper
+        working-directory: apps/desktop
+        run: |
+          helper="$(node -p 'require("node:path").join(require("node:path").dirname(require("electron")), "chrome-sandbox")')"
+          sudo chown root:root "$helper"
+          sudo chmod 4755 "$helper"
       - run: pnpm -C apps/desktop build
       - run: cargo build -p cs-daemon --locked
       - name: Start the app and the daemon behind logging proxies
