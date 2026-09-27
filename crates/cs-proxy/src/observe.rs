@@ -4,7 +4,23 @@
 //! [`ResponseObserver`] is fed every response chunk, in order, after the chunk
 //! was sent to the client. It must never fail and must bound its memory: an SSE
 //! line or a JSON body over its cap is skipped and the fields it would have
-//! given stay `None`.
+//! given stay `None`. JSON is read into small typed structs; everything else,
+//! such as `content`, is skipped by the parser without being built
+//! (`tests/observe_memory.rs` measures the peak).
+//!
+//! Known limits:
+//! - A non-streamed body over 4 MiB is not parsed, so its usage is lost:
+//!   `usage` comes after `content` in the Message object and can't be reached
+//!   without reading the whole body.
+//! - An over-cap line voids its event even when it is a comment line.
+//! - A body with a `content-encoding` other than `identity` is only counted.
+//!   The proxy strips `accept-encoding` from requests (`headers.rs`), so the
+//!   upstream shouldn't send one.
+//! - `model` is the one the response body names. After a server-side fallback
+//!   that can be the model requested rather than the one that served the call;
+//!   recording the serving model is a follow-up.
+//! - A duplicate key in an object that is read fails the whole parse (the
+//!   derived structs reject duplicates); it is not a documented shape.
 //!
 //! Wire facts (`.kiro/specs/03-passthrough-proxy/sources.md`, sections 2-6):
 //! - Streams: <https://platform.claude.com/docs/en/build-with-claude/streaming>
@@ -27,11 +43,14 @@
 //!   dispatched, nor is one cut off by the end of the body.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 
 use cs_core::llm::Usage;
 use http::{HeaderMap, StatusCode};
-use serde::Deserialize;
-use serde_json::Value;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{self, DeserializeOwned, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// Longest SSE line kept; a longer one voids its event.
 const MAX_SSE_LINE_BYTES: usize = 1 << 20;
@@ -75,6 +94,8 @@ enum BodyReader {
     Sse(SseDecoder),
     /// `None` once the body went over [`MAX_JSON_BODY_BYTES`].
     Json(Option<Vec<u8>>),
+    /// A content-coded body: its bytes are counted, never read.
+    Encoded,
 }
 
 impl ResponseObserver {
@@ -86,7 +107,9 @@ impl ResponseObserver {
             .is_some_and(is_event_stream);
         let rate_limit_headers = recorded_headers(headers);
         let request_id = rate_limit_headers.get("request-id").cloned();
-        let body = if streamed {
+        let body = if is_content_coded(headers) {
+            BodyReader::Encoded
+        } else if streamed {
             BodyReader::Sse(SseDecoder::default())
         } else {
             BodyReader::Json(Some(Vec::new()))
@@ -123,6 +146,7 @@ impl ResponseObserver {
                     *buffer = None;
                 }
             }
+            BodyReader::Encoded => {}
         }
     }
 
@@ -130,18 +154,18 @@ impl ResponseObserver {
     /// by a blank line is discarded.
     pub fn finish(mut self) -> Observed {
         if let BodyReader::Json(Some(bytes)) = &self.body
-            && let Ok(body) = serde_json::from_slice::<Fields>(bytes)
+            && let Some(body) = parse_fields(bytes)
         {
-            if body.kind.as_ref().and_then(Value::as_str) == Some("error") {
-                set_error_type(&mut self.observed, body.error.as_ref());
+            if body.kind.0.as_deref() == Some("error") {
+                set_error_type(&mut self.observed, body.error);
             } else {
-                if let Some(model) = label(body.model.as_ref()) {
+                if let Some(model) = body.model.0 {
                     self.observed.model = Some(model);
                 }
-                if let Some(reason) = label(body.stop_reason.as_ref()) {
+                if let Some(reason) = body.stop_reason.0 {
                     self.observed.stop_reason = Some(reason);
                 }
-                self.usage.overwrite(body.usage.as_ref());
+                self.usage.overwrite(body.usage);
             }
         }
         self.observed.usage = self.usage.into_usage();
@@ -156,8 +180,27 @@ impl ResponseObserver {
                 decoder.line.capacity() + decoder.data.capacity() + decoder.event.capacity()
             }
             BodyReader::Json(buffer) => buffer.as_ref().map_or(0, Vec::capacity),
+            BodyReader::Encoded => 0,
         }
     }
+}
+
+/// A `content-encoding` listing a coding other than `identity`
+/// (<https://www.rfc-editor.org/rfc/rfc9110#section-8.4>: a comma-separated
+/// list; `identity` is reserved and shouldn't be sent). An unreadable value
+/// counts as coded, so it is never parsed.
+fn is_content_coded(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |codings| {
+                codings
+                    .split(',')
+                    .map(str::trim)
+                    .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+            })
+        })
 }
 
 /// `text/event-stream`, ignoring parameters and ASCII case.
@@ -347,18 +390,175 @@ impl SseDecoder {
     }
 }
 
-/// The fields read from an event's data or a non-streamed body; the rest of
-/// the JSON (such as `content`) is skipped without being kept.
+/// Parses an event's data or a non-streamed body. Only the fields below are
+/// kept; the rest of the JSON (such as `content`) is skipped by the parser
+/// without being built, so parsing adds little memory to the bytes buffered.
+fn parse_fields(json: &[u8]) -> Option<Fields> {
+    serde_json::from_slice::<Object<Fields>>(json).ok()?.0
+}
+
+/// The top-level fields read. Each is lenient: a value of the wrong type
+/// reads as absent and doesn't fail the parse.
 #[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct Fields {
     #[serde(rename = "type")]
-    kind: Option<Value>,
-    model: Option<Value>,
-    stop_reason: Option<Value>,
-    usage: Option<Value>,
-    error: Option<Value>,
-    message: Option<Value>,
-    delta: Option<Value>,
+    kind: Label,
+    model: Label,
+    stop_reason: Label,
+    usage: Object<UsageFields>,
+    error: Object<ErrorFields>,
+    message: Object<MessageFields>,
+    delta: Object<DeltaFields>,
+}
+
+/// `message` of `message_start`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct MessageFields {
+    model: Label,
+    usage: Object<UsageFields>,
+}
+
+/// `delta` of `message_delta`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DeltaFields {
+    stop_reason: Label,
+}
+
+/// `error` of an error body or event.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ErrorFields {
+    #[serde(rename = "type")]
+    kind: Label,
+}
+
+/// A `usage` object.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UsageFields {
+    input_tokens: Count,
+    output_tokens: Count,
+    cache_creation_input_tokens: Count,
+    cache_read_input_tokens: Count,
+}
+
+/// A string of at most [`MAX_LABEL_BYTES`]; any other value is `None`.
+#[derive(Debug, Default)]
+struct Label(Option<String>);
+
+/// A non-negative integer; any other value is `None`.
+#[derive(Debug, Default)]
+struct Count(Option<u64>);
+
+/// A JSON object read as `T`; any other value is `None`. Only objects are
+/// taken, so an array is never read as a struct's fields by position.
+#[derive(Debug)]
+struct Object<T>(Option<T>);
+
+impl<T> Default for Object<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+/// A value read from whatever JSON type arrives. A type it doesn't take gives
+/// `Default`; an array or object it doesn't take is skipped with
+/// [`IgnoredAny`], which keeps nothing of it.
+trait Lenient: Default {
+    fn from_str(_text: &str) -> Self {
+        Self::default()
+    }
+
+    fn from_u64(_number: u64) -> Self {
+        Self::default()
+    }
+
+    fn from_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Self::default())
+    }
+}
+
+impl Lenient for Label {
+    fn from_str(text: &str) -> Self {
+        Self((text.len() <= MAX_LABEL_BYTES).then(|| text.to_owned()))
+    }
+}
+
+impl Lenient for Count {
+    fn from_u64(number: u64) -> Self {
+        Self(Some(number))
+    }
+}
+
+impl<T: DeserializeOwned> Lenient for Object<T> {
+    fn from_map<'de, A: MapAccess<'de>>(map: A) -> Result<Self, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map)).map(|value| Self(Some(value)))
+    }
+}
+
+struct LenientVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Lenient> Visitor<'de> for LenientVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _value: bool) -> Result<T, E> {
+        Ok(T::default())
+    }
+
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<T, E> {
+        Ok(T::default())
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<T, E> {
+        Ok(T::from_u64(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, _value: f64) -> Result<T, E> {
+        Ok(T::default())
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+        Ok(T::from_str(value))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<T, E> {
+        Ok(T::default())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<T, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(T::default())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        T::from_map(map)
+    }
+}
+
+impl<'de> Deserialize<'de> for Label {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
 }
 
 /// The SSE event types the observer reads.
@@ -386,15 +586,14 @@ impl EventKind {
 
 /// Applies one dispatched SSE event. Invalid JSON is ignored.
 fn apply_event(observed: &mut Observed, usage: &mut UsageParts, name: &[u8], data: &[u8]) {
-    let parse = || serde_json::from_slice::<Fields>(data).ok();
+    let parse = || parse_fields(data);
     // Events are named, with a matching `type` in the data; fall back to
     // `type` when the name is missing. Only the events used are parsed.
     let (kind, fields) = if name.is_empty() {
         let fields = parse();
         let kind = fields
             .as_ref()
-            .and_then(|fields| fields.kind.as_ref())
-            .and_then(Value::as_str)
+            .and_then(|fields| fields.kind.0.as_deref())
             .map_or(EventKind::Other, |kind| {
                 EventKind::from_name(kind.as_bytes())
             });
@@ -404,29 +603,28 @@ fn apply_event(observed: &mut Observed, usage: &mut UsageParts, name: &[u8], dat
     };
     match kind {
         EventKind::MessageStart => {
-            let Some(message) = fields.or_else(parse).and_then(|fields| fields.message) else {
+            let Some(message) = fields.or_else(parse).and_then(|fields| fields.message.0) else {
                 return;
             };
-            if let Some(model) = label(message.get("model")) {
+            if let Some(model) = message.model.0 {
                 observed.model = Some(model);
             }
-            usage.overwrite(message.get("usage"));
+            usage.overwrite(message.usage);
         }
         EventKind::MessageDelta => {
             let Some(fields) = fields.or_else(parse) else {
                 return;
             };
             // A usage-only delta with a null stop reason keeps the earlier one.
-            let delta = fields.delta.as_ref();
-            if let Some(reason) = label(delta.and_then(|delta| delta.get("stop_reason"))) {
+            if let Some(reason) = fields.delta.0.and_then(|delta| delta.stop_reason.0) {
                 observed.stop_reason = Some(reason);
             }
-            usage.overwrite(fields.usage.as_ref());
+            usage.overwrite(fields.usage);
         }
         EventKind::MessageStop => observed.saw_message_stop = true,
         EventKind::Error => {
             if let Some(fields) = fields.or_else(parse) {
-                set_error_type(observed, fields.error.as_ref());
+                set_error_type(observed, fields.error);
             }
         }
         EventKind::Other => {}
@@ -434,18 +632,10 @@ fn apply_event(observed: &mut Observed, usage: &mut UsageParts, name: &[u8], dat
 }
 
 /// Records the first `error.type` seen.
-fn set_error_type(observed: &mut Observed, error: Option<&Value>) {
+fn set_error_type(observed: &mut Observed, error: Object<ErrorFields>) {
     if observed.error_type.is_none() {
-        observed.error_type = label(error.and_then(|error| error.get("type")));
+        observed.error_type = error.0.and_then(|error| error.kind.0);
     }
-}
-
-/// A short string value; anything else (null, a number, too long) is `None`.
-fn label(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .filter(|text| text.len() <= MAX_LABEL_BYTES)
-        .map(str::to_owned)
 }
 
 /// Token counts reported so far; each report replaces the fields it carries.
@@ -460,22 +650,25 @@ struct UsageParts {
 impl UsageParts {
     /// Overwrites (never adds) each count present as a non-negative integer;
     /// absent or null counts keep their earlier value.
-    fn overwrite(&mut self, usage: Option<&Value>) {
-        let Some(usage) = usage.and_then(Value::as_object) else {
+    fn overwrite(&mut self, usage: Object<UsageFields>) {
+        let Some(usage) = usage.0 else {
             return;
         };
-        let slots = [
-            ("input_tokens", &mut self.input_tokens),
-            ("output_tokens", &mut self.output_tokens),
+        let reports = [
+            (&mut self.input_tokens, usage.input_tokens),
+            (&mut self.output_tokens, usage.output_tokens),
             (
-                "cache_creation_input_tokens",
                 &mut self.cache_creation_input_tokens,
+                usage.cache_creation_input_tokens,
             ),
-            ("cache_read_input_tokens", &mut self.cache_read_input_tokens),
+            (
+                &mut self.cache_read_input_tokens,
+                usage.cache_read_input_tokens,
+            ),
         ];
-        for (key, slot) in slots {
-            if let Some(count) = usage.get(key).and_then(Value::as_u64) {
-                *slot = Some(count);
+        for (slot, count) in reports {
+            if count.0.is_some() {
+                *slot = count.0;
             }
         }
     }
@@ -788,9 +981,93 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_body_is_not_a_usage() {
-        // `{"input_tokens": N}` is an estimate, not a call's usage (sources.md 6).
-        assert_eq!(whole(&json(), b"{\"input_tokens\": 42}").usage, None);
+    fn non_streamed_usage_needs_both_counts() {
+        // Input tokens alone would need an invented output count.
+        let body = b"{\"type\":\"message\",\"model\":\"m\",\"usage\":{\"input_tokens\":42}}";
+        let observed = whole(&json(), body);
+        assert_eq!(observed.model.as_deref(), Some("m"));
+        assert_eq!(observed.usage, None);
+        let body = b"{\"type\":\"message\",\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}";
+        assert_eq!(whole(&json(), body).usage, usage(42, 0, None, None));
+    }
+
+    #[test]
+    fn wrong_typed_fields_read_as_absent_without_failing_the_parse() {
+        let body = b"{\"type\":\"message\",\"model\":\"m\",\"stop_reason\":[1],\
+            \"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"cache_read_input_tokens\":{\"x\":1}},\
+            \"delta\":7,\"message\":[{\"model\":\"not read\"}],\"error\":\"x\",\"content\":[{\"a\":[[]]}]}";
+        let observed = whole(&json(), body);
+        assert_eq!(observed.model.as_deref(), Some("m"));
+        assert_eq!(observed.stop_reason, None);
+        assert_eq!(observed.usage, usage(3, 4, None, None));
+
+        // An array where an object belongs is not read by position.
+        let body = b"{\"usage\":[5,6,7,8]}";
+        assert_eq!(whole(&json(), body).usage, None);
+        let body = b"event: message_start\ndata: {\"message\":[\"m\",[1,2]]}\n\n";
+        let observed = whole(&sse(), body);
+        assert_eq!((observed.model, observed.usage), (None, None));
+        let body = b"event: message_start\n\
+            data: {\"message\":{\"model\":\"m\",\"usage\":[1,2]}}\n\n";
+        let observed = whole(&sse(), body);
+        assert_eq!(observed.model.as_deref(), Some("m"));
+        assert_eq!(observed.usage, None);
+    }
+
+    #[test]
+    fn content_coded_bodies_are_only_counted() {
+        for coding in ["gzip", "br", "identity, gzip", "x-unknown", "Identity,br"] {
+            let mut map = sse();
+            map.insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_static(coding),
+            );
+            map.insert("request-id", HeaderValue::from_static("req_fixture02"));
+            let observed = whole(&map, TEXT);
+            assert_eq!(
+                observed,
+                Observed {
+                    streamed: true,
+                    request_id: Some("req_fixture02".into()),
+                    rate_limit_headers: [("request-id".to_owned(), "req_fixture02".to_owned())]
+                        .into(),
+                    response_bytes: TEXT.len() as u64,
+                    ..Observed::default()
+                },
+                "{coding}"
+            );
+            let mut map = json();
+            map.insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_static(coding),
+            );
+            let mut observer = ResponseObserver::new(StatusCode::OK, &map);
+            observer.feed(MESSAGE_JSON);
+            assert_eq!(observer.buffered_capacity(), 0, "{coding}");
+            assert_eq!(observer.finish().model, None, "{coding}");
+        }
+        // `identity` (or an empty value) is no coding: the body is read.
+        for coding in [
+            &b"identity"[..],
+            b"IDENTITY",
+            b" identity , identity",
+            b"",
+            b" ",
+        ] {
+            let mut map = sse();
+            map.insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_bytes(coding).unwrap(),
+            );
+            assert_eq!(whole(&map, TEXT), whole(&sse(), TEXT), "{coding:?}");
+        }
+        // A value that isn't text counts as coded.
+        let mut map = sse();
+        map.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_bytes(b"gz\xffip").unwrap(),
+        );
+        assert_eq!(whole(&map, TEXT).usage, None);
     }
 
     #[test]
