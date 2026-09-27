@@ -4,24 +4,36 @@ Requirements and design in one file, kept short on purpose (#40). Wire facts are
 the official pages in "Sources"; anything not verified there is marked.
 
 ## Goal
-Point Claude Code at Callsheet with one environment variable and have it keep working
-exactly as before, while every call is recorded locally as metadata:
+Point Claude Code's Anthropic API traffic at Callsheet with one environment
+variable. Preserve the model request and streaming behavior specified below
+while recording observed /v1/ calls locally as metadata:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:<proxy port>
 claude
 ```
 
-Done means: a real Claude Code session runs through the proxy unchanged (streaming,
-tool use, subscription or API-key login), and each call shows up in the desktop app's
-**Recent calls** list with model, tokens, status and timing. No content is stored
-unless capture is on. Nothing is sent anywhere except the provider the call was for.
+Done means: a real Claude Code session routes its Anthropic API requests through
+the proxy (streaming, tool use, subscription or API-key login), and recorded
+/v1/ calls appear in the desktop app's **Recent calls** list with model,
+tokens, status and timing. No content is stored unless capture is on. The
+proxy forwards those calls only to the configured upstream provider. This does
+not claim to capture other traffic Claude Code sends directly.
 
 Not in 03: budgets and 429 enforcement (05), rate limiting (06), OpenAI/Codex (#5),
 cost in money (05's price table), signed checkpoints (04), OTLP (09).
 
+Claude Code changes some behavior when `ANTHROPIC_BASE_URL` points at a
+non-first-party host: MCP tool search is disabled by default unless
+`ENABLE_TOOL_SEARCH=true` and the gateway supports its tool references;
+Remote Control is disabled as of v2.1.196. See the official
+[environment-variable reference](https://code.claude.com/docs/en/env-vars).
+Document these limitations beside the base-URL setup and exercise the
+supported features in the real-session checkpoint. Byte-preserving HTTP
+forwarding cannot restore a feature the client disables before sending traffic.
+
 ## Requirements
-1. **Transparent.** Request method, path, query, headers and body bytes reach the
+1. **Transparent at the model API boundary.** Request method, path, query, headers and body bytes reach the
    upstream unchanged, except the rules in "Headers". Response status, headers and
    body bytes reach the client unchanged and in order; SSE events are forwarded as
    they arrive, never buffered to the end. `anthropic-beta`, `anthropic-version` and
@@ -133,6 +145,9 @@ the drain grace, drain the recorder, then the existing steps.
 - **Guard:** `Origin` → 403; wrong `Host` → 403.
 - **Real end-to-end** (manual, recorded in `progress.md`): Claude Code `claude -p`
   through the proxy; the call appears in `calls.list` and the desktop list.
+  Document observed behavior for MCP tool search, Remote Control availability,
+  and any client features changed by the custom base URL. Do not mark an
+  unsupported feature as an HTTP transparency failure.
 
 ## Sources
 [`sources.md`](sources.md): every wire fact with its official URL, fetched 2026-09-27
