@@ -421,3 +421,27 @@ in waves; `tasks.md` records the order.
   dead-code warnings.
 - Blocked: the default port. `www.iana.org` is denied by this environment's network policy,
   so the registry couldn't be checked (task 0.5).
+
+## 2026-09-27 — render check after wave 2; spellcheck dictionary download found and stopped
+
+A run of `main` after #51 and #52, with the real binaries.
+
+Daemon (`cs-daemon --data-dir $TMP`, default `127.0.0.1:0`):
+- The data dir is `700`; `daemon.json`, `control-token` and `daemon.lock` are `600`.
+- `version` with the token returns 200.
+- No token gives 401. An `Origin` header or a `localhost` Host gives 403.
+- A batch with one notification and one unknown method returns two entries, with -32601 for the unknown method.
+- A second instance is refused and names the pid, exit 1.
+- `--listen 0.0.0.0:1` exits 2 and creates no directory.
+- SIGTERM exits 0 and removes `daemon.json`.
+- The token is absent from the log.
+
+Desktop app: renders `app://renderer/index.html` ("Callsheet").
+
+**Leak found:** routed through a local proxy that logs and refuses every host, the app made one request on every start, to
+`https://redirector.gvt1.com/edgedl/chrome/dict/en-us-10-1.bdic`. That is the spellchecker's Hunspell dictionary for
+the system language.
+- The #33 fix turned the spellchecker off but did not stop the download.
+- The download goes through a loader that `webRequest` doesn't see, so the filter didn't catch it either.
+- Also calling `session.setSpellCheckerLanguages([])` stops it: `main` made 1 request on each of 2 of 2 runs; the fix made 0 on 4 of 4.
+- Follow-up: a CI check that launches the app behind a logging proxy and fails on any outbound request would catch regressions like this. CI has no display yet, so for now this is a manual check recorded here.
