@@ -6,7 +6,7 @@ Write a spec only when a feature becomes active. Scope notes below, plus the det
 | # | Feature | Status | Scope (input for its future spec) |
 |---|---|---|---|
 | 01 | foundation | done | Workspaces, ADRs, hardened Electron shell, Rust→TS types, CI, OSS files |
-| 02 | daemon-and-store | active | Loopback-only daemon, token-auth JSON-RPC control API, SQLite WAL, append-only hash-chained event log, content-addressed message blobs (capture off by default) |
+| 02 | daemon-and-store | done | Loopback-only daemon, token-auth JSON-RPC control API, SQLite WAL, append-only hash-chained event log, content-addressed message blobs (capture off by default) |
 | 03 | passthrough-proxy | queued | Anthropic Messages proxy (plain + SSE), key never stored, recording off the critical path (bounded queue, drop+count), W3C traceparent, golden transparency tests, adapters/claude-code |
 | 04 | log-integrity | queued | Root Ed25519 key in OS keychain, signed C2SP checkpoints, `verify-log` CLI |
 | 05 | budgets | queued | Policy schema + tamper check, versioned price table, reserve/settle ledger with idempotency keys and startup reconciliation, 429 + Retry-After, streaming cap |

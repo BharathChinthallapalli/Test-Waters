@@ -445,3 +445,118 @@ the system language.
 - The download goes through a loader that `webRequest` doesn't see, so the filter didn't catch it either.
 - Also calling `session.setSpellCheckerLanguages([])` stops it: `main` made 1 request on each of 2 of 2 runs; the fix made 0 on 4 of 4.
 - Follow-up: a CI check that launches the app behind a logging proxy and fails on any outbound request would catch regressions like this. CI has no display yet, so for now this is a manual check recorded here.
+
+## 2026-09-27 — 02 daemon-and-store: tasks 1–12 merged
+
+All twelve units of feature 02 are merged: #45–#52, #54, #55, #59 and #60. Each passed the 8 gates
+locally. The notes below come from each PR's "Notes for progress.md" and "How it was verified".
+
+- **1 event-hash (#46)**
+  - serde_json holds `-0`, `1.0`, `1e3` and integers above `u64::MAX` as floats, so bodies with them are rejected as "not an integer". `JSON.stringify` never emits them for integers.
+  - Nesting is capped at 64. serde_json parses at most 127 levels, so the first draft's cap of 128 accepted bodies that could never be read back (found in review).
+  - canon-json 0.2.1's vectors leave out upstream's `333333333.33333329`: serde_json without `float_roundtrip` parses it to a neighbouring double. Event hashes are unaffected, since bodies have no floats.
+  - A nested `crates/cs-core/tests/rfc8785/biome.json` (`"root": false`) stops Biome reformatting the vectors.
+- **2 win-acl (#49)**
+  - Protected DACL with one owner ACE, passed in `SECURITY_ATTRIBUTES` at creation. Directories get `D:P(A;OICI;FA;;;<SID>)`, files `D:P(A;;FA;;;<SID>)`: OI/CI do nothing on a file, although design.md writes OICI for both.
+  - On Windows, SQLite's `-wal`/`-shm` inherit the directory's DACL, not the database file's. They are owner-only only inside an owner-only directory.
+  - A follow-up commit sets the owner too (`O:<SID>`); without it an elevated process's files are owned by `BUILTIN\Administrators`.
+  - New CI job "Rust on Windows (owner-only files)" on `windows-2025`; since #52 it runs all cs-store and cs-daemon tests. This is the workspace's first `#[allow(unsafe_code)]` (the lint is `deny`, not `forbid`).
+  - A local `x86_64-pc-windows-gnu` build needs MinGW for bundled SQLite; compiling one module through a `#[path]` crate is a stand-in.
+- **3 secrets (#48)**
+  - The key is 64 lowercase hex characters via `set_password`/`get_password`, never `set_secret`. The Windows store keeps passwords as UTF-16 and secrets as raw bytes; KDE Wallet takes UTF-8 only.
+  - `content_key()` must run under `spawn_blocking`: zbus's blocking API starts its own tokio runtime and panics inside an async task. It can wait on an unlock prompt, so fetch the key once.
+  - "No Secret Service" arrives as a connection `NotFound` (no bus), `ServiceUnknown` (no provider) or `NoResult` (WSL, no `default` collection). It is recognised by walking the error's source chain.
+  - A malformed stored key is reported and left in place; replacing it would orphan every blob.
+  - Fixed task 0's macOS build: `apple-native-keyring-store` hits its own `compile_error!` without the `keychain` feature. No CI job builds for macOS.
+- **4 rpc-http (#47)**
+  - Layers, outermost first: 64 KiB body limit (413), 10 s timeout (408), Host/Origin (403), bearer (401), dispatch. They wrap the fallback too.
+  - Build `HttpConfig::for_listener(&listener)` from the bound port, never the configured one, which may be 0.
+  - A timed-out request drops the dispatch future at its current `.await`, and a batch shares one 10 s budget. Work that must finish goes to the writer thread.
+  - Numeric ids outside ±(2^53 − 1), or with fractions, get -32600 with `id: null`. A batch over 16 entries gets one -32600 and nothing runs.
+  - `axum::serve` 0.8.9 builds hyper's connection builder without a timer, so hyper's 30 s header-read timeout is silently dropped (fixed in #52).
+- **5 schema (#50)**
+  - Create `callsheet.db` owner-only first and never pass `SQLITE_OPEN_CREATE`. On Unix, SQLite 3.53.2 copies the database file's mode to `-wal`, `-journal` and `-shm`.
+  - Check `user_version` on a read-only connection first. Closing a read-write connection checkpoints a newer daemon's hot WAL into the main file.
+  - Startup order is `open_writer`, `migrate`, `open_reader`: a read-only connection can't switch to WAL.
+  - `VACUUM INTO` accepts a pre-created empty target, so backups are owner-only from creation. They go through `backup-v<from>-next.db` and a rename.
+  - The bundled build sets `SQLITE_USE_URI`, so relative paths get `./` to stop `file:` names being parsed as URIs.
+- **6 docs (#45)**
+  - SECURITY.md and PRIVACY.md say that before feature 04 a same-user process that can write the database can edit events and recompute hashes undetected.
+  - PRIVACY.md says WAL truncation and backup deletion free disk space without overwriting it; R6.3 says content is overwritten "in the write-ahead log".
+- **7 writer (#51)**
+  - rusqlite 0.40.2 has `u64` `ToSql`/`FromSql` only behind `fallible_uint` (off), so positions are read as `i64` and converted with checks.
+  - Capture changes are ticketed and the last request wins. Disabling never waits on the keychain, and no content is stored once a disable is requested. Fixed after review: disabling hung behind an unlock prompt and the pending append stored content anyway.
+  - With capture already on at open, the key loads on the first append with content. After a failed load, such appends fail at once for 10 s, so a burst causes one prompt.
+  - A key may be generated only while `event_content` and `blobs` are both empty, so a key lost after capture can't be replaced without a recovery design.
+  - Provisional per-event caps: 64 content items, 8 MiB of content, 256 KiB of canonical body.
+- **8 daemon-proc (#52)**
+  - `cs_daemon::serve` replaces `axum::serve`: hyper `http1::Builder` with `TokioTimer` and a 10 s `header_read_timeout`, plus `GracefulShutdown`. The timeout closes without a response and also closes idle keep-alive connections.
+  - Discovery probes must take a *shared* lock. With an exclusive probe, a client mistakes another client's probe for a live daemon.
+  - SIGHUP is not handled on purpose: a handler overrides `nohup`'s inherited ignore. Only the third signal during shutdown forces exit 1, because terminals can deliver one Ctrl+C twice.
+  - A console close gets 2 s of drain; Windows kills the process 5 s after `CTRL_CLOSE_EVENT`.
+  - Default listen is `127.0.0.1:0`, provisional until task 0.5 (the IANA port check); clients read the port from `daemon.json`.
+- **9 verify (#54)**
+  - Reads 10 000-event chunks under the shared gate. A stored body must equal its own canonical JSON, because serde_json keeps the last of duplicated keys.
+  - A missing blob counts as erased if a later erasure lists it and is in the referencing run or names that run in `affectedRuns`. The design says "same run", which would flag shared runs.
+  - Truncating the global end with run heads set back, and editing a run's newest event with its hash recomputed, both pass until feature 04 (a test pins the first).
+  - About 5 µs per event in release, so the 10 s request timeout covers roughly 2M events.
+- **10 erase (#55)**
+  - One writer command that takes the read gate itself with `blocking_write`. `Store::exclude_readers` is test-only, because holding it across an erase deadlocks.
+  - `planId` includes `contentItems`, so replaying a used plan is refused with 1002.
+  - `content.erased` is reserved: `Store::append` refuses it, and erase appends it only when a blob was deleted.
+  - A marker stored in the db, the WAL and a `VACUUM INTO` backup was found 0 times after erasing and after both retry paths.
+- **11 wire (#60)**
+  - Dropping a tokio runtime waits for every `spawn_blocking` task with no limit. `main` calls `shutdown_timeout(1 s)` so a stuck keychain call can't keep the process alive. Reproduce by pointing `DBUS_SESSION_BUS_ADDRESS` at a socket that accepts and never answers.
+  - The backup check runs whenever a `backup-v*.db` exists at startup. An `integrity_check` failure refuses to start; a verify problem starts with a warning, keeps the backup and repeats at every start.
+  - A signal while the store opens exits 0 before listening. The lock handle is leaked so a restarted daemon can't migrate alongside the abandoned open.
+  - Params are by name only, with `deny_unknown_fields`. `Discovery` moved to `cs-core::control` with a generated TS type.
+  - New CI job "TypeScript client against the daemon"; a missing binary fails the test rather than skipping it.
+  - node:test: a `setTimeout` from `timers/promises` inside `Promise.race` keeps the run alive; pass `{ ref: false }`.
+- **12 desktop status screen (#59)**
+  - Main calls the daemon over `node:http` (`agent: false`, explicit Host, no Origin, 2 s timeout, 64 KiB cap). A logging proxy saw 0 requests. The token never leaves `src/main/daemon.ts`.
+  - Node can't probe the `daemon.lock` file lock. Liveness uses `process.kill(pid, 0)`, boot time from `os.uptime()` and, on Linux, `/proc/<pid>/stat` (zombie state, start time).
+  - The renderer is compiled by `tsconfig.renderer.json` into `dist/renderer`; main serves `dist/renderer`, not `src/renderer`.
+  - Electron 44: `execCommand("copy")` works on a user gesture with every permission denied; `navigator.clipboard` would need `clipboard-sanitized-write`.
+  - New `.kiro/steering/ui.md` (always included) records the owner's UI rule and checkable standards.
+  - UI review: Electron under Xvfb with `--remote-debugging-port`, `scripts/fake-daemon.ts`, `scripts/screenshot.ts`. Kill only the Electron binary; killing `xvfb-run` orphans Xvfb.
+
+Settled in the closing commit: design.md now records the erasure rule as built (#54's; the comment in `erase.rs` that
+said "any run" is corrected), the plan ID with `contentItems`, the Windows descriptors with `O:<SID>` and no OICI on
+files, the backup-check policy, the startup-signal and runtime-shutdown behaviour, the `events.verify` time limit and
+the desktop app's discovery deviation. R6.3 now says the write-ahead log is truncated, not overwritten. PRIVACY.md
+covers the kept backup, Windows programs holding files open and the desktop app's network behaviour; SECURITY.md
+states the desktop discovery gap.
+
+### Open follow-ups
+
+- Owner: choose the default port (task 0.5, #52).
+- Docs: revisit the hash-chain wording in feature 04 and name the CLI commands in feature 07 (#45).
+- CI: a macOS build check (#48); a launch behind a logging proxy once CI has a display (#59). Untested: the Windows signal path (#52) and a signal during a slow startup (#60).
+- `Store::close` leaves about 50 KB of `-wal` after a graceful stop; close the reader first or checkpoint (#60).
+- `events.verify` shares the 10 s timeout (about 2M events); needs a longer timeout or background verification (#54).
+- Indexes: `events.kind` for the erasure pass (#54); `event_content.address` (#55).
+- Daemon identity: a live-pid check in Rust needs `unsafe` (#52). Writing the boot id and start ticks into `daemon.json` would remove the desktop's clock slack (#59).
+- Desktop discovery gaps (#59): pid reuse on macOS and Windows; on macOS a daemon slower than 10 s to publish shows as not running; treat a readable `daemon.lock` on Windows as no daemon, after checking on Windows.
+- Windows: an existing `--data-dir` keeps its own ACEs, so decide whether to refuse or warn (#49).
+- Store: revisit the per-event caps with feature 03 traffic and design lost-key recovery (#51). A pre-existing `callsheet.db`'s mode isn't checked, and a migration that rebuilds `runs` or `events` must handle `foreign_keys=ON` (#50).
+- HTTP (#47): rate-limit the rejection logs; consider requiring `Content-Type: application/json`; check the RFC references written from memory.
+- Key zeroing is best effort; `zeroize` would need a direct dependency (#48).
+- Desktop: show `~` for home paths; replace Electron's default menu (#59). There is no config file yet; the listen address comes only from `--listen` (#52).
+
+## 2026-09-27 — 02 checkpoint (task 13): render check on `main` after #59 and #60
+
+A run of `main` at 82adca3 with the real binaries (`cs-daemon` and the desktop app under Xvfb, `--no-sandbox` for the
+root container only). The app was routed through a local proxy that logs and refuses every host.
+
+- **Before the daemon starts:** the status screen shows "Daemon not running" with the exact `cs-daemon --data-dir …`
+  command and a Copy button.
+- **Daemon running:** within one refresh (3 s) it shows "Daemon running", with the address, version 0.1.0, schema
+  version 1, uptime, content capture Off with its note, and 0 events. Light and dark both checked.
+- **After SIGTERM:** the daemon exits 0 and the screen returns to "Daemon not running". At 420 px wide the command and
+  the data directory wrap with no sideways scroll.
+- **Network:** the logging proxy saw no requests during the whole run.
+- **Logs:** the daemon log contains no token and no `Authorization` value.
+- The curl run against the daemon (every method, 401, 403, batches, token rotation) is in #60's body. The status
+  screen's 21 states, each in both themes, were captured and reviewed on #59.
+- Before merging #60 on top of #59 (both touch `pnpm-lock.yaml`), the combined tree passed Biome, typecheck and the
+  desktop tests (118).

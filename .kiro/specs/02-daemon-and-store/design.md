@@ -58,11 +58,16 @@ directories: Apple conventions on macOS, Windows on Windows, XDG elsewhere. A `-
 flag overrides it for tests. Everything Callsheet creates there is owner-only:
 - **Unix:** directories `0700`, files `0600`, set at creation with
   `DirBuilderExt::mode` / `OpenOptionsExt::mode`, never chmod afterwards (no race).
-- **Windows:** created with a protected DACL that grants only the current user's SID
-  (`D:P(A;OICI;FA;;;<user SID>)`), built with `ConvertStringSecurityDescriptorToSecurityDescriptorW`
-  and passed in `SECURITY_ATTRIBUTES` to `CreateFileW` / `CreateDirectoryW`, so there is no
-  window where inherited permissions apply. The SID comes from `GetTokenInformation(TokenUser)`.
-  Never a NULL DACL.
+- **Windows:** created with a protected DACL that grants only the current user's SID, built
+  with `ConvertStringSecurityDescriptorToSecurityDescriptorW` and passed in
+  `SECURITY_ATTRIBUTES` to `CreateFileW` / `CreateDirectoryW`, so there is no window where
+  inherited permissions apply. The SID comes from `GetTokenInformation(TokenUser)`. Never a
+  NULL DACL.
+  - Directories: `O:<SID>D:P(A;OICI;FA;;;<SID>)`. Files: `O:<SID>D:P(A;;FA;;;<SID>)`.
+    `OICI` (inheritable) has no effect on a file, so files don't carry it.
+  - `O:<SID>` makes the user the owner too. Without it an elevated process's files are
+    owned by `BUILTIN\Administrators`, and an owner implicitly gets `READ_CONTROL` and
+    `WRITE_DAC`.
 
 ### Single instance and discovery (R1.5, R2.7)
 - `daemon.lock`: opened and held with `File::try_lock` for the life of the process. If it's
@@ -73,11 +78,21 @@ flag overrides it for tests. Everything Callsheet creates there is owner-only:
 - Clients read `daemon.json` and send the token only if `daemon.lock` is currently locked,
   which means a daemon is alive, and the pid matches. A stale file left by a crash, where
   another process may have taken the port, therefore never receives the token.
+- **The desktop app deviates** (task 12). Node has no file-lock call, so it can't probe
+  `daemon.lock`. It instead trusts `daemon.json` only when the pid is alive, the record was
+  written after this boot, and on Unix the pid matches the one in `daemon.lock`; on Linux
+  it also reads `/proc/<pid>/stat` to reject a zombie or a reused pid. The remaining gap:
+  on macOS, a crashed daemon's pid reused by another process of the same user in the same
+  boot, together with another program on the old port, would receive the token; on
+  Windows, pid reuse and the port are enough. Closing it needs a lock probe (a native
+  module) or a daemon-side proof of identity in `daemon.json`. Open follow-up.
 
 ### Configuration and binding (R1.1, R1.2)
 The listen address comes from `--listen <ip:port>` or the config file, default
-`127.0.0.1:<default port>`. The port is chosen in task 1 after checking the IANA registry;
-tests use port `0`. The address is parsed first; anything other than `127.0.0.1` exits with
+`127.0.0.1:<default port>`. The port was to be chosen in task 0.5 after checking the IANA
+registry, which this environment's network policy blocks. Until the owner picks one, the
+default is `127.0.0.1:0` (the OS chooses a free port; clients find it in `daemon.json`).
+Tests use port `0`. The address is parsed first; anything other than `127.0.0.1` exits with
 status 2 and a message before any socket exists. `127.0.0.1` rather than `::1` or
 `localhost` keeps one address for clients (#10).
 
@@ -94,8 +109,10 @@ status 2 and a message before any socket exists. `127.0.0.1` rather than `::1` o
 ### HTTP layer (R2.1, R2.3, R2.4, local limits)
 One route: `POST /rpc`. Layers, outermost first:
 1. `DefaultBodyLimit::max(64 KiB)`.
-2. `TimeoutLayer::with_status_code(408, 10 s)`. Header-read timeouts come from the server
-   builder; task 3 confirms the hyper setting in use.
+2. `TimeoutLayer::with_status_code(408, 10 s)`, counted from when the headers have been
+   read. The headers themselves must arrive within 10 s. `axum::serve` in 0.8.9 doesn't
+   set hyper's `header_read_timeout`, so the daemon serves through its own hyper-util
+   accept loop (`cs-daemon::serve`) that does.
 3. Host/Origin: 403 if `Origin` is present, or if `Host` is not exactly `127.0.0.1:<port>`.
 4. Token: 401 if `Authorization: Bearer` is missing or wrong.
 5. JSON-RPC dispatch.
@@ -147,6 +164,14 @@ the `cs-store` API.
     at the end of that startup, the backup is deleted. If startup fails, it stays for
     recovery, and the next successful startup deletes it. Erasure also removes any backup
     still present (see Erasure), so a Callsheet-made file never keeps erased content.
+  - **As built (task 11):** the check runs whenever a `backup-v*.db` exists at startup.
+    - An `integrity_check` problem, or a check that can't run, refuses startup and keeps
+      the backup.
+    - A verify problem starts the daemon with a warning and keeps the backup. The database
+      is sound, and the user inspects the problem through `events.verify`, which needs a
+      running daemon.
+    - The check and the warning then repeat at every start until the log verifies or an
+      erasure removes the backup.
 
 Schema version 1:
 
@@ -208,7 +233,14 @@ first of:
 - `runs.last_*` disagreeing with the last event.
 
 Content references are checked against `blobs`. A missing blob is `contentErased` if a later
-`content.erased` event in the same run lists it, and a problem otherwise. Removing events
+`content.erased` event lists its address and either belongs to the referencing event's run
+or names that run in its `affectedRuns`; otherwise it's a problem. (Task 9 widened "in the
+same run": that alone would flag the runs that shared the erased content.) `content.erased`
+is a reserved kind: the store's append API refuses it, and only erasure writes one.
+
+`events.verify` runs within the control API's 10 s request timeout. A log too large to
+verify in 10 s gets 408, and the scan stops between chunks. A longer-running verify
+(background or streamed) is left for when logs get that large. Removing events
 from the end of the global order leaves no trace, and SECURITY.md and PRIVACY.md say so
 until feature 04's checkpoints exist.
 
@@ -229,7 +261,9 @@ until feature 04's checkpoints exist.
 ### Erasure (R6)
 - **Plan:** `plan(run_id)` collects the addresses referenced by that run's events, the other
   runs referencing any of them, and
-  `plan_id = hex(SHA-256(canon_json({runId, addresses, sharedWithRuns})))`.
+  `plan_id = hex(SHA-256(canon_json({addresses, contentItems, runId, sharedWithRuns})))`.
+  `contentItems` counts the addresses that still have a blob, so once a run is erased its
+  count drops to 0, and replaying the used plan ID is rejected with 1002.
 - **Erase:** `erase(run_id, plan_id)` recomputes the plan and rejects with 1002 if the ID
   differs, so nothing is erased that the user wasn't shown. Otherwise the writer thread:
   1. takes the read gate **exclusively**, which waits for open read transactions to end and
@@ -264,7 +298,14 @@ log output never contains it.
 1. axum's `with_graceful_shutdown` stops new requests;
 2. the writer queue is drained and closed;
 3. `daemon.json` is removed and the lock released;
-4. the process exits 0.
+4. the runtime shuts down with a 1 s grace for blocking tasks (`shutdown_timeout`). A
+   keychain call stuck on an unlock prompt is abandoned instead of keeping the process
+   alive: dropping a tokio runtime waits for `spawn_blocking` tasks with no limit;
+5. the process exits 0.
+
+A signal during startup, while the store opens or the backup check runs, stops the
+daemon before it listens. The lock then stays held until the process ends, because an
+abandoned store open may still be migrating.
 
 ## Decisions (ADRs)
 - **ADR 0011** — erasing content keeps event hashes (owner decision on #7), written with
@@ -306,12 +347,14 @@ Nothing panics on untrusted input: request bodies, headers or files.
   token and a successful call after `token.rotate` plus a re-read.
 - **Platforms (R7.2):**
   - Linux CI runs everything.
-  - A new Windows CI job runs the ACL, lock and signal tests for `cs-store` and `cs-daemon`.
+  - A new Windows CI job runs every `cs-store` and `cs-daemon` test, including the ACL,
+    lock and signal tests.
   - macOS shares the Unix permission code with Linux; the real keychain is exercised by hand
     once per release, since CI uses the mock store everywhere.
   - The new job is added to **CI passed**.
-- **Render check:** the desktop app is not wired to the daemon in 02; a manual `curl` run
-  against the running daemon is recorded in `progress.md` instead.
+- **Render check:** the owner added task 12, a desktop status screen that reads the
+  daemon's `health` and `version`. The render check is that screen run against the real
+  daemon in both themes, plus the curl run, both recorded in `progress.md`.
 
 ## Sources (read 2026-09-26)
 - axum `axum-v0.8.9`: `axum-core/src/extract/default_body_limit.rs`,

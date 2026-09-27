@@ -47,9 +47,11 @@
 //! event stored one of its contents anew: erase never deletes more blobs than
 //! the confirmed plan showed.
 //!
-//! **Verification contract (shared with unit `verify`):** a missing blob counts
-//! as erased if any later `content.erased` event, in any run, lists its address.
-//! Events of the other runs are therefore covered by the erased run's event.
+//! **Verification contract (shared with unit `verify`, see `verify.rs`):** a
+//! missing blob counts as erased if a later `content.erased` event lists its
+//! address and either belongs to the referencing event's run or names that run
+//! under `affectedRuns`. The erased run's event lists every run that shared the
+//! content, so events of those runs are covered by it.
 //!
 //! **Nothing to delete** (a run without content, or an erased run confirmed
 //! again with a fresh plan) is a valid erase: it deletes nothing and appends no
