@@ -11,3 +11,6 @@ pub mod migrate;
 pub mod secrets;
 pub mod verify;
 pub mod writer;
+
+pub use content::{ContentKey, content_address};
+pub use writer::{AppendEvent, AppendedEvent, InvalidEvent, Store, StoreError, StoreOpenError};
