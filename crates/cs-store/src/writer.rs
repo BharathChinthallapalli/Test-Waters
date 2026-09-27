@@ -517,6 +517,17 @@ impl Store {
         }
     }
 
+    /// Test-only: appends even a reserved kind, so verification's tests can
+    /// forge `content.erased` events the way a tampered database would hold them.
+    #[cfg(test)]
+    pub(crate) async fn append_reserved(
+        &self,
+        event: AppendEvent,
+    ) -> Result<AppendedEvent, StoreError> {
+        let event = ValidEvent::checked(event)?;
+        settle(self.send_append(event).await?)
+    }
+
     /// Whether content capture is on (R3.4; off unless enabled).
     pub fn capture_content(&self) -> bool {
         self.capture.is_on()
@@ -844,6 +855,16 @@ struct ValidEvent {
 
 impl ValidEvent {
     fn new(event: AppendEvent) -> Result<Self, StoreError> {
+        // Verification trusts this kind to explain missing blobs, so only the
+        // erase command may append it (it builds its event directly).
+        if event.kind == CONTENT_ERASED_KIND {
+            return Err(InvalidEvent::ReservedKind.into());
+        }
+        Self::checked(event)
+    }
+
+    /// Every check except the reserved kind.
+    fn checked(event: AppendEvent) -> Result<Self, StoreError> {
         check_name(
             &event.run_id,
             [
@@ -860,11 +881,6 @@ impl ValidEvent {
                 InvalidEvent::KindHasControlCharacter,
             ],
         )?;
-        // Verification trusts this kind to explain missing blobs, so only the
-        // erase command may append it (it builds its event directly).
-        if event.kind == CONTENT_ERASED_KIND {
-            return Err(InvalidEvent::ReservedKind.into());
-        }
         if event.ts_ms > MAX_SAFE_INTEGER {
             return Err(InvalidEvent::TimestampOutOfRange.into());
         }
