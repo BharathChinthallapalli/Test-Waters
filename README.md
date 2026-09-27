@@ -1,14 +1,14 @@
 # Callsheet
 
-*Working name.* A local-first, open-source desktop control plane that hires AI
-coding workers per task and releases them when the task is done.
+*Working name.* Callsheet aims to become a local desktop tool for observing
+and coordinating AI coding workers. The intended workflow starts a worker for
+a task, records the activity Callsheet can actually observe, and releases the
+worker when the task is done. Cross-worker casting and portable memory are
+planned features; they are not implemented yet. Content capture is off by
+default, and Callsheet sends no telemetry.
 
-You register adapters (Claude Code, Codex, Hermes, any model API). For each task,
-Callsheet casts whichever worker has the capacity, quota, context headroom and
-skills right now, starts a fresh session with a precise context pack, records
-everything in a tamper-evident log, and releases the worker at wrap. Memory and
-identity belong to the project, not to the worker. Nothing leaves your machine
-by default.
+This repository is currently private. Its code is MIT-licensed, with public
+open-source release planned after a usable workflow is ready.
 
 See [docs/VISION.md](docs/VISION.md) for the idea and
 [docs/ROADMAP.md](docs/ROADMAP.md) for the build order.
@@ -19,7 +19,9 @@ See [docs/VISION.md](docs/VISION.md) for the idea and
 (daemon and store) are done: a loopback-only daemon with a token-protected
 control API, an append-only hash-chained event log in SQLite, and a desktop
 status screen that shows whether the daemon is running. The proxy that
-records model traffic arrives in feature 03, and the CLI later.
+records model traffic is in development in feature 03, and the CLI arrives later.
+A proxy observes only requests routed through it; it does not record every
+file edit or command an agent performs.
 
 ## Repository layout
 
