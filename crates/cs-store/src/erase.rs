@@ -595,6 +595,35 @@ mod tests {
         assert_eq!((d.shared_with_runs, d.content_items), (Vec::new(), 0));
     }
 
+    /// Verification trusts `content.erased` to explain missing blobs, so no
+    /// caller of `append` may forge one.
+    #[tokio::test]
+    async fn append_refuses_the_content_erased_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path()).await;
+        seed(&store).await;
+        let before = events(&store).await;
+
+        let forged = store
+            .append(AppendEvent {
+                run_id: "b".to_owned(),
+                kind: CONTENT_ERASED_KIND.to_owned(),
+                ts_ms: TS,
+                body: json!({ "addresses": [address(b"beta")], "affectedRuns": [], "planId": "x" }),
+                content: Vec::new(),
+            })
+            .await;
+
+        assert!(
+            matches!(
+                forged,
+                Err(StoreError::InvalidEvent(crate::InvalidEvent::ReservedKind))
+            ),
+            "{forged:?}"
+        );
+        assert_eq!(events(&store).await, before, "nothing appended");
+    }
+
     #[tokio::test]
     async fn a_dry_run_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();

@@ -199,6 +199,9 @@ pub enum InvalidEvent {
     KindTooLong,
     /// `kind` holds a control character (including NUL).
     KindHasControlCharacter,
+    /// `kind` is reserved for the store itself: `content.erased`
+    /// ([`crate::erase::CONTENT_ERASED_KIND`]), which only erasure appends.
+    ReservedKind,
     /// Content or body over one of the limits ([`MAX_CONTENT_ITEMS`],
     /// [`MAX_CONTENT_BYTES`], [`MAX_BODY_BYTES`]); `what` names it.
     TooLarge {
@@ -224,6 +227,7 @@ impl fmt::Display for InvalidEvent {
             Self::EmptyKind => f.write_str("event kind is empty"),
             Self::KindTooLong => write!(f, "event kind is longer than {MAX_NAME_LEN} bytes"),
             Self::KindHasControlCharacter => f.write_str("event kind holds a control character"),
+            Self::ReservedKind => f.write_str("event kind is reserved for the store"),
             Self::TooLarge { what, max } => write!(f, "event {what} is above the limit of {max}"),
             Self::TimestampOutOfRange => f.write_str("event tsMs is above 2^53 − 1"),
             Self::BodyNotAnObject => f.write_str("event body is not a JSON object"),
@@ -854,6 +858,11 @@ impl ValidEvent {
                 InvalidEvent::KindHasControlCharacter,
             ],
         )?;
+        // Verification trusts this kind to explain missing blobs, so only the
+        // erase command may append it (it builds its event directly).
+        if event.kind == CONTENT_ERASED_KIND {
+            return Err(InvalidEvent::ReservedKind.into());
+        }
         if event.ts_ms > MAX_SAFE_INTEGER {
             return Err(InvalidEvent::TimestampOutOfRange.into());
         }
