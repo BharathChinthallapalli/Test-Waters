@@ -28,7 +28,7 @@ supported.
 
 ## Local control API
 
-The Callsheet daemon (feature 02, being built) is controlled through a small
+The Callsheet daemon (feature 02) is controlled through a small
 JSON-RPC API ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)). It can be
 used only by programs on your machine that can read your token:
 
@@ -49,6 +49,13 @@ hidden:
 
 - Any process running as the same operating-system user can read the local
   control-API token ([ADR 0003](docs/adr/0003-json-rpc-control-api.md)).
+- The desktop app can't check the daemon's lock file the way the daemon's own
+  client code does, so it relies on process checks to tell whether the
+  daemon in `daemon.json` is still the one running. On macOS and Windows, if
+  the daemon crashed, its process id was reused, and another program took its
+  old port, the desktop app could send that program the token. Linux also
+  checks the process's start time. A stronger proof of the daemon's identity
+  is planned.
 - The event log is **tamper-evident, not tamper-proof**
   ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)). Each run's events
   are hash-chained and every event records its place in the daemon's global

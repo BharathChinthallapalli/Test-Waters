@@ -15,9 +15,11 @@ See [docs/VISION.md](docs/VISION.md) for the idea and
 
 ## Status
 
-**Pre-alpha. Nothing is usable yet.** Feature 01 (foundation) is in progress:
-workspaces, architecture decisions, a hardened desktop shell, generated types
-and CI. The daemon, proxy and CLI arrive in features 02–07.
+**Pre-alpha. Nothing is usable yet.** Feature 01 (foundation) and feature 02
+(daemon and store) are done: a loopback-only daemon with a token-protected
+control API, an append-only hash-chained event log in SQLite, and a desktop
+status screen that shows whether the daemon is running. The proxy that
+records model traffic arrives in feature 03, and the CLI later.
 
 ## Repository layout
 
@@ -39,7 +41,8 @@ Requirements: [rustup](https://rustup.rs/) (it installs the Rust version in
 pnpm install --frozen-lockfile
 cargo build --workspace
 pnpm -r test && cargo test --workspace
-pnpm --filter @callsheet/desktop start   # opens the desktop shell
+cargo run -p cs-daemon                   # starts the daemon; Ctrl+C stops it
+pnpm --filter @callsheet/desktop start   # opens the desktop app's status screen
 ```
 
 All quality gates and how CI runs them: [docs/ci.md](docs/ci.md).

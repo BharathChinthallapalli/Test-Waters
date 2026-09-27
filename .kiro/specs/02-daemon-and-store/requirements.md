@@ -74,7 +74,7 @@ log's integrity.
 
 1. WHEN the user asks to erase the content of a run THE SYSTEM SHALL first list every other run that refers to any of the same content, and SHALL erase only after the user confirms; a dry run SHALL show the same list and erase nothing.
 2. WHEN the user confirms an erasure THE SYSTEM SHALL remove every stored copy of that content, including copies shared with the listed runs.
-3. WHEN content is erased THE SYSTEM SHALL overwrite it in the database file and in the write-ahead log rather than only marking the space free, and SHALL remove any separate content files.
+3. WHEN content is erased THE SYSTEM SHALL overwrite it in the database file rather than only marking the space free, SHALL truncate the write-ahead log (which can hold earlier copies) to zero bytes, and SHALL remove any separate content files. (Wording corrected after implementation to match the design's Erasure section: the write-ahead log is emptied by `wal_checkpoint(TRUNCATE)`, not overwritten in place.)
 4. WHEN content is erased THE SYSTEM SHALL append an event recording the erasure and SHALL leave every existing event and hash unchanged; verification SHALL still pass and SHALL report the affected events as "content erased" (tested).
 5. THE SYSTEM SHALL document in PRIVACY.md exactly what erasing does, including that copies left by the storage device or filesystem are outside Callsheet's control.
 

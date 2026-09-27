@@ -14,6 +14,12 @@ is the contract; if the code ever disagrees with it, the code is the bug.
   to your provider, not data sent to the Callsheet project.
 - **No other network calls** are made on your behalf unless a feature you
   enable says so here.
+- **The desktop app stays on your machine.** Its window loads only the app's
+  own pages and cancels every other request. Its built-in spellchecker is
+  turned off with no languages set, because otherwise it downloads a
+  dictionary from Google on every start. It talks to the daemon only on
+  `127.0.0.1`, and the daemon's control token never leaves the app's main
+  process.
 
 ## What Callsheet stores (on your machine)
 
@@ -26,12 +32,10 @@ is the contract; if the code ever disagrees with it, the code is the bug.
 - **Signing keys** stay in your operating system's keychain and are used only
   by the local daemon ([ADR 0007](docs/adr/0007-identity-and-log-integrity.md)).
 
-Everything is stored locally and stays under your control. Once feature 02
-ships, you can erase a run's message content; see
-[Erasing a run's content](#erasing-a-runs-content).
-
-The daemon and store that hold this data are being built in feature 02. The
-sections below describe how Callsheet behaves once that feature ships.
+Everything is stored locally, in the daemon's data directory, and stays under
+your control. You can erase a run's message content; see
+[Erasing a run's content](#erasing-a-runs-content). The files there are
+readable only by your user account.
 
 ## Content capture and your keychain
 
@@ -93,12 +97,17 @@ What Callsheet does:
    the write-ahead log, which can still hold earlier copies, to zero bytes.
 4. **Removes Callsheet's own migration backups.** Before a schema upgrade
    Callsheet makes a backup copy of the database, and deletes it once the
-   upgraded database has started cleanly. Erasure deletes any that remain.
+   upgraded database has started cleanly. If the upgraded event log fails
+   verification, the backup is kept, for comparison, and the daemon warns
+   about it at every start until the log verifies. Erasure deletes any backup
+   that remains.
 5. **Reports success only once every copy in Callsheet's own files is gone.** If
    the write-ahead log can't be truncated or a backup can't be removed yet,
    Callsheet reports "erasure pending" instead, and retries every 30 seconds and
    at the next start until it succeeds. The daemon's health report shows the
-   erasure as pending meanwhile.
+   erasure as pending meanwhile. On Windows, another program holding one of
+   these files open, such as antivirus or backup software, can keep an erasure
+   pending until it lets go.
 6. **Keeps every event and hash**, and records a `content.erased` event listing
    what was erased and which runs were affected. Verification still passes and
    reports the affected events as "content erased".
@@ -123,6 +132,6 @@ What is outside Callsheet's control:
 
 ## Status
 
-Callsheet is pre-alpha. The daemon, proxy and store that these commitments
-apply to are still being built (features 02–05); this document states the
-rules they are built to.
+Callsheet is pre-alpha. The daemon and store (feature 02) follow this
+document. The proxy and the rest are still being built (features 03–05), and
+this document states the rules they are built to.
