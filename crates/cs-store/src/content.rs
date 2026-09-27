@@ -90,6 +90,17 @@ pub fn has_blobs(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS (SELECT 1 FROM blobs)", [], |row| row.get(0))
 }
 
+/// Whether content was ever stored under the current key: any blob, or any
+/// event that refers to a content address. Erasure removes blobs but keeps
+/// `event_content`, so this stays true after every blob is erased.
+pub fn content_ever_stored(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM event_content) OR EXISTS (SELECT 1 FROM blobs)",
+        [],
+        |row| row.get(0),
+    )
+}
+
 /// How many blobs are stored.
 pub fn blob_count(conn: &Connection) -> rusqlite::Result<u64> {
     conn.query_row("SELECT count(*) FROM blobs", [], |row| {

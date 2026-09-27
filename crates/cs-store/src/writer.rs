@@ -35,7 +35,9 @@
 //!
 //! # Content (R4.4, R5.1, R5.2)
 //! An event's `content` items are message bytes, never part of the body; a body
-//! may therefore not have a top-level `content` member of its own.
+//! may therefore not have a top-level `content` member of its own. Events are
+//! capped (provisionally) at [`MAX_CONTENT_ITEMS`] items, [`MAX_CONTENT_BYTES`]
+//! of content and [`MAX_BODY_BYTES`] of canonical body.
 //! - **Capture off:** the bytes are ignored. No blob, no address, no
 //!   `event_content` row; the body is stored exactly as given.
 //! - **Capture on:** each item is stored with [`content::put_content`] and the
@@ -50,9 +52,11 @@
 //! Enabling first gets the key from the [`SecretStore`] on a blocking thread
 //! (`spawn_blocking`): never on the writer thread, which must not wait on an
 //! unlock prompt, and never directly in an async task, where zbus panics. The
-//! key may be generated ([`IfMissing::Generate`]) only while no blob is stored;
-//! otherwise a missing key is an error ([`IfMissing::Fail`]), because a new key
-//! would orphan every stored blob. If the key can't be had, capture stays off
+//! key may be generated ([`IfMissing::Generate`]) only while no content was
+//! ever stored: no blob and no `event_content` row, which erasure keeps.
+//! Otherwise a missing key is an error ([`IfMissing::Fail`]): a keychain may
+//! hide a locked entry, and a new key would silently orphan every address
+//! already issued. If the key can't be had, capture stays off
 //! (a setting left on by an earlier run is turned off) and
 //! [`StoreError::Keychain`] (code 1001) is returned. On success the setting
 //! is written and the writer thread keeps the key (a [`ContentKey`], zeroed on
@@ -69,6 +73,15 @@
 //! attempt, appends with content fail at once for [`KEY_RETRY_INTERVAL`], so a
 //! burst of them asks the keychain once rather than prompting once per event.
 //!
+//! **Disabling never waits on the keychain**, even while an enable or a key
+//! load waits on an unlock prompt. Every capture change takes a ticket from a
+//! counter; the writer applies a change only if no newer one was applied
+//! already, so the last change requested wins whatever order the commands
+//! reach it in. From the moment a disable is requested, the writer ignores the
+//! content of every append (exactly as with capture off) until a newer enable
+//! is applied, and it drops a key that arrives for an older request. So content
+//! is never stored after the user asked for capture off.
+//!
 //! # Reads
 //! One read-only connection behind a `std::sync::Mutex` serves every read, so
 //! reads run one at a time on a blocking thread. [`Store::read`] holds the read
@@ -79,7 +92,7 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,6 +115,17 @@ pub const CONTENT_FIELD: &str = "content";
 
 /// Longest `run_id` or `kind`, in bytes.
 pub const MAX_NAME_LEN: usize = 256;
+
+/// Most content items one event may carry. Provisional, like the two limits
+/// below: to be revisited with feature 03's real traffic.
+pub const MAX_CONTENT_ITEMS: usize = 64;
+
+/// Most content bytes, all items together, one event may carry. Provisional.
+pub const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest event body, as canonical JSON before content addresses are added.
+/// Provisional.
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// How many commands may wait for the writer thread before senders wait.
 pub const QUEUE_CAPACITY: usize = 256;
@@ -159,8 +183,18 @@ pub struct AppendedEvent {
 pub enum InvalidEvent {
     EmptyRunId,
     RunIdTooLong,
+    /// `run_id` holds a control character (including NUL).
+    RunIdHasControlCharacter,
     EmptyKind,
     KindTooLong,
+    /// `kind` holds a control character (including NUL).
+    KindHasControlCharacter,
+    /// Content or body over one of the limits ([`MAX_CONTENT_ITEMS`],
+    /// [`MAX_CONTENT_BYTES`], [`MAX_BODY_BYTES`]); `what` names it.
+    TooLarge {
+        what: &'static str,
+        max: usize,
+    },
     /// `ts_ms` is above 2^53 − 1.
     TimestampOutOfRange,
     BodyNotAnObject,
@@ -176,8 +210,11 @@ impl fmt::Display for InvalidEvent {
         match self {
             Self::EmptyRunId => f.write_str("event runId is empty"),
             Self::RunIdTooLong => write!(f, "event runId is longer than {MAX_NAME_LEN} bytes"),
+            Self::RunIdHasControlCharacter => f.write_str("event runId holds a control character"),
             Self::EmptyKind => f.write_str("event kind is empty"),
             Self::KindTooLong => write!(f, "event kind is longer than {MAX_NAME_LEN} bytes"),
+            Self::KindHasControlCharacter => f.write_str("event kind holds a control character"),
+            Self::TooLarge { what, max } => write!(f, "event {what} is above the limit of {max}"),
             Self::TimestampOutOfRange => f.write_str("event tsMs is above 2^53 − 1"),
             Self::BodyNotAnObject => f.write_str("event body is not a JSON object"),
             Self::BodyHasContentField => write!(
@@ -294,29 +331,32 @@ pub struct Store {
     reader: Arc<Mutex<Connection>>,
     gate: Arc<RwLock<()>>,
     secrets: Arc<dyn SecretStore>,
-    /// Published by the writer thread whenever it changes capture.
+    /// Capture state shared with the writer thread.
     capture: Arc<CaptureFlags>,
-    /// Held for every capture change and key load, which serializes them.
-    capture_changes: tokio::sync::Mutex<KeyLoad>,
+    /// Held across every keychain call (enabling, and key loads for appends),
+    /// so one call runs at a time. Disabling never takes it.
+    key_load: tokio::sync::Mutex<()>,
+    /// The last failed key load for an append; see [`KEY_RETRY_INTERVAL`].
+    last_key_failure: Mutex<Option<(Instant, KeychainUnavailable)>>,
     migrated: Migrated,
 }
 
-/// The writer's capture state, published for the async side.
+/// Capture state shared between the async side and the writer thread.
 ///
-/// Only the writer thread stores to these, right after it has changed its own
-/// state, so they stay true even if a caller stops waiting for the reply.
+/// `on` and `key_loaded` are stored only by the writer thread, right after it
+/// has changed its own state, so they stay true even if a caller stops waiting
+/// for the reply. The tickets are taken by the async side when a change is
+/// requested.
 #[derive(Debug)]
 struct CaptureFlags {
     /// Capture is on.
     on: AtomicBool,
     /// The writer holds the content key (only ever while capture is on).
     key_loaded: AtomicBool,
-}
-
-/// The last failed attempt to load the key for an append.
-#[derive(Debug, Default)]
-struct KeyLoad {
-    last_failure: Option<(Instant, KeychainUnavailable)>,
+    /// The newest ticket handed out for a capture change (enable or disable).
+    requested: AtomicU64,
+    /// The newest ticket handed out for a disable.
+    newest_disable: AtomicU64,
 }
 
 impl CaptureFlags {
@@ -326,6 +366,19 @@ impl CaptureFlags {
 
     fn key_loaded(&self) -> bool {
         self.key_loaded.load(Ordering::SeqCst)
+    }
+
+    fn requested(&self) -> u64 {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    fn newest_disable(&self) -> u64 {
+        self.newest_disable.load(Ordering::SeqCst)
+    }
+
+    /// Hands out the ticket of a new capture change.
+    fn next_ticket(&self) -> u64 {
+        self.requested.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -341,12 +394,15 @@ impl Store {
         let flags = Arc::new(CaptureFlags {
             on: AtomicBool::new(capture),
             key_loaded: AtomicBool::new(false),
+            requested: AtomicU64::new(0),
+            newest_disable: AtomicU64::new(0),
         });
         let (commands, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (stopped, writer_stopped) = watch::channel(false);
         let state = WriterState {
             conn: writer,
             key: None,
+            applied: 0,
             flags: Arc::clone(&flags),
         };
         // Detached: `close` waits for it through `writer_stopped`.
@@ -362,7 +418,8 @@ impl Store {
             gate: Arc::new(RwLock::new(())),
             secrets,
             capture: flags,
-            capture_changes: tokio::sync::Mutex::new(KeyLoad::default()),
+            key_load: tokio::sync::Mutex::new(()),
+            last_key_failure: Mutex::new(None),
             migrated,
         })
     }
@@ -398,31 +455,25 @@ impl Store {
         self.capture.is_on()
     }
 
-    /// Turns content capture on or off and returns the new setting.
+    /// Turns content capture on or off and returns whether it is on now.
     ///
-    /// Enabling gets the content key first, even within
-    /// [`KEY_RETRY_INTERVAL`] of a failed attempt. If it can't, it fails with
-    /// [`StoreError::Keychain`] and capture is off afterwards: a setting left
-    /// on from an earlier run, whose key could not be loaded, is turned off
-    /// too, so the setting agrees with the error. See the module docs.
+    /// The last change requested wins: if a newer change was applied first,
+    /// this one is dropped and the returned value reflects the newer one.
+    ///
+    /// Disabling returns without waiting on the keychain, even while an enable
+    /// waits on an unlock prompt. Enabling gets the content key first, even
+    /// within [`KEY_RETRY_INTERVAL`] of a failed attempt. If it can't, it fails
+    /// with [`StoreError::Keychain`] and capture is off afterwards: a setting
+    /// left on from an earlier run, whose key could not be loaded, is turned
+    /// off too, so the setting agrees with the error. See the module docs.
     pub async fn set_capture_content(&self, enabled: bool) -> Result<bool, StoreError> {
-        let mut changing = self.capture_changes.lock().await;
-        changing.last_failure = None;
-        if !enabled {
-            self.set_writer_capture(None).await?;
-        } else if !self.capture.key_loaded() {
-            match self.obtain_key().await {
-                Ok(key) => self.set_writer_capture(Some(key)).await?,
-                Err(error @ StoreError::Keychain(_)) => {
-                    if self.capture.is_on() {
-                        self.set_writer_capture(None).await?;
-                    }
-                    return Err(error);
-                }
-                Err(other) => return Err(other),
-            }
+        self.forget_key_failure();
+        if enabled {
+            self.enable().await?;
+        } else {
+            self.disable().await?;
         }
-        Ok(enabled)
+        Ok(self.capture.is_on())
     }
 
     /// Runs `f` in one read transaction on the read-only connection, holding
@@ -452,6 +503,11 @@ impl Store {
 
     /// Takes the read gate exclusively: waits for every open read to finish and
     /// holds new reads back until the guard is dropped. For erasure (task 10).
+    ///
+    /// While the guard is held, [`Store::read`] (and everything built on it,
+    /// such as [`Store::blob_count`]) waits for it, so calling one from the
+    /// holder deadlocks. Erasure must therefore recompute its plan on the
+    /// writer connection, inside the command that erases, not through `read`.
     pub async fn exclude_readers(&self) -> OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.gate).write_owned().await
     }
@@ -529,45 +585,105 @@ impl Store {
         self.request(|reply| Command::Append { event, reply }).await
     }
 
-    async fn set_writer_capture(&self, key: Option<ContentKey>) -> Result<(), StoreError> {
-        self.request(|reply| Command::SetCapture { key, reply })
+    /// Requests capture off. Never waits on the keychain.
+    async fn disable(&self) -> Result<(), StoreError> {
+        let ticket = self.capture.next_ticket();
+        // From here on the writer ignores content until a newer enable.
+        self.capture
+            .newest_disable
+            .fetch_max(ticket, Ordering::SeqCst);
+        self.request(|reply| Command::Disable { ticket, reply })
+            .await?
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Requests capture on, getting the key first unless the writer holds it.
+    async fn enable(&self) -> Result<(), StoreError> {
+        // Taken before waiting for another keychain call, so a disable
+        // requested meanwhile is newer and wins.
+        let ticket = self.capture.next_ticket();
+        let _loading = self.key_load.lock().await;
+        if self.send_enable(ticket, None).await? != CaptureChange::NeedsKey {
+            return Ok(());
+        }
+        match self.obtain_key().await {
+            Ok(key) => {
+                self.send_enable(ticket, Some(key)).await?;
+                Ok(())
+            }
+            Err(error @ StoreError::Keychain(_)) => {
+                // A setting left on by an earlier run goes off with this
+                // error, unless a newer change was requested meanwhile.
+                if self.capture.is_on() && self.capture.requested() == ticket {
+                    self.disable().await?;
+                }
+                Err(error)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn send_enable(
+        &self,
+        ticket: u64,
+        key: Option<ContentKey>,
+    ) -> Result<CaptureChange, StoreError> {
+        self.request(|reply| Command::Enable { ticket, key, reply })
             .await?
             .map_err(StoreError::Sqlite)
     }
 
     /// Loads the key into the writer when capture is on but the key isn't
-    /// loaded yet (after opening with capture on).
+    /// loaded yet (after opening with capture on). Changes no setting.
     ///
     /// Within [`KEY_RETRY_INTERVAL`] of a failed attempt it fails at once with
     /// that attempt's error, so a burst of appends asks the keychain (and may
-    /// prompt the user) once, not once per append.
+    /// prompt the user) once, not once per append. If capture is disabled
+    /// while the keychain answers, the writer drops the key.
     async fn load_key(&self) -> Result<(), StoreError> {
-        let mut changing = self.capture_changes.lock().await;
+        let _loading = self.key_load.lock().await;
         if self.capture.key_loaded() || !self.capture.is_on() {
             return Ok(());
         }
-        if let Some((at, error)) = &changing.last_failure
-            && at.elapsed() < KEY_RETRY_INTERVAL
-        {
-            return Err(StoreError::Keychain(error.clone()));
+        if let Some(error) = self.recent_key_failure() {
+            return Err(StoreError::Keychain(error));
         }
+        let seen = self.capture.requested();
         match self.obtain_key().await {
             Ok(key) => {
-                changing.last_failure = None;
-                self.set_writer_capture(Some(key)).await
+                self.request(|reply| Command::LoadKey { key, seen, reply })
+                    .await
             }
             Err(StoreError::Keychain(error)) => {
-                changing.last_failure = Some((Instant::now(), error.clone()));
+                *self.key_failure() = Some((Instant::now(), error.clone()));
                 Err(StoreError::Keychain(error))
             }
             Err(other) => Err(other),
         }
     }
 
+    fn key_failure(&self) -> std::sync::MutexGuard<'_, Option<(Instant, KeychainUnavailable)>> {
+        self.last_key_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn recent_key_failure(&self) -> Option<KeychainUnavailable> {
+        match &*self.key_failure() {
+            Some((at, error)) if at.elapsed() < KEY_RETRY_INTERVAL => Some(error.clone()),
+            _ => None,
+        }
+    }
+
+    fn forget_key_failure(&self) {
+        *self.key_failure() = None;
+    }
+
     /// Gets the content key on a blocking thread. It may be generated only
-    /// while no blob is stored. Call with `capture_changes` locked.
+    /// while no content was ever stored. Call with `key_load` locked.
     async fn obtain_key(&self) -> Result<ContentKey, StoreError> {
-        let if_missing = if self.read(content::has_blobs).await? {
+        let if_missing = if self.read(content::content_ever_stored).await? {
             IfMissing::Fail
         } else {
             IfMissing::Generate
@@ -601,27 +717,43 @@ struct ValidEvent {
 }
 
 impl ValidEvent {
-    fn new(event: AppendEvent) -> Result<Self, InvalidEvent> {
+    fn new(event: AppendEvent) -> Result<Self, StoreError> {
         check_name(
             &event.run_id,
-            InvalidEvent::EmptyRunId,
-            InvalidEvent::RunIdTooLong,
+            [
+                InvalidEvent::EmptyRunId,
+                InvalidEvent::RunIdTooLong,
+                InvalidEvent::RunIdHasControlCharacter,
+            ],
         )?;
         check_name(
             &event.kind,
-            InvalidEvent::EmptyKind,
-            InvalidEvent::KindTooLong,
+            [
+                InvalidEvent::EmptyKind,
+                InvalidEvent::KindTooLong,
+                InvalidEvent::KindHasControlCharacter,
+            ],
         )?;
         if event.ts_ms > MAX_SAFE_INTEGER {
-            return Err(InvalidEvent::TimestampOutOfRange);
+            return Err(InvalidEvent::TimestampOutOfRange.into());
         }
+        check_content_size(&event.content)?;
         let Some(members) = event.body.as_object() else {
-            return Err(InvalidEvent::BodyNotAnObject);
+            return Err(InvalidEvent::BodyNotAnObject.into());
         };
         if members.contains_key(CONTENT_FIELD) {
-            return Err(InvalidEvent::BodyHasContentField);
+            return Err(InvalidEvent::BodyHasContentField.into());
         }
         event::check_body_numbers(&event.body).map_err(InvalidEvent::Body)?;
+        let canonical = event::canonical_json(&event.body)
+            .map_err(|error| StoreError::Hash(EventHashError::Canonicalization(error)))?;
+        if canonical.len() > MAX_BODY_BYTES {
+            return Err(InvalidEvent::TooLarge {
+                what: "body (canonical JSON bytes)",
+                max: MAX_BODY_BYTES,
+            }
+            .into());
+        }
         Ok(Self {
             run_id: event.run_id,
             kind: event.kind,
@@ -643,14 +775,38 @@ fn settle(outcome: Result<AppendedEvent, AppendFailure>) -> Result<AppendedEvent
     }
 }
 
-fn check_name(name: &str, empty: InvalidEvent, too_long: InvalidEvent) -> Result<(), InvalidEvent> {
+/// `errors` is what to report for an empty name, a too long one, and one with
+/// a control character.
+fn check_name(name: &str, errors: [InvalidEvent; 3]) -> Result<(), InvalidEvent> {
+    let [empty, too_long, control] = errors;
     if name.is_empty() {
         Err(empty)
     } else if name.len() > MAX_NAME_LEN {
         Err(too_long)
+    } else if name.chars().any(char::is_control) {
+        Err(control)
     } else {
         Ok(())
     }
+}
+
+fn check_content_size(content: &[Vec<u8>]) -> Result<(), InvalidEvent> {
+    if content.len() > MAX_CONTENT_ITEMS {
+        return Err(InvalidEvent::TooLarge {
+            what: "content item count",
+            max: MAX_CONTENT_ITEMS,
+        });
+    }
+    let total = content
+        .iter()
+        .try_fold(0usize, |total, item| total.checked_add(item.len()));
+    if total.is_none_or(|total| total > MAX_CONTENT_BYTES) {
+        return Err(InvalidEvent::TooLarge {
+            what: "content size in bytes",
+            max: MAX_CONTENT_BYTES,
+        });
+    }
+    Ok(())
 }
 
 enum Command {
@@ -658,12 +814,35 @@ enum Command {
         event: ValidEvent,
         reply: oneshot::Sender<Result<AppendedEvent, AppendFailure>>,
     },
-    /// `Some(key)`: turn capture on and keep the key. `None`: turn it off and
-    /// drop the key.
-    SetCapture {
+    /// Turn capture on with change `ticket`, using `key` or, if `None`, the key
+    /// the writer holds.
+    Enable {
+        ticket: u64,
         key: Option<ContentKey>,
-        reply: oneshot::Sender<rusqlite::Result<()>>,
+        reply: oneshot::Sender<rusqlite::Result<CaptureChange>>,
     },
+    /// Turn capture off with change `ticket` and drop the key.
+    Disable {
+        ticket: u64,
+        reply: oneshot::Sender<rusqlite::Result<CaptureChange>>,
+    },
+    /// Keep `key` for appends, if capture is still on and no capture change was
+    /// requested since ticket `seen`; otherwise drop it.
+    LoadKey {
+        key: ContentKey,
+        seen: u64,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// What the writer did with a capture change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureChange {
+    Applied,
+    /// A newer change was applied already; this one was dropped.
+    Superseded,
+    /// An enable without a key, and the writer holds none.
+    NeedsKey,
 }
 
 enum AppendFailure {
@@ -678,6 +857,8 @@ struct WriterState {
     conn: Connection,
     /// `Some` only while capture is on.
     key: Option<ContentKey>,
+    /// Ticket of the newest capture change applied.
+    applied: u64,
     flags: Arc<CaptureFlags>,
 }
 
@@ -694,8 +875,15 @@ impl WriterState {
                 Command::Append { event, reply } => {
                     let _ = reply.send(self.append(event));
                 }
-                Command::SetCapture { key, reply } => {
-                    let _ = reply.send(self.set_capture(key));
+                Command::Enable { ticket, key, reply } => {
+                    let _ = reply.send(self.enable(ticket, key));
+                }
+                Command::Disable { ticket, reply } => {
+                    let _ = reply.send(self.disable(ticket));
+                }
+                Command::LoadKey { key, seen, reply } => {
+                    self.load_key(key, seen);
+                    let _ = reply.send(());
                 }
             }
         }
@@ -708,7 +896,7 @@ impl WriterState {
     }
 
     fn append(&mut self, event: ValidEvent) -> Result<AppendedEvent, AppendFailure> {
-        let key = if self.flags.is_on() && !event.content.is_empty() {
+        let key = if self.stores_content() && !event.content.is_empty() {
             match &self.key {
                 Some(key) => Some(key),
                 None => return Err(AppendFailure::NeedsKey(event)),
@@ -719,14 +907,56 @@ impl WriterState {
         append_in_transaction(&mut self.conn, event, key).map_err(AppendFailure::Error)
     }
 
-    fn set_capture(&mut self, key: Option<ContentKey>) -> rusqlite::Result<()> {
-        let enabled = key.is_some();
-        write_capture_setting(&self.conn, enabled)?;
-        // Replacing the old key drops it, which zeroes it.
-        self.key = key;
-        self.flags.on.store(enabled, Ordering::SeqCst);
-        self.flags.key_loaded.store(enabled, Ordering::SeqCst);
-        Ok(())
+    /// Capture is on and no disable was requested since the newest applied
+    /// change.
+    fn stores_content(&self) -> bool {
+        self.flags.is_on() && self.flags.newest_disable() <= self.applied
+    }
+
+    fn enable(&mut self, ticket: u64, key: Option<ContentKey>) -> rusqlite::Result<CaptureChange> {
+        if ticket < self.applied {
+            // `key`, if any, is dropped and zeroed.
+            return Ok(CaptureChange::Superseded);
+        }
+        let held = key.is_none();
+        let Some(key) = key.or_else(|| self.key.take()) else {
+            return Ok(CaptureChange::NeedsKey);
+        };
+        if let Err(error) = write_capture_setting(&self.conn, true) {
+            // Nothing changes: the key the writer held stays, a new one is
+            // dropped.
+            if held {
+                self.key = Some(key);
+            }
+            return Err(error);
+        }
+        self.key = Some(key);
+        self.applied = ticket;
+        self.flags.on.store(true, Ordering::SeqCst);
+        self.flags.key_loaded.store(true, Ordering::SeqCst);
+        Ok(CaptureChange::Applied)
+    }
+
+    fn disable(&mut self, ticket: u64) -> rusqlite::Result<CaptureChange> {
+        if ticket < self.applied {
+            return Ok(CaptureChange::Superseded);
+        }
+        write_capture_setting(&self.conn, false)?;
+        // Dropping the key zeroes it.
+        self.key = None;
+        self.applied = ticket;
+        self.flags.on.store(false, Ordering::SeqCst);
+        self.flags.key_loaded.store(false, Ordering::SeqCst);
+        Ok(CaptureChange::Applied)
+    }
+
+    /// Keeps `key` only if nothing changed since the load started; otherwise
+    /// dropping it zeroes it.
+    fn load_key(&mut self, key: ContentKey, seen: u64) {
+        if self.flags.requested() == seen && self.flags.is_on() && self.key.is_none() {
+            self.key = Some(key);
+            self.flags.key_loaded.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1310,6 +1540,68 @@ mod tests {
                 },
                 InvalidEvent::BodyHasContentField,
             ),
+            (
+                AppendEvent {
+                    run_id: "run\0a".to_owned(),
+                    ..event("r", 0)
+                },
+                InvalidEvent::RunIdHasControlCharacter,
+            ),
+            (
+                AppendEvent {
+                    run_id: "run\na".to_owned(),
+                    ..event("r", 0)
+                },
+                InvalidEvent::RunIdHasControlCharacter,
+            ),
+            (
+                AppendEvent {
+                    kind: "tool\u{7f}".to_owned(),
+                    ..event("r", 0)
+                },
+                InvalidEvent::KindHasControlCharacter,
+            ),
+            (
+                AppendEvent {
+                    kind: "tool\u{85}".to_owned(),
+                    ..event("r", 0)
+                },
+                InvalidEvent::KindHasControlCharacter,
+            ),
+            (
+                AppendEvent {
+                    content: vec![Vec::new(); MAX_CONTENT_ITEMS + 1],
+                    ..event("r", 0)
+                },
+                InvalidEvent::TooLarge {
+                    what: "content item count",
+                    max: MAX_CONTENT_ITEMS,
+                },
+            ),
+            (
+                AppendEvent {
+                    content: vec![
+                        vec![0; MAX_CONTENT_BYTES / 2],
+                        vec![0; MAX_CONTENT_BYTES / 2 + 1],
+                    ],
+                    ..event("r", 0)
+                },
+                InvalidEvent::TooLarge {
+                    what: "content size in bytes",
+                    max: MAX_CONTENT_BYTES,
+                },
+            ),
+            (
+                AppendEvent {
+                    // `{"s":"…"}` adds 8 bytes around the string.
+                    body: json!({ "s": "x".repeat(MAX_BODY_BYTES - 7) }),
+                    ..event("r", 0)
+                },
+                InvalidEvent::TooLarge {
+                    what: "body (canonical JSON bytes)",
+                    max: MAX_BODY_BYTES,
+                },
+            ),
         ];
 
         for (bad, expected) in cases {
@@ -1329,6 +1621,31 @@ mod tests {
             .unwrap();
         assert_eq!(store.last_global_position().await.unwrap(), 1);
         assert_eq!(runs(&store).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_at_every_limit_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        store.set_capture_content(true).await.unwrap();
+        let body = json!({ "s": "x".repeat(MAX_BODY_BYTES - 8) });
+        assert_eq!(event::canonical_json(&body).unwrap().len(), MAX_BODY_BYTES);
+        let mut content = vec![Vec::new(); MAX_CONTENT_ITEMS - 1];
+        content.push(vec![1; MAX_CONTENT_BYTES]);
+
+        store
+            .append(AppendEvent {
+                run_id: "r".repeat(MAX_NAME_LEN),
+                kind: "k".repeat(MAX_NAME_LEN),
+                body,
+                content,
+                ..event("r", 0)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.blob_count().await.unwrap(), 2);
+        assert_eq!(assert_chain(&store).await, 1);
     }
 
     #[tokio::test]
@@ -1460,7 +1777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_key_may_be_generated_only_while_no_blob_is_stored() {
+    async fn the_key_may_be_generated_only_while_no_content_was_ever_stored() {
         let dir = tempfile::tempdir().unwrap();
         let recording = RecordingSecretStore::new();
         let store = Store::open(dir.path(), recording.clone()).unwrap();
@@ -1474,8 +1791,160 @@ mod tests {
             .unwrap();
         store.set_capture_content(false).await.unwrap();
         store.set_capture_content(true).await.unwrap();
-
         assert_eq!(recording.calls(), [IfMissing::Generate, IfMissing::Fail]);
+        store.close().await.unwrap();
+        drop(store);
+
+        // An erasure deletes every blob but keeps the events' addresses; a
+        // missing key must still not be replaced.
+        let conn = db::open_writer(dir.path()).unwrap();
+        conn.execute("DELETE FROM blobs", []).unwrap();
+        drop(conn);
+        let recording = RecordingSecretStore::new();
+        let store = Store::open(dir.path(), recording.clone()).unwrap();
+        assert_eq!(store.blob_count().await.unwrap(), 0);
+        store.set_capture_content(false).await.unwrap();
+        store.set_capture_content(true).await.unwrap();
+
+        assert_eq!(recording.calls(), [IfMissing::Fail]);
+    }
+
+    /// Answers only once the test releases it, like an unanswered unlock
+    /// prompt.
+    struct BlockingSecretStore {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SecretStore for BlockingSecretStore {
+        fn content_key(
+            &self,
+            _if_missing: IfMissing,
+        ) -> Result<[u8; KEY_LEN], KeychainUnavailable> {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(KEY)
+        }
+    }
+
+    /// A store whose keychain blocks, a way to release it, and a wait for a
+    /// keychain call to start.
+    fn blocking_store(
+        dir: &Path,
+    ) -> (
+        Arc<Store>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (entered, wait_entered) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let secrets = Arc::new(BlockingSecretStore {
+            entered: Mutex::new(entered),
+            release: Mutex::new(wait_release),
+        });
+        (
+            Arc::new(Store::open(dir, secrets).unwrap()),
+            release,
+            wait_entered,
+        )
+    }
+
+    async fn wait_for_keychain_call(entered: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || entered.recv().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabling_during_a_key_load_returns_at_once_and_no_content_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        store_with_capture_left_on(dir.path()).await;
+        let (store, release, entered) = blocking_store(dir.path());
+        let append = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .append(with_content("run-a", 1, &[b"asked for while on"]))
+                    .await
+            })
+        };
+        wait_for_keychain_call(entered).await;
+
+        let disabled =
+            tokio::time::timeout(Duration::from_millis(500), store.set_capture_content(false))
+                .await
+                .expect("disabling waited for the keychain");
+
+        assert!(!disabled.unwrap());
+        assert!(!store.capture_content());
+        release.send(()).unwrap();
+        // The key arrives after the disable, so the writer drops it and the
+        // event is stored as with capture off.
+        append.await.unwrap().unwrap();
+        store
+            .append(with_content("run-a", 2, &[b"after disabling"]))
+            .await
+            .unwrap();
+        assert_eq!(store.blob_count().await.unwrap(), 0);
+        assert!(event_content(&store).await.is_empty());
+        assert!(
+            rows(&store)
+                .await
+                .iter()
+                .all(|row| body_of(row).get(CONTENT_FIELD).is_none())
+        );
+        assert_eq!(setting(&store).await.as_deref(), Some("false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabling_during_an_enable_returns_at_once_and_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, release, entered) = blocking_store(dir.path());
+        let enable = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.set_capture_content(true).await })
+        };
+        wait_for_keychain_call(entered).await;
+
+        let disabled =
+            tokio::time::timeout(Duration::from_millis(500), store.set_capture_content(false))
+                .await
+                .expect("disabling waited for the keychain");
+
+        assert!(!disabled.unwrap());
+        release.send(()).unwrap();
+        // The enable was requested first, so the disable wins.
+        assert!(!enable.await.unwrap().unwrap());
+        assert!(!store.capture_content());
+        assert_eq!(setting(&store).await.as_deref(), Some("false"));
+        store
+            .append(with_content("run-a", 1, &[b"after disabling"]))
+            .await
+            .unwrap();
+        assert_eq!(store.blob_count().await.unwrap(), 0);
+        assert!(event_content(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_change_requested_later_wins_whatever_order_the_writer_sees() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        store.set_capture_content(true).await.unwrap();
+        // A disable is applied before an enable requested earlier
+        // reaches the writer: the enable is dropped.
+        let older = store.capture.next_ticket();
+        store.disable().await.unwrap();
+
+        assert_eq!(
+            store.send_enable(older, None).await.unwrap(),
+            CaptureChange::Superseded
+        );
+        assert!(!store.capture_content());
+        store
+            .append(with_content("run-a", 1, &[b"not stored"]))
+            .await
+            .unwrap();
+        assert_eq!(store.blob_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
