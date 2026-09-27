@@ -46,3 +46,13 @@ test("the renderer page has no inline script", async () => {
 
   assert.doesNotMatch(html, /<script(?![^>]*\ssrc=)[^>]*>/i);
 });
+
+test("the renderer page has no inline style attributes or event handlers", async () => {
+  const html = await readFile(
+    new URL("../renderer/index.html", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(html, /\sstyle=/i);
+  assert.doesNotMatch(html, /\son[a-z]+=/i);
+});

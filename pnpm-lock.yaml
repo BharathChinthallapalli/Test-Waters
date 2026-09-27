@@ -172,6 +172,9 @@ importers:
 
   apps/desktop:
     devDependencies:
+      '@callsheet/api-types':
+        specifier: workspace:*
+        version: link:../../packages/api-types
       '@types/node':
         specifier: ^24.13.6
         version: 24.13.6
