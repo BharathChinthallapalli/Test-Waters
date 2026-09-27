@@ -32,11 +32,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
-  # Behaviour that differs by platform (feature 02, R7.2). For now: owner-only
-  # files (protected DACL); later feature 02 tasks add the lock and signal tests
-  # for cs-store and cs-daemon here.
+  # Behaviour that differs by platform (feature 02, R7.2): every cs-store and
+  # cs-daemon test, including owner-only files (protected DACL), the instance
+  # lock and discovery, and the daemon binary. See docs/ci.md for what can't run
+  # here (sending a console control event needs Win32 FFI).
   windows:
-    name: Rust on Windows (owner-only files)
+    name: Rust on Windows (cs-store, cs-daemon)
     runs-on: windows-2025
     timeout-minutes: 30
     permissions:
@@ -48,7 +49,7 @@ jobs:
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test -p cs-store --locked fsperm
+      - run: cargo test -p cs-store -p cs-daemon --locked
 
   cargo-deny:
     name: Rust dependencies (cargo-deny)

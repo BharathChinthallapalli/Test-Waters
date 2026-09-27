@@ -6,7 +6,7 @@
 | Job | Gates |
 |---|---|
 | Rust (fmt, clippy, test) | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` |
-| Rust on Windows (owner-only files) | `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test -p cs-store --locked fsperm` on `windows-2025` |
+| Rust on Windows (cs-store, cs-daemon) | `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test -p cs-store -p cs-daemon --locked` on `windows-2025` |
 | Rust dependencies (cargo-deny) | `cargo deny check` (licences, advisories, bans, sources; see `deny.toml`) |
 | TypeScript (Biome, typecheck, test, audit) | `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test`, `pnpm audit` |
 | Generated types are current | `node scripts/gen-types.ts --check` (ADR 0009) |
@@ -36,10 +36,23 @@ The other jobs run on Linux (`ubuntu-24.04`). Behaviour that differs by
 platform (file permissions, locks, signals; requirement 7.2 of feature 02) also
 needs a test on Windows, so **Rust on Windows** runs on the pinned
 `windows-2025` image, with the same checkout and toolchain steps as the Linux
-Rust job. It runs clippy for the whole workspace and the owner-only file tests
-(`fsperm`: owned by the current user, with a protected DACL that grants only
-that user). Later feature 02
-tasks extend it with the lock and signal tests for `cs-store` and `cs-daemon`.
+Rust job. It runs clippy for the whole workspace and every test of `cs-store` and
+`cs-daemon`, among them:
+
+- owner-only files (`fsperm`: owned by the current user, with a protected DACL
+  that grants only that user);
+- the instance lock (`daemon.lock`, a second instance is refused and named) and
+  discovery (`daemon.json` is trusted only while the lock is held);
+- the token file, rotation, the header-read timeout and graceful connection
+  draining, and the built `cs-daemon` binary (exit status 2 for a non-loopback
+  `--listen`, a second instance refused, token reused after a crash).
+
+Not covered on Windows: delivering Ctrl+C or a console close event to the
+daemon. Sending one (`GenerateConsoleCtrlEvent`) needs Win32 FFI, and `unsafe`
+is denied outside `cs-store::fsperm`. The shutdown sequence after the signal
+is the same code on every platform and is tested on Linux with `SIGINT` and
+`SIGTERM`. The Unix-only tests (file modes, a data directory open to others,
+the pid check in `daemon.lock`, signals) are compiled out on Windows.
 **CI passed** fails unless this job succeeded too.
 
 There is no full local equivalent on Linux: `cargo clippy --target
