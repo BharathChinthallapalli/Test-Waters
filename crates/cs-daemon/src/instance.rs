@@ -6,10 +6,22 @@
 //! `cs_store::fsperm`. Everything secret lives in it (the token, the lock, the
 //! database), and on Windows SQLite's `-wal`/`-shm` files get their ACL from it
 //! (`cs_store::db` module docs), so its permissions matter:
-//! - Unix: a directory that already exists must have no group or other permission
-//!   bits, or the daemon refuses to start. It's never chmod-ed for the user.
-//! - Windows: a directory that already exists is used as it is; its DACL is not
-//!   checked. Only a directory the daemon creates is guaranteed owner-only.
+//! - Unix: the directory must have no group or other permission bits and be
+//!   owned by the user running the daemon, or the daemon refuses to start.
+//! - Windows: the directory must be owned by the current user and have a
+//!   protected DACL whose allow ACEs are all for that user
+//!   (`cs_store::fsperm::owner_only_problem`), or the daemon refuses to start.
+//!
+//! A directory that fails is never repaired (chmod-ed, or given a new DACL):
+//! - Callsheet itself only ever creates it through `fsperm`, so a failing
+//!   directory was made or changed by someone else, and whatever it holds may
+//!   already carry other users' ACEs or owners, which re-applying the parent's
+//!   permissions doesn't remove;
+//! - Windows checks access when a handle is opened and a handle keeps the
+//!   access it was granted (Microsoft Learn, "Requesting Access Rights to an
+//!   Object"; MS-FSA 2.1.5.1.2.1), so another account's open handle outlives a
+//!   new DACL;
+//! - refusing is what Unix does too. The message names the directory and the fix.
 //!
 //! **Single instance.** `daemon.lock` is created owner-only and held with
 //! `std::fs::File::try_lock` (an exclusive `flock` on Unix, `LockFileEx` over the
@@ -82,6 +94,18 @@ pub enum InstanceError {
     NotADirectory { path: PathBuf },
     /// Unix: the data directory has group or other permission bits.
     DataDirNotOwnerOnly { path: PathBuf, mode: u32 },
+    /// Unix: the data directory is owned by `owner`, not by `current`, the uid
+    /// that owns the files this process creates.
+    DataDirNotOwned {
+        path: PathBuf,
+        owner: u32,
+        current: u32,
+    },
+    /// Windows: the data directory's owner or DACL is not owner-only.
+    DataDirAclNotOwnerOnly {
+        path: PathBuf,
+        problem: fsperm::AclProblem,
+    },
     /// Opening, locking or writing `daemon.lock` failed.
     Lock { path: PathBuf, source: io::Error },
     /// Another daemon holds the lock (R1.5). `pid` is from `daemon.json`, or on
@@ -108,6 +132,22 @@ impl fmt::Display for InstanceError {
                 f,
                 "data directory {} has mode {mode:04o}, but it must not be accessible to \
                  group or others; run `chmod 700` on it or pass another --data-dir",
+                path.display()
+            ),
+            Self::DataDirNotOwned {
+                path,
+                owner,
+                current,
+            } => write!(
+                f,
+                "data directory {} is owned by uid {owner}, but Callsheet runs as uid {current}; \
+                 pass another --data-dir",
+                path.display()
+            ),
+            Self::DataDirAclNotOwnerOnly { path, problem } => write!(
+                f,
+                "data directory {} {problem}, but only you may have access to it; move it away \
+                 so Callsheet re-creates it owner-only, or pass another --data-dir",
                 path.display()
             ),
             Self::Lock { path, source } => write!(f, "cannot lock {}: {source}", path.display()),
@@ -172,7 +212,7 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 
 #[cfg(unix)]
 fn check_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), InstanceError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let mode = metadata.permissions().mode() & 0o7777;
     if mode & 0o077 != 0 {
@@ -181,10 +221,63 @@ fn check_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), Instance
             mode,
         });
     }
+    let current = new_file_owner(path).map_err(|source| InstanceError::DataDir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_owner(path, metadata.uid(), current)
+}
+
+#[cfg(unix)]
+fn check_owner(path: &Path, owner: u32, current: u32) -> Result<(), InstanceError> {
+    if owner != current {
+        return Err(InstanceError::DataDirNotOwned {
+            path: path.to_path_buf(),
+            owner,
+            current,
+        });
+    }
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// The uid that owns the files this process creates, read from a probe file
+/// created owner-only in `dir` and removed again. "The owner (user ID) of the
+/// new file is set to the effective user ID of the process" (Linux man-pages,
+/// open(2), `O_CREAT`). Stable std has no `getuid` (`UnixStream::peer_cred` is
+/// unstable in Rust 1.98.1, feature `peer_credentials_unix_socket`), and `libc`
+/// would need `unsafe`.
+#[cfg(unix)]
+fn new_file_owner(dir: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(io::Error::other)?;
+    let probe = dir.join(format!(".owner-probe-{}", hex::encode(suffix)));
+    let file = fsperm::create_new_owner_only(&probe)?;
+    let owner = file.metadata().map(|metadata| metadata.uid());
+    drop(file);
+    fs::remove_file(&probe)?;
+    owner
+}
+
+#[cfg(windows)]
+fn check_owner_only(path: &Path, _metadata: &fs::Metadata) -> Result<(), InstanceError> {
+    match fsperm::owner_only_problem(path) {
+        Ok(None) => Ok(()),
+        Ok(Some(problem)) => Err(InstanceError::DataDirAclNotOwnerOnly {
+            path: path.to_path_buf(),
+            problem,
+        }),
+        Err(source) => Err(InstanceError::DataDir {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `fsperm` can't create the directory on other platforms, so this is never
+/// reached.
+#[cfg(not(any(unix, windows)))]
 fn check_owner_only(_path: &Path, _metadata: &fs::Metadata) -> Result<(), InstanceError> {
     Ok(())
 }
@@ -436,5 +529,61 @@ mod tests {
 
         assert!(known.to_string().contains("pid 4242"), "{known}");
         assert!(unknown.to_string().contains("unknown pid"), "{unknown}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_owner_must_be_the_current_uid() {
+        let path = Path::new("/data");
+
+        assert!(check_owner(path, 1000, 1000).is_ok());
+        let error = check_owner(path, 65534, 1000).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                InstanceError::DataDirNotOwned {
+                    owner: 65534,
+                    current: 1000,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("/data") && message.contains("uid 65534") && !message.contains('\n'),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_new_file_owner_is_this_process_and_leaves_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+
+        let uid = new_file_owner(root.path()).unwrap();
+
+        // The temporary directory was created by this process too.
+        assert_eq!(uid, fs::metadata(root.path()).unwrap().uid());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn acl_message_is_one_line_naming_the_directory_and_the_fix() {
+        let error = InstanceError::DataDirAclNotOwnerOnly {
+            path: PathBuf::from("data"),
+            problem: fsperm::AclProblem::OthersAllowed,
+        };
+
+        let message = error.to_string();
+
+        assert!(
+            message.starts_with("data directory data grants access to other accounts")
+                && message.contains("--data-dir")
+                && !message.contains('\n'),
+            "{message}"
+        );
     }
 }

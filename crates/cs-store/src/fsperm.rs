@@ -12,8 +12,10 @@
 //!   own (SQLite's `-wal` and `-shm`), get it as their only, inherited ACE. Their
 //!   DACL is not protected, though, so a later change to the parent's DACL
 //!   reaches them; and a directory that already existed keeps its own ACEs.
+//!   [`owner_only_problem`] tells whether an existing directory is owner-only.
 //! - Anything else: these functions return [`io::ErrorKind::Unsupported`].
 
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -22,6 +24,41 @@ use std::path::Path;
 /// owner-only; existing ones are left as they are.
 pub fn create_dir_all_owner_only(path: &Path) -> io::Result<()> {
     imp::create_dir_all(path)
+}
+
+/// Why an existing directory is not owner-only on Windows (see
+/// [`owner_only_problem`]). The `Display` text completes "the directory …".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclProblem {
+    /// There is no DACL, which allows everyone full access, or an ACE allows
+    /// access to an account other than the current user. An allow ACE of a kind
+    /// the check doesn't read (object or callback ACEs) counts as one.
+    OthersAllowed,
+    /// The DACL is not protected, so inheritable ACEs of the parent reach it.
+    Inherited,
+    /// The owner is not the current user. An owner can always read and change
+    /// the DACL (`READ_CONTROL`, `WRITE_DAC`).
+    NotOwner,
+}
+
+impl fmt::Display for AclProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OthersAllowed => "grants access to other accounts",
+            Self::Inherited => "inherits permissions from its parent",
+            Self::NotOwner => "is not owned by the current user",
+        })
+    }
+}
+
+/// Windows: checks that the directory `path` has the descriptor this module
+/// gives the directories it creates: owned by the current user, with a
+/// protected DACL whose allow ACEs are all for the current user (deny ACEs are
+/// fine). `Ok(None)` when it does, else the first problem found, in the order
+/// of [`AclProblem`]. The directory is never changed.
+#[cfg(windows)]
+pub fn owner_only_problem(path: &Path) -> io::Result<Option<AclProblem>> {
+    imp::owner_only_problem(path)
 }
 
 /// Creates a new owner-only file. Fails if `path` already exists.
@@ -102,16 +139,19 @@ mod imp {
     use std::ptr;
     use std::sync::OnceLock;
 
+    use super::AclProblem;
     use windows_sys::Win32::Foundation::{
         ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
@@ -254,6 +294,158 @@ mod imp {
             return Err(io::Error::other("no security descriptor was returned"));
         }
         Ok(descriptor)
+    }
+
+    // ACE types (Microsoft Learn, `ACE_HEADER`). The values are winnt.h's, as
+    // windows-sys 0.61.2 gives them in `Win32/System/SystemServices`, a feature
+    // this crate doesn't enable.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
+    const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+    const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 12;
+
+    pub(super) fn owner_only_problem(path: &Path) -> io::Result<Option<AclProblem>> {
+        let path = wide_path(path)?;
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `path` is NUL-terminated; the SID and ACL out pointers may
+        // be null (they are read from the descriptor below); `descriptor` is a
+        // valid out pointer.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let descriptor = LocalBuf(descriptor);
+        if descriptor.0.is_null() {
+            return Err(io::Error::other("no security descriptor was returned"));
+        }
+        descriptor_problem(&descriptor)
+    }
+
+    /// The checks of [`owner_only_problem`] on `descriptor`, which must hold a
+    /// valid self-relative security descriptor (from `GetNamedSecurityInfoW` or
+    /// SDDL); it is only read.
+    fn descriptor_problem(descriptor: &LocalBuf) -> io::Result<Option<AclProblem>> {
+        let user = user_sid()?;
+
+        let mut present = 0;
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `descriptor` is valid (see above); the out pointers are valid.
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // No DACL, or a NULL one, allows everyone full access
+        // (`GetSecurityDescriptorDacl`, pDacl: "fail securely").
+        if present == 0 || dacl.is_null() {
+            return Ok(Some(AclProblem::OthersAllowed));
+        }
+        // SAFETY: `dacl` points into `descriptor`, which outlives the call;
+        // `user` holds a valid SID.
+        let only_user = unsafe { only_user_allowed(dacl, user.0) }?;
+        if !only_user {
+            return Ok(Some(AclProblem::OthersAllowed));
+        }
+
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: `descriptor` is valid; the out pointers are valid.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_DACL_PROTECTED == 0 {
+            return Ok(Some(AclProblem::Inherited));
+        }
+
+        let mut owner: PSID = ptr::null_mut();
+        let mut owner_defaulted = 0;
+        // SAFETY: `descriptor` is valid; the out pointers are valid.
+        if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut owner_defaulted) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a non-null `owner` points at a SID inside `descriptor`, and
+        // `user` holds a valid SID; EqualSid is only given SIDs that IsValidSid
+        // accepts, as its documentation requires.
+        let is_user =
+            !owner.is_null() && unsafe { IsValidSid(owner) != 0 && EqualSid(owner, user.0) != 0 };
+        Ok((!is_user).then_some(AclProblem::NotOwner))
+    }
+
+    /// Whether every ACE of `dacl` that can allow access is an
+    /// `ACCESS_ALLOWED_ACE` for `user`. Deny ACEs never allow access.
+    ///
+    /// # Safety
+    /// `dacl` must point at a valid ACL and `user` at a valid SID, both
+    /// readable during the call.
+    unsafe fn only_user_allowed(dacl: *const ACL, user: PSID) -> io::Result<bool> {
+        // SAFETY: the caller guarantees `dacl` points at a valid ACL.
+        let count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `dacl` is valid and `index` is below its ACE count; `ace`
+            // is a valid out pointer.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: GetAce returned the address of an ACE inside the ACL.
+            // Every ACE starts with an ACE_HEADER (`ACE_HEADER`, Remarks) and
+            // is DWORD-aligned (`ACCESS_ALLOWED_ACE`, Remarks).
+            let header = unsafe { ace.cast::<ACE_HEADER>().read() };
+            match header.AceType {
+                ACCESS_DENIED_ACE_TYPE
+                | ACCESS_DENIED_OBJECT_ACE_TYPE
+                | ACCESS_DENIED_CALLBACK_ACE_TYPE
+                | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {}
+                ACCESS_ALLOWED_ACE_TYPE
+                    if usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>() =>
+                {
+                    // SAFETY: an ACE of this type is an ACCESS_ALLOWED_ACE, at
+                    // least that large (checked above), whose SID starts at
+                    // `SidStart` inside the ACE.
+                    let sid: PSID =
+                        unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+                    // SAFETY: `sid` points into the ACL and `user` at a valid
+                    // SID; EqualSid is only given SIDs that IsValidSid accepts.
+                    if unsafe { IsValidSid(sid) == 0 || EqualSid(sid, user) == 0 } {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The current user's SID in binary form.
+    fn user_sid() -> io::Result<LocalBuf> {
+        let string = to_wide(OsStr::new(current_user_sid()?))?;
+        let mut sid: PSID = ptr::null_mut();
+        // SAFETY: `string` is NUL-terminated and outlives the call; `sid` is a
+        // valid out pointer.
+        if unsafe { ConvertStringSidToSidW(string.as_ptr(), &mut sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = LocalBuf(sid);
+        if sid.0.is_null() {
+            return Err(io::Error::other("no SID was returned"));
+        }
+        Ok(sid)
     }
 
     /// The string SID (`S-1-5-21-…`) of the user in this process's token. The
@@ -414,13 +606,18 @@ mod imp {
     #[cfg(test)]
     pub(super) mod inspect {
         use super::*;
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
-            SE_FILE_OBJECT,
-        };
-        use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        };
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION;
+
+        /// Creates the directory `path` with the descriptor `sddl`.
+        pub(in super::super) fn create_dir_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+            create_dir(path, &descriptor_from_sddl(sddl)?)
+        }
+
+        /// [`owner_only_problem`] for the in-memory descriptor `sddl`.
+        pub(in super::super) fn sddl_problem(sddl: &str) -> io::Result<Option<AclProblem>> {
+            descriptor_problem(&descriptor_from_sddl(sddl)?)
+        }
 
         pub(in super::super) fn dacl_sddl(path: &Path) -> io::Result<String> {
             security_sddl(path, DACL_SECURITY_INFORMATION)
@@ -690,6 +887,110 @@ mod tests {
 
         assert_single_ace(&file, "ID", false);
         assert_single_ace(&subdir, "OICIID", false);
+    }
+
+    // ---- owner_only_problem ------------------------------------------------------
+
+    #[test]
+    fn created_directories_pass_the_owner_only_check() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data");
+        create_dir_all_owner_only(&dir).unwrap();
+
+        assert_eq!(owner_only_problem(&dir).unwrap(), None);
+        assert_owner_only(&dir, "OICI");
+    }
+
+    #[test]
+    fn a_directory_made_by_std_fails_and_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data");
+        std::fs::create_dir(&dir).unwrap();
+        let before = inspect::dacl_sddl(&dir).unwrap();
+
+        let problem = owner_only_problem(&dir).unwrap();
+
+        assert!(problem.is_some(), "{before}");
+        let after = inspect::dacl_sddl(&dir).unwrap();
+        assert_eq!(after, before);
+        assert!(!parse_dacl(&after).0.contains('P'), "{after}");
+    }
+
+    #[test]
+    fn an_added_everyone_ace_fails_and_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data");
+        create_dir_all_owner_only(&dir).unwrap();
+        // Everyone (S-1-1-0) may read; `*` marks a numeric SID (Microsoft
+        // Learn, "icacls", Remarks).
+        let status = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(R)"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let before = inspect::dacl_sddl(&dir).unwrap();
+        assert!(before.contains(";;;WD)"), "{before}");
+
+        assert_eq!(
+            owner_only_problem(&dir).unwrap(),
+            Some(AclProblem::OthersAllowed)
+        );
+        assert_eq!(inspect::dacl_sddl(&dir).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unprotected_dacl_fails_even_with_only_the_owner_ace() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("data");
+        create_dir_all_owner_only(&parent).unwrap();
+        let dir = parent.join("child");
+        let sid = current_user_sid().unwrap();
+        // Not protected: the parent's only ACE, also the user's, is merged in.
+        inspect::create_dir_with_sddl(&dir, &format!("O:{sid}D:(A;OICI;FA;;;{sid})")).unwrap();
+
+        assert_eq!(
+            owner_only_problem(&dir).unwrap(),
+            Some(AclProblem::Inherited)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_of_descriptors() {
+        let sid = current_user_sid().unwrap();
+        let owner_ace = format!("(A;OICI;FA;;;{sid})");
+        let cases = [
+            (format!("O:{sid}D:P{owner_ace}"), None),
+            // Deny ACEs never grant anything.
+            (format!("O:{sid}D:P(D;OICI;FW;;;WD){owner_ace}"), None),
+            // An empty DACL grants nothing.
+            (format!("O:{sid}D:P"), None),
+            (
+                format!("O:{sid}D:P{owner_ace}(A;OICI;FR;;;WD)"),
+                Some(AclProblem::OthersAllowed),
+            ),
+            (
+                format!("O:{sid}D:P{owner_ace}(A;OICI;FR;;;BU)"),
+                Some(AclProblem::OthersAllowed),
+            ),
+            (
+                format!("O:{sid}D:P{owner_ace}(A;OICIIO;FA;;;CO)"),
+                Some(AclProblem::OthersAllowed),
+            ),
+            // An allow ACE of another kind counts, even for the user.
+            (
+                format!("O:{sid}D:P(OA;;FR;bf967a86-0de6-11d0-a285-00aa003049e2;;{sid})"),
+                Some(AclProblem::OthersAllowed),
+            ),
+            // No DACL at all allows everyone full access.
+            (format!("O:{sid}"), Some(AclProblem::OthersAllowed)),
+            (format!("O:{sid}D:{owner_ace}"), Some(AclProblem::Inherited)),
+            (format!("O:BAD:P{owner_ace}"), Some(AclProblem::NotOwner)),
+            (format!("D:P{owner_ace}"), Some(AclProblem::NotOwner)),
+        ];
+        for (sddl, expected) in cases {
+            assert_eq!(inspect::sddl_problem(&sddl).unwrap(), expected, "{sddl}");
+        }
     }
 
     #[test]
