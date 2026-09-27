@@ -8,17 +8,20 @@
 //! The layers wrap every path, so a request to any other path or with another method
 //! is still checked for Host, Origin and token before it gets 404 or 405.
 //!
-//! Serve the router with `into_make_service_with_connect_info::<SocketAddr>()` so
-//! auth failures can name the peer; without it the peer is logged as unknown.
+//! Serve the router with [`crate::serve`], which adds the peer's
+//! `ConnectInfo<SocketAddr>` to every request so auth failures can name it (without
+//! it the peer is logged as unknown) and sets hyper's header-read timeout.
 //!
-//! **Header-read timeout.** `axum::serve` in axum 0.8.9 builds a fresh
-//! `hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())` for every
-//! connection and exposes no way to configure it (`axum/src/serve/mod.rs`,
+//! **Header-read timeout.** Don't serve it with `axum::serve`: in axum 0.8.9 it
+//! builds a fresh `hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())`
+//! for every connection and exposes no way to configure it (`axum/src/serve/mod.rs`,
 //! `handle_connection`). hyper's HTTP/1 `header_read_timeout` defaults to 30 s but
 //! only takes effect with a timer, and that builder sets none, so hyper drops the
 //! default (`hyper/src/server/conn/http1.rs`, `Builder::new` sets `Time::Empty`;
-//! `hyper/src/common/time.rs`, `Time::check`). The 10 s timeout here starts once the
-//! headers have been read; it covers reading the body and the dispatch.
+//! `hyper/src/common/time.rs`, `Time::check`), and a client that never finishes its
+//! headers holds its connection forever. [`crate::serve`] configures the timer and a
+//! 10 s header-read timeout. The 10 s timeout here starts once the headers have
+//! been read; it covers reading the body and the dispatch.
 
 use std::io;
 use std::net::SocketAddr;

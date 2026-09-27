@@ -10,5 +10,6 @@ pub mod instance;
 pub mod logging;
 pub mod methods;
 pub mod rpc;
+pub mod serve;
 pub mod shutdown;
 pub mod token;
