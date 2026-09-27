@@ -189,25 +189,54 @@ pub fn backup_path(data_dir: &Path, from: u32) -> PathBuf {
 /// so one stuck file doesn't keep the others. Called after a migrated startup
 /// has passed `integrity_check` and a full verify, and during erasure.
 pub fn remove_migration_backups(data_dir: &Path) -> io::Result<u64> {
-    let mut removed = 0;
+    remove_migration_backups_except(data_dir, None)
+}
+
+/// [`remove_migration_backups`], except that the backup whose file name is
+/// `keep` stays. Erasure retries use it to leave the backup that this startup's
+/// migration just made until that startup has verified.
+pub fn remove_migration_backups_except(data_dir: &Path, keep: Option<&OsStr>) -> io::Result<u64> {
+    visit_backups(data_dir, |entry| {
+        if keep == Some(entry.file_name().as_os_str()) {
+            Ok(false)
+        } else {
+            fs::remove_file(entry.path()).map(|()| true)
+        }
+    })
+}
+
+/// How many files [`remove_migration_backups`] would delete now. For the
+/// erasure dry run.
+pub fn count_migration_backups(data_dir: &Path) -> io::Result<u64> {
+    visit_backups(data_dir, |_| Ok(true))
+}
+
+/// Calls `f` on every regular file in `data_dir` whose name matches
+/// `backup-v*.db` and counts the calls that return `true`. It goes on after a
+/// failure, then reports the first one.
+fn visit_backups(
+    data_dir: &Path,
+    mut f: impl FnMut(&fs::DirEntry) -> io::Result<bool>,
+) -> io::Result<u64> {
+    let mut counted = 0;
     let mut first_error = None;
     for entry in fs::read_dir(data_dir)? {
         let outcome = entry.and_then(|entry| {
             if is_backup_name(&entry.file_name()) && entry.file_type()?.is_file() {
-                fs::remove_file(entry.path()).map(|()| true)
+                f(&entry)
             } else {
                 Ok(false)
             }
         });
         match outcome {
-            Ok(true) => removed += 1,
+            Ok(true) => counted += 1,
             Ok(false) => {}
             Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
     }
-    first_error.map_or(Ok(removed), Err)
+    first_error.map_or(Ok(counted), Err)
 }
 
 fn is_backup_name(name: &OsStr) -> bool {
