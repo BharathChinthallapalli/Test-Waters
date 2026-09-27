@@ -6,9 +6,11 @@ const { contextBridge, ipcRenderer } =
   require("electron") as typeof import("electron");
 
 type DaemonStatus = import("../shared/daemon-status.ts").DaemonStatus;
+type RecentCalls = import("../shared/recent-calls.ts").RecentCalls;
 
 const STATUS_GET_CHANNEL = "callsheet:status:get";
 const STATUS_CHANGED_CHANNEL = "callsheet:status:changed";
+const CALLS_OLDER_CHANNEL = "callsheet:calls:older";
 
 const api: import("./api.ts").CallsheetApi = Object.freeze({
   status: Object.freeze({
@@ -26,6 +28,13 @@ const api: import("./api.ts").CallsheetApi = Object.freeze({
         ipcRenderer.removeListener(STATUS_CHANGED_CHANNEL, forward);
       };
     },
+  }),
+  calls: Object.freeze({
+    // Only a number crosses; the main process checks it again.
+    older: (before: number): Promise<RecentCalls> =>
+      typeof before === "number"
+        ? ipcRenderer.invoke(CALLS_OLDER_CHANNEL, before)
+        : Promise.reject(new TypeError("calls.older needs a number")),
   }),
 });
 

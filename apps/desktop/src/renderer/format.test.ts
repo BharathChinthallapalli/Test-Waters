@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { formatCount, formatDuration, startCommand } from "./format.ts";
+import {
+  baseUrlCommands,
+  formatCallDuration,
+  formatCallTime,
+  formatCount,
+  formatDuration,
+  inputTokensBreakdown,
+  isProxyAddress,
+  startCommand,
+  totalInputTokens,
+} from "./format.ts";
 
 const S = 1000;
 const MIN = 60 * S;
@@ -114,4 +124,133 @@ test("Windows: what double quotes would expand gets PowerShell single quotes", (
   for (const [dir, quoted] of cases) {
     assert.equal(arg(startCommand(dir, "windows")), quoted, dir);
   }
+});
+
+test("call durations: ms under a second, one decimal under ten, then units", () => {
+  const cases: Array<[number, string]> = [
+    [0, "0 ms"],
+    [812, "812 ms"],
+    [999, "999 ms"],
+    [1000, "1.0 s"],
+    [3249, "3.2 s"],
+    [9999, "9.9 s"],
+    [10_000, "10 s"],
+    [42_900, "42 s"],
+    [60_000, "1 min"],
+    [125_000, "2 min 5 s"],
+    [2 * H + 5 * MIN, "2 h 5 min"],
+    [-3, "0 ms"],
+  ];
+  for (const [ms, expected] of cases) {
+    assert.equal(
+      formatCallDuration(ms),
+      expected.replace(/(\d) /g, "$1\u00a0"),
+      `${ms} ms`,
+    );
+  }
+});
+
+test("call times: relative today, the date otherwise, the full time on hover", () => {
+  const now = new Date(2026, 8, 27, 15, 30, 0).getTime();
+  const today = (hour: number, minute: number, second = 0) =>
+    new Date(2026, 8, 27, hour, minute, second).getTime();
+  const text = (ms: number) => formatCallTime(ms, now, "en-US").text;
+  assert.equal(text(now), "Just now");
+  assert.equal(text(now - 59 * S), "Just now");
+  assert.equal(text(now + 5 * S), "Just now"); // clocks that disagree
+  // A no-break space between number and unit, as in every duration.
+  assert.equal(text(now - 60 * S), "1 min ago");
+  assert.equal(text(today(15, 18)), "12 min ago");
+  assert.equal(text(today(12, 29)), "3 h ago");
+  assert.equal(text(today(0, 0, 1)), "15 h ago");
+  // Yesterday is a date, even when it was only minutes ago.
+  const justAfterMidnight = new Date(2026, 8, 28, 0, 5).getTime();
+  assert.equal(
+    formatCallTime(
+      new Date(2026, 8, 27, 23, 50).getTime(),
+      justAfterMidnight,
+      "en-US",
+    ).text,
+    "Sep 27",
+  );
+  assert.equal(text(new Date(2026, 8, 26, 14, 2).getTime()), "Sep 26");
+  assert.equal(text(new Date(2025, 11, 31, 9).getTime()), "Dec 31, 2025");
+  const { title } = formatCallTime(today(14, 2, 31), now, "en-US");
+  assert.match(title, /^Sep 27, 2026, 2:02:31\sPM$/);
+});
+
+test("input tokens include the cache; the breakdown names each part", () => {
+  const usage = {
+    inputTokens: 408,
+    outputTokens: 812,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 12_000,
+  };
+  assert.equal(totalInputTokens(usage), 12_408);
+  assert.equal(
+    inputTokensBreakdown(usage, "en-US"),
+    "12,408 input tokens: 408 uncached, 12,000 read from cache, 0 written to cache",
+  );
+  // A cache count the provider didn't report isn't shown as 0.
+  const bare = {
+    ...usage,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+  };
+  assert.equal(totalInputTokens(bare), 408);
+  assert.equal(
+    inputTokensBreakdown(bare, "en-US"),
+    "408 input tokens: 408 uncached",
+  );
+});
+
+test("the ANTHROPIC_BASE_URL line, per platform", () => {
+  assert.deepEqual(baseUrlCommands("127.0.0.1:4101", "posix"), [
+    { shell: null, text: "export ANTHROPIC_BASE_URL=http://127.0.0.1:4101" },
+  ]);
+  assert.deepEqual(baseUrlCommands("127.0.0.1:4101", "windows"), [
+    {
+      shell: "PowerShell",
+      text: '$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:4101"',
+    },
+    // No quotes: cmd.exe's set would keep them as part of the value.
+    {
+      shell: "Command Prompt",
+      text: "set ANTHROPIC_BASE_URL=http://127.0.0.1:4101",
+    },
+  ]);
+});
+
+test("only a 127.0.0.1:<port> address is put into a shell line", () => {
+  for (const address of ["127.0.0.1:1", "127.0.0.1:65535"]) {
+    assert.ok(isProxyAddress(address), address);
+  }
+  for (const address of [
+    "127.0.0.1:0",
+    "127.0.0.1:65536",
+    "127.0.0.1:04101",
+    "127.0.0.1",
+    "localhost:4101",
+    "0.0.0.0:4101",
+    "127.0.0.1:4101 ",
+    "127.0.0.1:4101;id",
+    '127.0.0.1:4101"; Remove-Item ~ #',
+    "127.0.0.1:4101$(id)",
+  ]) {
+    assert.equal(baseUrlCommands(address, "posix"), null, address);
+    assert.equal(baseUrlCommands(address, "windows"), null, address);
+  }
+});
+
+test("sh sets exactly the URL from the export line", {
+  skip: process.platform === "win32",
+}, () => {
+  const [line] = baseUrlCommands("127.0.0.1:4101", "posix") ?? [];
+  assert.ok(line);
+  const value = execFileSync(
+    "/bin/sh",
+    ["-c", `${line.text}; printf %s "$ANTHROPIC_BASE_URL"`],
+    { encoding: "utf8", env: {} },
+  );
+  assert.equal(value, "http://127.0.0.1:4101");
 });

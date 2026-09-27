@@ -79,7 +79,44 @@
         <p id="next-step-after" class="next-step-after" hidden></p>
       </section>
 
-      <dl id="details" class="details" aria-label="Daemon details" hidden></dl>
+      <section id="connect" class="connect" aria-labelledby="connect-title" hidden>
+        <h2 id="connect-title" class="section-title">Connect Claude Code</h2>
+        <p id="connect-text" class="connect-text"></p>
+        <div id="connect-commands" class="connect-commands"></div>
+        <p id="connect-after" class="connect-after" hidden></p>
+      </section>
+
+      <section id="calls" class="calls" aria-labelledby="calls-title" hidden>
+        <h2 id="calls-title" class="section-title">Recent calls</h2>
+        <p id="calls-dropped" class="calls-callout" hidden></p>
+        <p id="calls-note" class="calls-callout" hidden></p>
+        <div id="calls-card" class="calls-card">
+          <div id="calls-state" class="calls-state" hidden>
+            <p id="calls-message" class="calls-message"></p>
+            <p id="calls-detail" class="calls-detail" hidden></p>
+          </div>
+          <div id="calls-columns" class="call-columns" aria-hidden="true" hidden>
+            <span></span>
+            <span>Time</span>
+            <span>Model</span>
+            <span>Status</span>
+            <span class="call-num">In</span>
+            <span class="call-num">Out</span>
+            <span class="call-num">Duration</span>
+          </div>
+          <ul id="call-list" class="call-list" aria-labelledby="calls-title" hidden></ul>
+        </div>
+        <div id="calls-more" class="calls-more" hidden>
+          <button id="load-older" class="button" type="button">Load older</button>
+          <p id="older-error" class="older-error" role="status"></p>
+        </div>
+        <p id="calls-limit" class="calls-limit" hidden></p>
+      </section>
+
+      <section id="daemon" class="daemon" aria-label="Daemon details" hidden>
+        <h2 id="daemon-title" class="section-title" hidden>Daemon</h2>
+        <dl id="details" class="details"></dl>
+      </section>
 
       <p id="aside" class="aside" hidden>
         <strong id="aside-title" class="aside-title">Note</strong>

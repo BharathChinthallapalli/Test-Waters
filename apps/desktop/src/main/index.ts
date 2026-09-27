@@ -3,9 +3,11 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, ipcMain, protocol, session } from "electron";
+import { parseBefore } from "./calls.ts";
 import { CONTENT_SECURITY_POLICY } from "./csp.ts";
 import { DATA_DIR_ENV, DaemonMonitor, resolveDataDir } from "./daemon.ts";
 import {
+  CALLS_OLDER_CHANNEL,
   isTrustedSender,
   RENDERER_ORIGIN,
   STATUS_CHANGED_CHANNEL,
@@ -56,8 +58,8 @@ async function serveRendererFile(request: Request): Promise<Response> {
 
 /**
  * Checks the daemon while `window` is visible and not minimised, pushes every
- * result to it, and answers its `status.get` calls. Only the window's own
- * `app://renderer` top frame is answered or sent to.
+ * result to it, and answers its `status.get` and `calls.older` calls. Only the
+ * window's own `app://renderer` top frame is answered or sent to.
  */
 function watchDaemon(window: BrowserWindow): void {
   const monitor = new DaemonMonitor({
@@ -82,6 +84,16 @@ function watchDaemon(window: BrowserWindow): void {
     }
     return poller.latest;
   });
+  ipcMain.handle(CALLS_OLDER_CHANNEL, (event, before: unknown) => {
+    if (!isTrustedSender(event, contents)) {
+      throw new Error("calls.older is only available to the Callsheet window");
+    }
+    const cursor = parseBefore(before);
+    if (cursor === null) {
+      throw new TypeError("calls.older needs a positive integer cursor");
+    }
+    return monitor.listCalls(cursor);
+  });
 
   const update = (): void =>
     poller.setActive(
@@ -94,6 +106,7 @@ function watchDaemon(window: BrowserWindow): void {
   window.on("closed", () => {
     poller.setActive(false);
     ipcMain.removeHandler(STATUS_GET_CHANNEL);
+    ipcMain.removeHandler(CALLS_OLDER_CHANNEL);
   });
 }
 

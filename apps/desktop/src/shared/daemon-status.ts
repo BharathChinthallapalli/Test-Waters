@@ -12,6 +12,8 @@
  * secondary technical detail (an error code, a daemon's error message) that is
  * never the message itself.
  */
+import type { RecentCalls } from "./recent-calls.ts";
+
 export type DaemonStatus =
   | ConnectingStatus
   | StartingStatus
@@ -64,6 +66,18 @@ export interface DaemonHealth {
   /** Global position of the newest event, which is also the number of events. */
   lastGlobalPosition: number;
   erasurePending: boolean;
+  /** The model-call proxy; null when this daemon doesn't run one. */
+  proxy: ProxyStatus | null;
+}
+
+/** `health.proxy` (feature 03). */
+export interface ProxyStatus {
+  /** `127.0.0.1:<port>`: Claude Code's `ANTHROPIC_BASE_URL` is `http://<address>`. */
+  address: string;
+  /** Calls recorded since the daemon started. */
+  callsRecorded: number;
+  /** Calls forwarded but not recorded since the daemon started. */
+  recordsDropped: number;
 }
 
 /** The daemon answered `version` (and `health`, when it has it). */
@@ -78,6 +92,8 @@ export interface RunningStatus extends StatusBase {
   uptimeMs: number;
   /** Null when the daemon predates the `health` method (JSON-RPC -32601). */
   health: DaemonHealth | null;
+  /** The newest page of recorded model calls, asked for with every check. */
+  calls: RecentCalls;
 }
 
 /**

@@ -47,6 +47,7 @@
   --color-button: #ffffff;
   --color-button-hover: #f0f0f3;
   --color-button-border: #c4c4cc;
+  --color-row-active: #f3f3f6;
 
   --color-ok: #177a3c;
   --color-ok-subtle: #e4f3e8;
@@ -77,6 +78,7 @@
     --color-button: #26262b;
     --color-button-hover: #303036;
     --color-button-border: #45454d;
+    --color-row-active: #26262b;
 
     --color-ok: #4cc26e;
     --color-ok-subtle: #16301f;
@@ -134,7 +136,15 @@ dd {
 .notice[hidden],
 .aside[hidden],
 .next-step[hidden],
-.command-row[hidden] {
+.command-row[hidden],
+.connect[hidden],
+.connect-commands[hidden],
+.calls[hidden],
+.daemon[hidden],
+.calls-state[hidden],
+.call-columns[hidden],
+.call-details[hidden],
+.calls-more[hidden] {
   display: none;
 }
 
@@ -143,7 +153,8 @@ dd {
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
-  max-width: 600px;
+  /* Wide enough for the Recent calls columns with a readable model name. */
+  max-width: 800px;
   margin: 0 auto;
   padding: var(--space-7) var(--space-6);
 }
@@ -451,6 +462,322 @@ dd {
   line-height: var(--leading-caption);
 }
 
+/* Sections below the status: Connect Claude Code, Recent calls */
+.connect,
+.calls,
+.daemon {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.section-title {
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  font-weight: 600;
+}
+
+.connect-commands {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.connect-command {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.connect-shell {
+  color: var(--color-text-secondary);
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+}
+
+.connect-after {
+  color: var(--color-text-secondary);
+}
+
+.calls-callout {
+  color: var(--color-text-secondary);
+}
+
+.calls-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-m);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.calls-state {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-4);
+}
+
+.calls-state[data-state="empty"] .calls-message {
+  color: var(--color-text-secondary);
+}
+
+.calls-detail {
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  overflow-wrap: anywhere;
+}
+
+/* One line per call: chevron, time, model, status, in, out, duration. */
+.call-columns,
+.call-row {
+  display: grid;
+  grid-template-columns: 12px 76px minmax(0, 1fr) 100px 64px 56px 64px;
+  column-gap: var(--space-2);
+  align-items: baseline;
+  padding: var(--space-2) var(--space-3);
+}
+
+.call-columns {
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-tertiary);
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+}
+
+.call-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.call + .call {
+  border-top: 1px solid var(--color-border);
+}
+
+.call-row {
+  width: 100%;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.call-row:hover,
+.call-row[aria-expanded="true"] {
+  background: var(--color-row-active);
+}
+
+/* Inside the card's rounded corners, so the ring isn't clipped. */
+.call-row:focus-visible {
+  outline-offset: -2px;
+}
+
+/* A right-pointing triangle that turns down when the details are open. */
+.call-chevron {
+  align-self: center;
+  width: 0;
+  height: 0;
+  margin-left: 2px;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid var(--color-text-tertiary);
+}
+
+.call-row[aria-expanded="true"] .call-chevron {
+  transform: rotate(90deg);
+}
+
+.call-time,
+.call-num {
+  white-space: nowrap;
+}
+
+.call-time {
+  color: var(--color-text-secondary);
+}
+
+.call-num {
+  text-align: right;
+}
+
+.call-num.muted {
+  color: var(--color-text-tertiary);
+}
+
+/* In the one-line layout the column headings name the numbers. */
+.call-unit {
+  display: none;
+}
+
+.call-model {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.call-model-name,
+.call-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.call-model-name {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.call-model-name.muted {
+  color: var(--color-text-tertiary);
+}
+
+.call-path {
+  min-width: 0;
+  flex: 0 1 auto;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+}
+
+.call-stream {
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-caption);
+}
+
+/* Outcome: text, plus a mark whose shape differs by tone. */
+.call-status {
+  --tone: var(--color-ok);
+  display: flex;
+  align-items: baseline;
+  gap: 6px; /* between the 8 px mark and its word */
+  white-space: nowrap;
+}
+
+.call-status[data-tone="off"] {
+  --tone: var(--color-off);
+}
+
+.call-status[data-tone="warning"] {
+  --tone: var(--color-warning);
+  color: var(--color-warning);
+}
+
+.call-status[data-tone="danger"] {
+  --tone: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.call-mark {
+  flex: none;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  background: var(--tone);
+}
+
+.call-status[data-tone="ok"] .call-mark {
+  border-radius: 50%;
+}
+
+.call-status[data-tone="off"] .call-mark {
+  border: 1.5px solid var(--tone);
+  border-radius: 50%;
+  background: transparent;
+}
+
+.call-status[data-tone="warning"] .call-mark {
+  width: 9px;
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+
+.call-status[data-tone="danger"] .call-mark {
+  border-radius: 1px;
+}
+
+/* Details of an open row, indented past the chevron. */
+.call-details {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-3) var(--space-3)
+    calc(var(--space-3) + 12px + var(--space-2));
+  background: var(--color-row-active);
+}
+
+.call-facts {
+  display: grid;
+  gap: 2px;
+}
+
+.call-fact {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  column-gap: var(--space-3);
+}
+
+.call-fact dt,
+.call-header dt,
+.call-headers-title {
+  color: var(--color-text-secondary);
+}
+
+.call-fact dd {
+  overflow-wrap: anywhere;
+}
+
+.call-fact dd.mono,
+.call-header-list {
+  font-family: var(--font-mono);
+}
+
+.call-headers {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.call-headers-title {
+  margin: 0;
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  font-weight: 600;
+}
+
+/* Names in one column and values aligned in the next. */
+.call-header-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-4);
+  margin: 0;
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+}
+
+.call-header {
+  display: contents;
+}
+
+.call-header dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.calls-more {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.older-error,
+.calls-limit {
+  color: var(--color-text-secondary);
+}
+
+.button[aria-disabled="true"] {
+  color: var(--color-text-secondary);
+}
+
 /* Narrow windows, down to the 420 px minimum: tighter margins and labels */
 @media (max-width: 520px) {
   .pane {
@@ -470,5 +797,73 @@ dd {
       3 *
       var(--leading-body)
     );
+  }
+
+  /* Two lines per call: model and status, then time and the numbers, which
+     keep fixed widths so they still line up from row to row. */
+  .call-columns {
+    display: none;
+  }
+
+  .call-row {
+    grid-template-columns: 12px minmax(0, 1fr) 76px 64px 96px;
+    grid-template-areas:
+      "chevron model model model status"
+      ". time in out duration";
+    row-gap: 2px;
+  }
+
+  .call-chevron {
+    grid-area: chevron;
+  }
+
+  .call-model {
+    grid-area: model;
+  }
+
+  .call-status {
+    grid-area: status;
+    justify-self: end;
+  }
+
+  .call-time {
+    grid-area: time;
+  }
+
+  .call-in {
+    grid-area: in;
+  }
+
+  .call-out {
+    grid-area: out;
+  }
+
+  .call-duration {
+    grid-area: duration;
+  }
+
+  .call-time,
+  .call-num {
+    color: var(--color-text-secondary);
+    font-size: var(--text-caption);
+    line-height: var(--leading-caption);
+  }
+
+  .call-unit {
+    display: inline;
+  }
+
+  .call-fact {
+    grid-template-columns: 96px minmax(0, 1fr);
+  }
+
+  /* Each header's name, then its value on the next line. */
+  .call-header-list {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0;
+  }
+
+  .call-header dd {
+    margin-bottom: var(--space-1);
   }
 }

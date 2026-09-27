@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import {
+  CALLS_OLDER_CHANNEL,
   isTrustedSender,
   RENDERER_ORIGIN,
   STATUS_CHANGED_CHANNEL,
@@ -47,6 +48,19 @@ test("the preload uses the same channel names as the main process", async () => 
   );
   assert.ok(preload.includes(`"${STATUS_GET_CHANNEL}"`));
   assert.ok(preload.includes(`"${STATUS_CHANGED_CHANNEL}"`));
+  assert.ok(preload.includes(`"${CALLS_OLDER_CHANNEL}"`));
+});
+
+test("the preload passes only a number to calls.older", async () => {
+  const preload = await readFile(
+    new URL("../preload/index.cts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    preload,
+    /typeof before === "number"\s*\?\s*ipcRenderer\.invoke\(CALLS_OLDER_CHANNEL, before\)/,
+  );
+  assert.match(preload, /calls: Object\.freeze\(\{/);
 });
 
 test("the preload never hands the renderer ipcRenderer or an IPC event", async () => {
