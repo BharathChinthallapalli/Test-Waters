@@ -243,3 +243,109 @@ async fn calls_list_answers_over_http() {
     daemon.server.stop().await;
     daemon.store.close().await.unwrap();
 }
+
+/// `MAX_RESPONSE_BYTES` in `apps/desktop/src/main/daemon.ts`: the desktop
+/// refuses a longer reply body.
+const DESKTOP_MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// A call record as large as one from a subscription login: `request-id`, 13
+/// `anthropic-ratelimit-unified-*` headers and a 200-byte user agent. The header
+/// names and values are synthetic, sized like the ones the #63 review measured;
+/// the real set gets recorded under issue #39.
+fn large_call(n: u64) -> Value {
+    let request_id = format!("req_011CTbX9{n:016}");
+    let mut headers = serde_json::Map::new();
+    headers.insert("request-id".into(), json!(request_id));
+    for (name, value) in [
+        ("status", "allowed"),
+        ("reset", "1790003600"),
+        ("representative-claim", "five_hour"),
+        ("fallback-percentage", "0.5"),
+        ("5h-status", "allowed"),
+        ("5h-reset", "1790003600"),
+        ("5h-utilization", "0.4213"),
+        ("7d-status", "allowed_warning"),
+        ("7d-reset", "1790518400"),
+        ("7d-utilization", "0.8127"),
+        ("overage-status", "rejected"),
+        ("overage-reset", "1790518400"),
+        ("overage-disabled-reason", "org_level_disabled"),
+    ] {
+        headers.insert(format!("anthropic-ratelimit-unified-{name}"), json!(value));
+    }
+    json!({
+        "provider": "anthropic", "method": "POST", "path": "/v1/messages", "status": 200,
+        "outcome": "completed", "streamed": true, "model": "claude-opus-5-20260901",
+        "requestId": request_id, "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 123_456, "outputTokens": 4_567,
+            "cacheCreationInputTokens": 12_345, "cacheReadInputTokens": 98_765,
+        },
+        "startedAtMs": 1_790_000_000_000_u64 + n, "ttfbMs": 1_234, "durationMs": 45_678,
+        "requestBytes": 987_654, "responseBytes": 123_456,
+        "rateLimitHeaders": headers, "traceId": "0af7651916cd43dd8448eb211c80319c",
+        "userAgent": "u".repeat(200),
+    })
+}
+
+#[tokio::test]
+async fn calls_list_replies_fit_the_desktop_cap_and_page_through_every_call() {
+    let daemon = start().await;
+    let token = token_in(&daemon.dir);
+    let mut appended = Vec::new();
+    for n in 1..=200 {
+        let receipt = daemon
+            .store
+            .append(AppendEvent {
+                run_id: "cc-session".to_owned(),
+                kind: "llm.call".to_owned(),
+                ts_ms: 1_790_000_000_000,
+                body: large_call(n),
+                content: Vec::new(),
+            })
+            .await
+            .unwrap();
+        appended.push(receipt.global_pos);
+    }
+    appended.reverse();
+
+    let mut listed = Vec::new();
+    let mut entry_bytes = 0;
+    let mut largest_reply = 0;
+    let mut before = None;
+    loop {
+        let params = before.map_or_else(
+            || json!({ "limit": 200 }),
+            |before: u64| json!({ "limit": 200, "before": before }),
+        );
+        let request =
+            json!({ "jsonrpc": "2.0", "method": "calls.list", "params": params, "id": 1 })
+                .to_string();
+        let response = exchange(daemon.addr, &post(daemon.addr, Some(&token), &request)).await;
+        assert_eq!(status(&response), 200);
+        let payload = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        largest_reply = largest_reply.max(payload.len());
+        let body: Value = serde_json::from_str(payload).unwrap();
+        for entry in body["result"]["calls"].as_array().unwrap() {
+            entry_bytes += entry.to_string().len();
+            listed.push(entry["globalPos"].as_u64().unwrap());
+        }
+        match body["result"]["nextBefore"].as_u64() {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+
+    assert!(
+        entry_bytes > DESKTOP_MAX_REPLY_BYTES,
+        "all 200 on one page would be over the cap ({entry_bytes} bytes of entries)"
+    );
+    assert!(
+        largest_reply <= DESKTOP_MAX_REPLY_BYTES,
+        "a reply of {largest_reply} bytes"
+    );
+    assert_eq!(listed, appended, "every call once, newest first");
+
+    daemon.server.stop().await;
+    daemon.store.close().await.unwrap();
+}

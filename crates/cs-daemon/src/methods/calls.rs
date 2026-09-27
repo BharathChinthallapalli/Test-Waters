@@ -7,16 +7,25 @@
 //!
 //! One read ([`Store::read`]: the read-only connection, under the shared read
 //! gate) takes `limit + 1` rows; the extra row only says there is an older
-//! page. `nextBefore` is then the position of the oldest row on this page, so
-//! the next page starts exactly below it: no overlap, no gap.
+//! page. `nextBefore` is then the position of the oldest row this page took,
+//! so the next page starts exactly below it: no overlap, no gap.
 //!
-//! A body that doesn't parse as an [`LlmCallRecord`] is skipped and logged by
+//! A page is also cut short by size: entries go in, newest first, until the
+//! next one would take their serialized total over [`MAX_PAGE_BYTES`].
+//! `nextBefore` is then the position of the last row taken, and the next page
+//! starts with the entry that didn't fit. The first entry always goes in, so
+//! paging never sticks, even on one entry over the budget.
+//!
+//! A row whose `run_id` or `body` isn't text (a BLOB, or invalid UTF-8), or
+//! whose body doesn't parse as an [`LlmCallRecord`], is skipped and logged by
 //! its global position only. The list is a view: an event is never changed,
 //! and a record another daemon version wrote (a field added as required, or one
 //! removed) must not make every page fail. `events.verify` still covers the
-//! skipped event. A skipped row still counts towards `limit` and `nextBefore`,
-//! so a page can hold fewer than `limit` calls (even none) and still have a
-//! `nextBefore`; paging goes on past it.
+//! skipped event. A skipped row still counts towards `limit` and `nextBefore`.
+//!
+//! So a page can hold fewer than `limit` calls (even none, after skipped rows)
+//! and still have a `nextBefore`. A client pages on until `nextBefore` is
+//! absent; a short or empty page is not the end.
 //!
 //! The query filters on `kind` without an index (schema version 1 has none on
 //! `events.kind`): it walks `events` down from `before` by primary key until it
@@ -37,6 +46,21 @@ pub const DEFAULT_LIMIT: u32 = 50;
 
 /// Largest `limit` accepted.
 pub const MAX_LIMIT: u32 = 200;
+
+/// Most bytes of serialized entries one page holds, past its first entry.
+///
+/// The desktop refuses a reply over 64 KiB (`MAX_RESPONSE_BYTES` in
+/// `apps/desktop/src/main/daemon.ts`). Each record carries every recorded
+/// rate-limit header, so 50 records can already be more than that. 48 KiB of
+/// entries leaves 16 KiB for the JSON-RPC envelope, the commas between entries
+/// and `nextBefore`.
+///
+/// One entry over the budget still goes out, alone. If it is also over 64 KiB
+/// (the store takes a body up to 256 KiB, and nothing caps the recorded
+/// headers yet), the desktop refuses that reply, so its list stops at that
+/// call. Capping the recorded headers where they are recorded (`observe`)
+/// keeps every record well under the budget.
+pub const MAX_PAGE_BYTES: usize = 48 * 1024;
 
 /// Newest first, below `?2`, one more row than the page holds.
 const PAGE_SQL: &str = "SELECT global_pos, run_id, body FROM events \
@@ -62,10 +86,12 @@ pub async fn list(store: &Store, params: Option<Value>) -> Result<Value, RpcErro
         .read(move |conn| {
             let mut statement = conn.prepare(PAGE_SQL)?;
             let rows = statement.query_map((LLM_CALL_KIND, before, fetch), |row| {
+                // A BLOB or invalid UTF-8 reads as `None` instead of failing
+                // the page; `into_entry` skips the row.
                 Ok(StoredCall {
                     global_pos: row.get(0)?,
-                    run_id: row.get(1)?,
-                    body: row.get(2)?,
+                    run_id: row.get_ref(1)?.as_str().ok().map(str::to_owned),
+                    body: row.get_ref(2)?.as_str().ok().map(str::to_owned),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -75,23 +101,26 @@ pub async fn list(store: &Store, params: Option<Value>) -> Result<Value, RpcErro
     serde_json::to_value(page(rows, limit)).map_err(|_| RpcError::internal_error())
 }
 
-/// An `llm.call` row as read, before its body is parsed.
+/// An `llm.call` row as read, before its body is parsed. `run_id` and `body`
+/// are `None` when the column isn't valid text.
 #[derive(Debug)]
 struct StoredCall {
     global_pos: i64,
-    run_id: String,
-    body: String,
+    run_id: Option<String>,
+    body: Option<String>,
 }
 
 impl StoredCall {
-    /// The entry, or `None` (logged by position only) if the body isn't a
+    /// The entry, or `None` (logged by position only) if the row isn't a
     /// record this build can read.
     fn into_entry(self) -> Option<CallEntry> {
-        let parsed = serde_json::from_str::<LlmCallRecord>(&self.body);
-        match (u64::try_from(self.global_pos), parsed) {
-            (Ok(global_pos), Ok(call)) => Some(CallEntry {
+        let parsed = self
+            .body
+            .and_then(|body| serde_json::from_str::<LlmCallRecord>(&body).ok());
+        match (u64::try_from(self.global_pos), self.run_id, parsed) {
+            (Ok(global_pos), Some(run_id), Some(call)) => Some(CallEntry {
                 global_pos,
-                run_id: self.run_id,
+                run_id,
                 call,
             }),
             // The parse error can quote the body, so it isn't logged.
@@ -106,24 +135,40 @@ impl StoredCall {
     }
 }
 
-/// Builds the result from up to `limit + 1` rows, newest first.
+/// Builds the result from up to `limit + 1` rows, newest first, within
+/// [`MAX_PAGE_BYTES`].
 fn page(mut rows: Vec<StoredCall>, limit: u32) -> CallsListResult {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let more = rows.len() > limit;
     rows.truncate(limit);
-    let next_before = if more {
-        rows.last()
-            .and_then(|oldest| u64::try_from(oldest.global_pos).ok())
-    } else {
-        None
-    };
-    CallsListResult {
-        calls: rows
-            .into_iter()
-            .filter_map(StoredCall::into_entry)
-            .collect(),
-        next_before,
+    let mut calls = Vec::new();
+    let mut bytes: usize = 0;
+    // The position of the last row taken, whether read or skipped.
+    let mut last_taken = None;
+    for row in rows {
+        let global_pos = row.global_pos;
+        if let Some(entry) = row.into_entry() {
+            let size = serialized_len(&entry);
+            if !calls.is_empty() && bytes.saturating_add(size) > MAX_PAGE_BYTES {
+                return CallsListResult {
+                    calls,
+                    next_before: last_taken,
+                };
+            }
+            bytes = bytes.saturating_add(size);
+            calls.push(entry);
+        }
+        last_taken = u64::try_from(global_pos).ok();
     }
+    CallsListResult {
+        calls,
+        next_before: last_taken.filter(|_| more),
+    }
+}
+
+/// Bytes of `entry` in the reply, which is compact JSON.
+fn serialized_len(entry: &CallEntry) -> usize {
+    serde_json::to_vec(entry).map_or(usize::MAX, |json| json.len())
 }
 
 /// Logs the cause and gives the client a fixed message only. Store errors
@@ -420,12 +465,120 @@ mod tests {
         assert_eq!(three.next_before, None);
     }
 
+    /// `record(n)` with one rate-limit header of `bytes` bytes.
+    fn record_of_size(n: u64, bytes: usize) -> LlmCallRecord {
+        let mut call = record(n);
+        call.rate_limit_headers
+            .insert("anthropic-ratelimit-padding".into(), "x".repeat(bytes));
+        call
+    }
+
+    #[tokio::test]
+    async fn a_page_stops_at_the_byte_budget_but_always_takes_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let oldest = append_call(&store, "run", 1).await;
+        let huge = serde_json::to_value(record_of_size(2, MAX_PAGE_BYTES + 1024)).unwrap();
+        let huge = append(&store, "run", LLM_CALL_KIND, huge).await;
+        let skipped = append(&store, "run", LLM_CALL_KIND, json!({ "version": 2 })).await;
+        let newest = append_call(&store, "run", 3).await;
+
+        // The huge entry doesn't fit after `newest`; the skipped row before it
+        // was taken, so the next page starts below that row.
+        let one = list_ok(&store, None).await;
+        assert_eq!(positions(&one), [newest]);
+        assert_eq!(one.next_before, Some(skipped));
+
+        // Alone on its page, over the budget, then the rest.
+        let two = list_ok(&store, Some(json!({ "before": skipped }))).await;
+        assert_eq!(positions(&two), [huge]);
+        assert!(serialized_len(&two.calls[0]) > MAX_PAGE_BYTES);
+        assert_eq!(two.next_before, Some(huge));
+        let three = list_ok(&store, Some(json!({ "before": huge }))).await;
+        assert_eq!(positions(&three), [oldest]);
+        assert_eq!(three.next_before, None);
+    }
+
+    #[tokio::test]
+    async fn entries_fill_a_page_up_to_the_budget_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let one_entry = |n: u64, pos: u64, bytes: usize| {
+            serialized_len(&CallEntry {
+                global_pos: pos,
+                run_id: "run".into(),
+                call: record_of_size(n, bytes),
+            })
+        };
+        // Entries of exactly half the budget: every `n` and position below has
+        // one digit, so they serialize to the same length.
+        let padding = MAX_PAGE_BYTES / 2 - one_entry(1, 1, 0);
+        assert_eq!(one_entry(1, 1, padding), MAX_PAGE_BYTES / 2);
+        append_call(&store, "run", 1).await;
+        for (n, bytes) in [(2, padding), (3, padding), (4, padding + 1)] {
+            let body = serde_json::to_value(record_of_size(n, bytes)).unwrap();
+            append(&store, "run", LLM_CALL_KIND, body).await;
+        }
+
+        let one = list_ok(&store, None).await;
+        assert_eq!(positions(&one), [4], "one byte over the budget");
+        assert_eq!(one.next_before, Some(4));
+        let two = list_ok(&store, Some(json!({ "before": 4 }))).await;
+        assert_eq!(positions(&two), [3, 2], "exactly the budget");
+        assert_eq!(two.next_before, Some(2));
+        let three = list_ok(&store, Some(json!({ "before": 2 }))).await;
+        assert_eq!(positions(&three), [1]);
+        assert_eq!(three.next_before, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_that_is_not_text_is_skipped_not_a_failed_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let first = append_call(&store, "run", 1).await;
+        store.close().await.unwrap();
+
+        // The store only writes text; these rows go in with plain SQL, as a
+        // damaged or foreign database could hold them (no hash chain;
+        // `calls.list` doesn't read it).
+        let body = serde_json::to_string(&record(2)).unwrap();
+        let conn = cs_store::db::open_writer(dir.path()).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO runs VALUES (x'ff', 0, 1, '');
+             INSERT INTO events VALUES (2, 'run', 2, 'llm.call', 0, CAST('{body}' AS BLOB), '', '');
+             INSERT INTO events VALUES (3, 'run', 3, 'llm.call', 0, CAST(x'7bff7d' AS TEXT), '', '');
+             INSERT INTO events VALUES (4, x'ff', 1, 'llm.call', 0, '{body}', '', '');"
+        ))
+        .unwrap();
+        drop(conn);
+        let store = open(dir.path());
+        let last = append_call(&store, "other", 3).await;
+
+        const TYPES_SQL: &str = "SELECT typeof(body) || '/' || typeof(run_id) FROM events \
+             WHERE global_pos BETWEEN 2 AND 4 ORDER BY global_pos";
+        let kinds: Vec<String> = store
+            .read(|conn| {
+                let mut statement = conn.prepare(TYPES_SQL)?;
+                let rows = statement.query_map((), |row| row.get(0))?;
+                rows.collect()
+            })
+            .await
+            .unwrap();
+        assert_eq!(kinds, ["blob/text", "text/text", "text/blob"]);
+
+        let all = list_ok(&store, None).await;
+        assert_eq!(positions(&all), [last, first]);
+        let page = list_ok(&store, Some(json!({ "limit": 2 }))).await;
+        assert_eq!(positions(&page), [last]);
+        assert_eq!(page.next_before, Some(4));
+    }
+
     #[test]
     fn a_row_with_a_negative_position_is_skipped() {
         let stored = StoredCall {
             global_pos: -1,
-            run_id: "run".into(),
-            body: serde_json::to_string(&record(1)).unwrap(),
+            run_id: Some("run".into()),
+            body: Some(serde_json::to_string(&record(1)).unwrap()),
         };
         assert!(stored.into_entry().is_none());
     }

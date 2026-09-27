@@ -5,8 +5,8 @@
 //! `cs_core::control::methods` to its handler: `health`, `version`,
 //! `token.rotate` and `settings.*` in [`core`], `events.verify` in [`verify`],
 //! `content.erasePlan` and `content.erase` in [`erase`], `calls.list` in
-//! [`calls`]. Any other method is -32601. Each handler checks its own params (-32602) and maps its errors
-//! (1001–1004, -32603) in one place.
+//! [`calls`]. Any other method is -32601. Each handler checks its own params
+//! (-32602) and maps its errors (1001–1004, -32603) in one place.
 
 pub mod calls;
 pub mod core;
