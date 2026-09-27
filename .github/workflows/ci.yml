@@ -145,10 +145,60 @@ jobs:
       - run: cargo build -p cs-daemon --locked
       - run: pnpm -C packages/api-types test:integration
 
+  # Nothing leaves the machine by default (PRIVACY.md, issue #56): the built
+  # desktop app (fresh profile, then a restart) and cs-daemon start behind
+  # logging proxies that refuse every request, and any request fails the job.
+  # See docs/ci.md for what this does and doesn't cover.
+  egress:
+    name: Desktop makes no outbound requests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      # Reads the pnpm version from `packageManager` in package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends xvfb
+      - run: pnpm install --frozen-lockfile
+      # Electron 44 has no install script: its binary is downloaded on first
+      # use. Download it here, checked against the checksums in the electron
+      # package, so a failed download fails this step and not the check.
+      - name: Download the Electron binary
+        run: pnpm -C apps/desktop exec install-electron
+      # Ubuntu 23.10 and later restrict unprivileged user namespaces with
+      # AppArmor, so Chromium uses its setuid sandbox helper, which must be
+      # owned by root with mode 4755 (Chromium's
+      # docs/security/apparmor-userns-restrictions.md and
+      # docs/linux/suid_sandbox_development.md). The app keeps its sandbox;
+      # --no-sandbox is never used here.
+      - name: Set up Chromium's setuid sandbox helper
+        working-directory: apps/desktop
+        run: |
+          helper="$(node -p 'require("node:path").join(require("node:path").dirname(require("electron")), "chrome-sandbox")')"
+          sudo chown root:root "$helper"
+          sudo chmod 4755 "$helper"
+      - run: pnpm -C apps/desktop build
+      - run: cargo build -p cs-daemon --locked
+      - name: Start the app and the daemon behind logging proxies
+        working-directory: apps/desktop
+        run: xvfb-run -a -s "-screen 0 1280x800x24" node scripts/egress-check.ts
+
   ci-passed:
     name: CI passed
     if: always()
-    needs: [rust, windows, cargo-deny, ts, types, daemon-client]
+    needs: [rust, windows, cargo-deny, ts, types, daemon-client, egress]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
