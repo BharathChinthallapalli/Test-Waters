@@ -4,10 +4,11 @@
 //! token and the start time, and dispatches every method in
 //! `cs_core::control::methods` to its handler: `health`, `version`,
 //! `token.rotate` and `settings.*` in [`core`], `events.verify` in [`verify`],
-//! `content.erasePlan` and `content.erase` in [`erase`]. Any other method is
-//! -32601. Each handler checks its own params (-32602) and maps its errors
-//! (1001–1004, -32603) in one place.
+//! `content.erasePlan` and `content.erase` in [`erase`], `calls.list` in
+//! [`calls`]. Any other method is -32601. Each handler checks its own params
+//! (-32602) and maps its errors (1001–1004, -32603) in one place.
 
+pub mod calls;
 pub mod core;
 pub mod erase;
 pub mod verify;
@@ -52,6 +53,7 @@ impl Handler for Methods {
             methods::EVENTS_VERIFY => verify::handle(store, params).await,
             methods::CONTENT_ERASE_PLAN => erase::plan(store, params).await,
             methods::CONTENT_ERASE => erase::erase(store, params).await,
+            methods::CALLS_LIST => calls::list(store, params).await,
             _ => Err(RpcError::method_not_found()),
         }
     }
@@ -287,6 +289,22 @@ mod tests {
             .unwrap();
         assert_eq!(verified["ok"], true);
         assert_eq!(verified["erasedEvents"], 2);
+    }
+
+    #[tokio::test]
+    async fn calls_list_is_dispatched() {
+        let f = with_key();
+        append(&f.store, "a", b"not a call").await;
+
+        let empty = f.methods.call("calls.list", None).await.unwrap();
+        assert_eq!(empty, json!({ "calls": [] }));
+
+        let bad = f
+            .methods
+            .call("calls.list", Some(json!({ "limit": 0 })))
+            .await
+            .unwrap_err();
+        assert_eq!(bad, RpcError::invalid_params());
     }
 
     #[tokio::test]
