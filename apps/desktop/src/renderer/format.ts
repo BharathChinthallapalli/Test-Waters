@@ -54,11 +54,34 @@ function pair(
     : `${unit(first, firstName)} ${unit(second, secondName)}`;
 }
 
+/**
+ * One formatter per locale and kind. Building an `Intl` formatter costs far
+ * more than using one, and a refresh formats every row of a list of up to
+ * 1,000 calls (`toLocaleString` with options builds one on every call).
+ */
+const formatters = new Map<string, Intl.NumberFormat | Intl.DateTimeFormat>();
+
+function cached<T extends Intl.NumberFormat | Intl.DateTimeFormat>(
+  kind: string,
+  locale: string | undefined,
+  make: () => T,
+): T {
+  const key = `${kind}|${locale ?? ""}`;
+  let formatter = formatters.get(key);
+  if (formatter === undefined) {
+    formatter = make();
+    formatters.set(key, formatter);
+  }
+  return formatter as T;
+}
+
 /** An integer with the locale's digit grouping, e.g. "12,408". */
 export function formatCount(value: number, locale?: string): string {
-  return new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(
-    value,
-  );
+  return cached(
+    "count",
+    locale,
+    () => new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }),
+  ).format(value);
 }
 
 /** A wall-clock time with seconds, in the locale's format, e.g. "14:02:31". */
@@ -167,10 +190,15 @@ export function formatCallTime(
 ): CallTime {
   const started = new Date(startedAtMs);
   const now = new Date(nowMs);
-  const title = started.toLocaleString(locale, {
-    dateStyle: "medium",
-    timeStyle: "medium",
-  });
+  const title = cached(
+    "call-title",
+    locale,
+    () =>
+      new Intl.DateTimeFormat(locale, {
+        dateStyle: "medium",
+        timeStyle: "medium",
+      }),
+  ).format(started);
   const ago = nowMs - startedAtMs;
   if (ago < MINUTE) {
     return { text: "Just now", title };
@@ -182,13 +210,17 @@ export function formatCallTime(
         : `${unit(Math.floor(ago / HOUR), "h")} ago`;
     return { text, title };
   }
-  const text = started.toLocaleDateString(locale, {
-    month: "short",
-    day: "numeric",
-    ...(started.getFullYear() === now.getFullYear()
-      ? {}
-      : { year: "numeric" as const }),
-  });
+  const thisYear = started.getFullYear() === now.getFullYear();
+  const text = cached(
+    thisYear ? "call-date" : "call-date-year",
+    locale,
+    () =>
+      new Intl.DateTimeFormat(locale, {
+        month: "short",
+        day: "numeric",
+        ...(thisYear ? {} : { year: "numeric" as const }),
+      }),
+  ).format(started);
   return { text, title };
 }
 

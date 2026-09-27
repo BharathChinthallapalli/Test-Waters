@@ -1,13 +1,20 @@
 import type { CallsheetApi } from "../preload/api.ts";
 import type { DaemonStatus } from "../shared/daemon-status.ts";
-import { onLoadOlder, renderCalls, renderConnect } from "./calls-render.ts";
 import {
-  applyOlder,
-  applyStatus,
-  type CallsList,
-  EMPTY_LIST,
-} from "./calls-state.ts";
-import { describeCalls, describeConnect } from "./calls-view.ts";
+  announce,
+  focusRow,
+  loadOlderHasFocus,
+  loadOlderHidden,
+  onLoadOlder,
+  renderCalls,
+  renderConnect,
+} from "./calls-render.ts";
+import { applyStatus, type CallsList, EMPTY_LIST } from "./calls-state.ts";
+import {
+  describeCalls,
+  describeConnect,
+  describeOlderLoaded,
+} from "./calls-view.ts";
 import { wireCopyButton } from "./copy.ts";
 import {
   type DetailRow,
@@ -23,6 +30,7 @@ import {
   setText,
 } from "./dom.ts";
 import { formatClock } from "./format.ts";
+import { OlderLoader } from "./older-loader.ts";
 
 /**
  * The status screen. Draws {@link describeStatus}'s view, the Connect Claude
@@ -146,11 +154,27 @@ function renderRows(rows: readonly DetailRow[]): void {
   });
 }
 
-/** The calls held, and the state of "Load older". */
+/** The calls held, and "Load older". */
 let calls: CallsList = EMPTY_LIST;
-let loadingOlder: number | null = null;
-let olderError: string | null = null;
 let latest: DaemonStatus | null = null;
+const older = new OlderLoader({
+  fetch: (before) => window.callsheet.calls.older(before),
+  list: () => calls,
+  settled: ({ list, loaded }) => {
+    calls = list;
+    const hadFocus = loadOlderHasFocus();
+    renderCallsSection();
+    if (loaded === null) {
+      return; // a failure is the text by the button
+    }
+    announce(describeOlderLoaded(loaded.added, loaded.ended));
+    // The button hid under the keyboard's focus: carry on at the first call
+    // it loaded, rather than leaving focus on nothing.
+    if (hadFocus && loadOlderHidden() && loaded.firstNew !== null) {
+      focusRow(String(loaded.firstNew));
+    }
+  },
+});
 
 function renderCallsSection(): void {
   if (latest === null) {
@@ -161,7 +185,7 @@ function renderCallsSection(): void {
     describeCalls(
       latest,
       calls,
-      { loadingOlder: loadingOlder !== null, olderError },
+      { loadingOlder: older.loading, olderError: older.error },
       Date.now(),
     ),
   );
@@ -183,42 +207,22 @@ function render(status: DaemonStatus): void {
     ui.checked,
     status.checkedAtMs > 0
       ? `Last checked ${formatClock(status.checkedAtMs)} · Refreshes every 3 seconds`
-      : " ",
+      : "\u00a0",
   );
   latest = status;
   const before = calls.run;
   calls = applyStatus(calls, status);
   if (calls.run !== before) {
-    loadingOlder = null;
-    olderError = null;
+    older.reset();
   }
   renderCallsSection();
 }
 
 function loadOlder(): void {
-  const before = calls.nextBefore;
-  if (before === null || loadingOlder !== null) {
-    return;
-  }
-  loadingOlder = before;
-  olderError = null;
-  renderCallsSection();
-  const settle = (answer: unknown): void => {
-    if (loadingOlder !== before) {
-      return; // the daemon changed meanwhile
-    }
-    loadingOlder = null;
-    const result = applyOlder(calls, before, answer);
-    calls = result.list;
-    olderError = result.error;
+  if (older.start()) {
+    announce("");
     renderCallsSection();
-  };
-  window.callsheet.calls.older(before).then(settle, () =>
-    settle({
-      state: "failed",
-      message: "Older calls couldn't be loaded. Try again.",
-    }),
-  );
+  }
 }
 
 wireCopyButton(ui.copy, ui.command);

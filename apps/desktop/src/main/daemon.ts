@@ -696,13 +696,23 @@ export class DaemonMonitor {
    */
   async listCalls(before: number): Promise<RecentCalls> {
     const running = this.#running;
+    const notRunning: RecentCalls = {
+      state: "failed",
+      message: "The daemon isn't running, so older calls can't be loaded.",
+    };
     if (running === null) {
-      return {
-        state: "failed",
-        message: "The daemon isn't running, so older calls can't be loaded.",
-      };
+      return notRunning;
     }
     try {
+      // The token goes only to the process the last check vouched for, so
+      // that check's cheap parts run again first: the same discovery record,
+      // a lock that agrees, and a live process.
+      if (!(await this.#stillRunning(running.dataDir, running.discovery))) {
+        if (this.#running === running) {
+          this.#running = null;
+        }
+        return notRunning;
+      }
       return await this.#listCalls(running.dataDir, running.discovery, before);
     } catch {
       return {
@@ -710,6 +720,46 @@ export class DaemonMonitor {
         message: "Something unexpected went wrong while loading calls.",
       };
     }
+  }
+
+  /**
+   * Forgets the running daemon, so {@link listCalls} refuses until the next
+   * check finds one again. Called while the window isn't shown and no checks
+   * run, when what the last check found can't be kept up to date.
+   */
+  forgetRunning(): void {
+    this.#running = null;
+  }
+
+  /**
+   * The discovery file still names the same run, the lock agrees and the
+   * process is alive: {@link #check}'s tests without asking the daemon.
+   */
+  async #stillRunning(dataDir: string, known: Discovery): Promise<boolean> {
+    let current: ReturnType<typeof parseDiscovery>;
+    try {
+      const raw = await readFile(
+        path.join(dataDir, DISCOVERY_FILE_NAME),
+        "utf8",
+      );
+      current = parseDiscovery(JSON.parse(raw));
+    } catch {
+      return false;
+    }
+    if (
+      typeof current === "string" ||
+      current.pid !== known.pid ||
+      current.port !== known.port ||
+      current.startedAtMs !== known.startedAtMs
+    ) {
+      return false;
+    }
+    const [lock, liveness] = await Promise.all([
+      this.#readLock(dataDir),
+      this.#liveness(known.pid, known.startedAtMs),
+    ]);
+    const lockAgrees = this.#platform === "win32" || lock?.pid === known.pid;
+    return liveness !== "dead" && lockAgrees;
   }
 
   /** One `calls.list` page; every failure becomes "failed" or "unsupported". */

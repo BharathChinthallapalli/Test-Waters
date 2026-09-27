@@ -870,6 +870,11 @@ describe("DaemonMonitor: recent calls", () => {
       "127.0.0.1:0",
       "127.0.0.1:04101",
       "127.0.0.1:4101; rm -rf ~",
+      // A trailing newline would end the line and run what follows it; JS
+      // `$` without the m flag matches only at the very end, unlike PCRE.
+      "127.0.0.1:4101\n",
+      "127.0.0.1:4101\nrm -rf ~",
+      "127.0.0.1:4101\r\n",
       "localhost:4101",
     ]) {
       respond = proxyDaemon(
@@ -1000,5 +1005,57 @@ describe("DaemonMonitor: recent calls", () => {
     await rm(path.join(dataDir, "daemon.json"));
     await check(target);
     assert.equal((await target.listCalls(4)).state, "failed");
+  });
+
+  test("listCalls re-checks the run before sending the token", async () => {
+    const startedAtMs = Date.now() - HOUR;
+    await publish({ startedAtMs });
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, { calls: [daemonEntry(3)] }),
+    );
+    let alive = true;
+    const target = monitor({
+      isProcessAlive: (pid) => alive && pid === LIVE_PID,
+    });
+    const refused = async (): Promise<void> => {
+      requests = [];
+      assert.deepEqual(await target.listCalls(4), {
+        state: "failed",
+        message: "The daemon isn't running, so older calls can't be loaded.",
+      });
+      assert.equal(requests.length, 0, "no request, so no token sent");
+    };
+
+    // Another run took the discovery file since the last check.
+    await check(target);
+    await publish({ startedAtMs, pid: LIVE_PID + 1 }, LIVE_PID + 1);
+    await refused();
+    // The refusal is kept: the same run coming back needs a new check.
+    await publish({ startedAtMs });
+    await refused();
+
+    // The lock names another process.
+    await check(target);
+    await writeFile(path.join(dataDir, "daemon.lock"), String(LIVE_PID + 1));
+    await refused();
+    await publish({ startedAtMs });
+
+    // The process died.
+    await check(target);
+    alive = false;
+    await refused();
+    alive = true;
+
+    // The window was hidden: nothing checked the daemon meanwhile.
+    await check(target);
+    target.forgetRunning();
+    await refused();
+
+    // And a run that is still there is asked.
+    await check(target);
+    requests = [];
+    assert.equal((await target.listCalls(4)).state, "loaded");
+    assert.equal(requests.length, 1);
   });
 });

@@ -33,10 +33,19 @@ const OUTCOMES: ReadonlySet<string> = new Set<CallOutcome>([
   "incomplete",
 ]);
 
-/** C0 and C1 controls, which a record never needs and a screen can't show. */
+/**
+ * C0 and C1 controls, which a record never needs and a screen can't show, and
+ * the bidirectional embeddings, overrides and isolates (U+202A to U+202E,
+ * U+2066 to U+2069), which would reorder the text shown after them.
+ */
 function isControl(char: string): boolean {
   const code = char.codePointAt(0) ?? 0;
-  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+  return (
+    code <= 0x1f ||
+    (code >= 0x7f && code <= 0x9f) ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069)
+  );
 }
 
 /**
@@ -106,6 +115,25 @@ function usage(value: unknown): CallUsage | null {
   };
 }
 
+/**
+ * Kept first, whatever else was recorded: what a client acts on after an
+ * error, and the id that support asks for.
+ */
+const FIRST_HEADERS: readonly string[] = [
+  "retry-after",
+  "x-should-retry",
+  "request-id",
+];
+
+function headerRank(name: string): number {
+  const rank = FIRST_HEADERS.indexOf(name);
+  return rank === -1 ? FIRST_HEADERS.length : rank;
+}
+
+/**
+ * At most `LIMITS.rateLimitHeaders`: {@link FIRST_HEADERS} first, then the
+ * rest by name, so the cap never drops the ones that matter.
+ */
 function headers(value: unknown): Array<[string, string]> {
   if (!isObject(value)) {
     throw new Malformed("rateLimitHeaders");
@@ -118,7 +146,10 @@ function headers(value: unknown): Array<[string, string]> {
     entries.push([name, headerValue]);
   }
   return entries
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .sort(
+      ([a], [b]) =>
+        headerRank(a) - headerRank(b) || (a < b ? -1 : a > b ? 1 : 0),
+    )
     .slice(0, LIMITS.rateLimitHeaders)
     .map(([name, headerValue]) => [
       clip(name, LIMITS.headerName),

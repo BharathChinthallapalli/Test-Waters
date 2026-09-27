@@ -16,6 +16,7 @@ import {
   describeCall,
   describeCalls,
   describeConnect,
+  describeOlderLoaded,
   describeOutcome,
   EMPTY_TEXT,
   LOGIN_NOTE,
@@ -228,7 +229,7 @@ test("a row: input includes the cache, with the breakdown on hover", () => {
   assert.equal(row.streamed, true);
   assert.equal(
     row.label,
-    "1 min ago, claude-opus-4-1, streamed, Completed, 12,408 tokens in, 812 tokens out, 3.2 s",
+    "1 min ago, claude-opus-4-1, streamed, Completed, 12,408 in, 812 out, 3.2 s",
   );
 });
 
@@ -291,4 +292,54 @@ test("details: ids, reasons, and the rate-limit headers without request-id", () 
     plain.details.find((entry) => entry.key === "request-id")?.value,
     "Not reported",
   );
+});
+
+test("the row's accessible name uses the words shown: '50,527 in'", () => {
+  const row = describeCall(summary(1), NOW, "en-US");
+  assert.match(row.label, /, 12,408 in, 812 out, /);
+  assert.doesNotMatch(row.label, /tokens in/);
+});
+
+test("Load older announces what it loaded, and the end only at the end", () => {
+  assert.equal(
+    describeOlderLoaded(41, false, "en-US"),
+    "Loaded 41 older calls.",
+  );
+  assert.equal(
+    describeOlderLoaded(1, true, "en-US"),
+    "Loaded 1 older call. That is the oldest recorded call.",
+  );
+  // An empty page with a cursor: nothing added, and more may exist.
+  assert.equal(
+    describeOlderLoaded(0, false, "en-US"),
+    "No readable calls in that part of the log. Load older to keep looking.",
+  );
+  assert.equal(
+    describeOlderLoaded(1234, false, "en-US"),
+    "Loaded 1,234 older calls.",
+  );
+});
+
+test("rows are reused between refreshes until their time text can change", () => {
+  const status = running(page(positions(9, 7)));
+  const list = applyStatus(EMPTY_LIST, status);
+  const first = describeCalls(status, list, IDLE, NOW, "en-US");
+  const later = describeCalls(status, list, IDLE, NOW + 3000, "en-US");
+  assert.equal(later?.rows[0], first?.rows[0], "same minute: the same view");
+  const nextMinute = describeCalls(status, list, IDLE, NOW + 60_000, "en-US");
+  assert.notEqual(nextMinute?.rows[0], first?.rows[0]);
+  assert.equal(nextMinute?.rows[0]?.time, "2 min ago");
+  // Another locale is another view.
+  const german = describeCalls(status, list, IDLE, NOW + 60_000, "de-DE");
+  assert.equal(german?.rows[0]?.tokensIn, "12.408");
+  // Another record at the same position (a reused pid, say) isn't mistaken.
+  const other = running(page([summary(9, { durationMs: 750_000 })]));
+  const replaced = describeCalls(
+    other,
+    applyStatus(EMPTY_LIST, other),
+    IDLE,
+    NOW + 60_000,
+    "de-DE",
+  );
+  assert.equal(replaced?.rows[0]?.duration, "12 min 30 s");
 });

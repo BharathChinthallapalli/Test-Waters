@@ -95,10 +95,15 @@ function watchDaemon(window: BrowserWindow): void {
     return monitor.listCalls(cursor);
   });
 
-  const update = (): void =>
-    poller.setActive(
-      !window.isDestroyed() && window.isVisible() && !window.isMinimized(),
-    );
+  const update = (): void => {
+    const active =
+      !window.isDestroyed() && window.isVisible() && !window.isMinimized();
+    poller.setActive(active);
+    if (!active) {
+      // No checks run while hidden, so nothing vouches for the daemon.
+      monitor.forgetRunning();
+    }
+  };
   window.on("show", update);
   window.on("hide", update);
   window.on("minimize", update);

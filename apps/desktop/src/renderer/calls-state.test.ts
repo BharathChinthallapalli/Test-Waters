@@ -27,7 +27,6 @@ test("Load older joins the older page below", () => {
   list = result.list;
   assert.deepEqual(pos(list), [9, 7, 5, 3]);
   assert.equal(list.nextBefore, 3);
-  assert.equal(list.extended, true);
 });
 
 test("a refresh keeps the older calls when the new page reaches them", () => {
@@ -46,7 +45,23 @@ test("a refresh with a gap before the held calls lets them go", () => {
   list = applyStatus(list, running(page(positions(14, 13, 12), 12)));
   assert.deepEqual(pos(list), [14, 13, 12]);
   assert.equal(list.nextBefore, 12);
-  assert.equal(list.extended, false);
+});
+
+test("new calls don't push the oldest rows off a list never extended", () => {
+  // A full newest page, nothing loaded with "Load older": 50 calls, 51 to 100.
+  const first = Array.from({ length: 50 }, (_, i) => 100 - i);
+  let list = applyStatus(EMPTY_LIST, running(page(positions(...first), 51)));
+  // Three calls arrive; the page now scans 103 down to 54.
+  const second = Array.from({ length: 50 }, (_, i) => 103 - i);
+  list = applyStatus(list, running(page(positions(...second), 54)));
+  // 51 to 53 stay, so an open or focused row at the bottom survives.
+  assert.equal(list.calls.length, 53);
+  assert.deepEqual(pos(list).slice(-3), [53, 52, 51]);
+  assert.deepEqual(pos(list).slice(0, 2), [103, 102]);
+  assert.equal(list.nextBefore, 51);
+  // Load older carries on from the oldest held call.
+  list = applyOlder(list, 51, page(positions(50, 49), 49)).list;
+  assert.deepEqual(pos(list).slice(-2), [50, 49]);
 });
 
 test("a complete newest page replaces what is held", () => {

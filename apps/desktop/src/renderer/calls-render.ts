@@ -43,6 +43,7 @@ const ui = {
   loadOlder: element<HTMLButtonElement>("load-older"),
   olderError: element("older-error"),
   limit: element("calls-limit"),
+  announce: element("calls-announce"),
 };
 
 /** The commands shown now, so the card is rebuilt only when they change. */
@@ -326,6 +327,39 @@ export function renderCalls(view: CallsView | null): void {
   setAttribute(ui.loadOlder, "aria-disabled", loading ? "true" : null);
   setText(ui.olderError, view.olderError ?? "");
   setOptionalText(ui.limit, view.limitNote);
+}
+
+/**
+ * Says `text` politely through the section's status region. Cleared first, so
+ * the same sentence twice in a row is still announced.
+ */
+export function announce(text: string): void {
+  ui.announce.textContent = "";
+  if (text !== "") {
+    // After the clearing is seen, or the same text isn't a change.
+    requestAnimationFrame(() => {
+      ui.announce.textContent = text;
+    });
+  }
+}
+
+/** True while keyboard or pointer focus is on "Load older". */
+export function loadOlderHasFocus(): boolean {
+  return document.activeElement === ui.loadOlder;
+}
+
+/**
+ * True when "Load older" is hidden. Asked straight after a render: Chromium
+ * moves focus off a hidden element only at its next style update, so
+ * {@link loadOlderHasFocus} can still be true then.
+ */
+export function loadOlderHidden(): boolean {
+  return ui.more.hidden === true;
+}
+
+/** Moves focus to the row of the call at this position, if it is shown. */
+export function focusRow(key: string): void {
+  rows.get(key)?.button.focus();
 }
 
 /** Calls `load` when "Load older" is pressed, unless a load is running. */

@@ -153,8 +153,9 @@ dd {
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
-  /* Wide enough for the Recent calls columns with a readable model name. */
-  max-width: 800px;
+  /* Wide enough for the Recent calls columns, at their widest values, beside
+     a full dated model id such as claude-sonnet-4-5-20250929. */
+  max-width: 840px;
   margin: 0 auto;
   padding: var(--space-7) var(--space-6);
 }
@@ -470,6 +471,20 @@ dd {
   gap: var(--space-2);
 }
 
+/* Read by screen readers, not drawn: announcements with no visible text. The
+   1 px box and -1 px margin are the usual technique, not layout spacing. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .section-title {
   font-size: var(--text-body);
   line-height: var(--leading-body);
@@ -529,7 +544,7 @@ dd {
 .call-columns,
 .call-row {
   display: grid;
-  grid-template-columns: 12px 76px minmax(0, 1fr) 100px 64px 56px 64px;
+  grid-template-columns: 12px 92px minmax(0, 1fr) 100px 72px 64px 84px;
   column-gap: var(--space-2);
   align-items: baseline;
   padding: var(--space-2) var(--space-3);
@@ -578,7 +593,7 @@ dd {
   align-self: center;
   width: 0;
   height: 0;
-  margin-left: 2px;
+  margin-left: 2px; /* a small inset for the 5 px triangle, finer than the 4 px step */
   border-top: 4px solid transparent;
   border-bottom: 4px solid transparent;
   border-left: 5px solid var(--color-text-tertiary);
@@ -708,7 +723,7 @@ dd {
 
 .call-facts {
   display: grid;
-  gap: 2px;
+  gap: 2px; /* facts read as one list, tighter than the 4 px step */
 }
 
 .call-fact {
@@ -748,7 +763,7 @@ dd {
 .call-header-list {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  gap: 2px var(--space-4);
+  gap: 2px var(--space-4); /* rows as tight as the facts above */
   margin: 0;
   font-size: var(--text-caption);
   line-height: var(--leading-caption);
@@ -805,12 +820,22 @@ dd {
     display: none;
   }
 
+  /* Measured at 420 px with a 15 px scrollbar, caption size: "Sep 25, 2025"
+     80 px (the time track gets 87), "1,234,567 in" 76, "12,408 out" 66,
+     "12 min 30 s" 71. The status spans Out and Duration. 8 px side padding
+     leaves the date its width. */
   .call-row {
-    grid-template-columns: 12px minmax(0, 1fr) 76px 64px 96px;
+    grid-template-columns: 12px minmax(0, 1fr) 80px 68px 76px;
     grid-template-areas:
-      "chevron model model model status"
+      "chevron model model status status"
       ". time in out duration";
-    row-gap: 2px;
+    row-gap: 2px; /* the two lines of one call read as one row */
+    padding: var(--space-2);
+  }
+
+  .call-details {
+    padding: var(--space-1) var(--space-2) var(--space-3)
+      calc(var(--space-2) + 12px + var(--space-2));
   }
 
   .call-chevron {

@@ -91,7 +91,8 @@ if (values.size) {
   });
 }
 if (values.reload) {
-  await send("Page.reload");
+  // Without ignoreCache a reload can run the previous build's scripts.
+  await send("Page.reload", { ignoreCache: true });
 }
 await pause(Number(values.wait));
 if (values.click) {

@@ -20,12 +20,16 @@
 // default), --calls-error (`calls.list` answers -32000), --unreadable <list>
 // (indexes of calls, newest 0, such as "3,50-99", that `calls.list` skips as
 // unreadable records: they still count towards a page, so "0-49" makes the
-// newest page empty with a `nextBefore`).
+// newest page empty with a `nextBefore`), --arrive-ms <n> (a new call is
+// recorded every n ms, as while Claude Code runs).
 //
 // The calls are made up but shaped like the proxy's records: completed streams
 // with prompt-cache reads, a 429 with `retry-after` and rate-limit headers, a
 // 529, a cancelled stream, a stream cut off part-way, a `count_tokens` call
-// (no model, no usage) and a long model name. No proxy is actually served.
+// (no model, no usage) and a long model name; and the widest values the list
+// must fit: calls of 1 min 45 s (the 5th newest) and 12 min 30 s with
+// 1,234,567 input tokens (the 7th), and, with more than 12 calls, the oldest
+// two dated in the previous year. No proxy is actually served.
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -45,6 +49,7 @@ const { values } = parseArgs({
     calls: { type: "string", default: "0" },
     "calls-error": { type: "boolean", default: false },
     unreadable: { type: "string" },
+    "arrive-ms": { type: "string" },
   },
 });
 
@@ -259,11 +264,59 @@ function makeCall(i: number, now: number) {
 }
 
 /** Every recorded call, newest first, at positions interleaved with events. */
+const DAY = 24 * 60 * MINUTE;
+
+/**
+ * The widest values the list has to fit, on calls that are otherwise ordinary:
+ * minute-long streams (1 min 45 s, 12 min 30 s, routine for Claude Code), a
+ * 1,234,567-token input (a long session's cache reads) and, for the oldest two
+ * calls, a date in the previous year ("Sep 26, 2025").
+ */
+function widest(i: number, count: number, now: number) {
+  const call = makeCall(i, now);
+  if (i === 4) {
+    return { ...call, durationMs: 105_000 };
+  }
+  if (i === 6 && call.usage) {
+    return {
+      ...call,
+      durationMs: 750_000,
+      stopReason: "end_turn",
+      usage: {
+        ...call.usage,
+        inputTokens: 3,
+        cacheCreationInputTokens: 34_564,
+        cacheReadInputTokens: 1_200_000,
+        outputTokens: 12_408,
+      },
+    };
+  }
+  if (count > 12 && i >= count - 2) {
+    return { ...call, startedAtMs: now - 366 * DAY - (i - count + 3) * DAY };
+  }
+  return call;
+}
+
 const allCalls = Array.from({ length: Number(values.calls) }, (_, i) => ({
   globalPos: Number(values.events) - 3 * i,
   runId: i < 30 ? "cc-5c1f0d2e" : "cc-9a77b4c0",
-  call: makeCall(i, startedAtMs),
+  call: widest(i, Number(values.calls), startedAtMs),
 }));
+
+// --arrive-ms: a new call is recorded this often, at the top of the list.
+const arriveMs = Number(values["arrive-ms"] ?? 0);
+if (arriveMs > 0) {
+  let arrived = 0;
+  setInterval(() => {
+    arrived += 1;
+    const now = Date.now();
+    allCalls.unshift({
+      globalPos: (allCalls[0]?.globalPos ?? Number(values.events)) + 3,
+      runId: "cc-5c1f0d2e",
+      call: { ...makeCall(arrived % 11, now), startedAtMs: now - 2_000 },
+    });
+  }, arriveMs).unref();
+}
 
 /** Indexes into `allCalls` of records to treat as unreadable ("3,50-99"). */
 const unreadable = new Set(

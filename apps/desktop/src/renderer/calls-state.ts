@@ -13,10 +13,10 @@ import { parseRecentCalls } from "./calls-payload.ts";
  * every position from its `nextBefore` up, a page may be empty and still have a
  * `nextBefore`, and only a page without `nextBefore` ends the list.
  *
- * The newest page joins the calls already held only when its range reaches the
- * newest of them; if more records arrived between two checks than a page
- * scans, there would be a gap, so the held older calls are let go instead. A
- * different daemon run starts over.
+ * The newest page joins the calls already held whenever its range reaches the
+ * newest of them, so calls below it stay as new ones arrive; if more records
+ * arrived between two checks than a page scans, there would be a gap, so the
+ * held calls below it are let go instead. A different daemon run starts over.
  */
 
 /** Calls held at most; older ones can be fetched again with "Load older". */
@@ -29,8 +29,6 @@ export interface CallsList {
   calls: CallSummary[];
   /** Cursor for the next older page; null only once the list has ended. */
   nextBefore: number | null;
-  /** Older pages were joined to the newest page. */
-  extended: boolean;
   /**
    * The last newest page's `nextBefore`: that page covered every position from
    * here up, whether or not it returned calls.
@@ -46,7 +44,6 @@ export const EMPTY_LIST: CallsList = Object.freeze({
   run: null,
   calls: [],
   nextBefore: null,
-  extended: false,
   newestFrom: null,
   loaded: false,
   problem: null,
@@ -84,19 +81,18 @@ export function applyStatus(list: CallsList, status: DaemonStatus): CallsList {
   }
   // The page covers every position from `from` up. What is held covers one
   // contiguous range up to the newest held call and, since the last newest
-  // page, up from that page's `from` too.
+  // page, up from that page's `from` too. When the two overlap, the held calls
+  // below the page stay, whether they came from "Load older" or from an
+  // earlier newest page, so rows don't fall off the bottom as calls arrive.
   const from = page.nextBefore;
   const newestHeld = current.calls[0]?.globalPos ?? null;
   const reaches = (top: number | null) =>
     from !== null && top !== null && from <= top;
-  const joins =
-    current.extended && (reaches(newestHeld) || reaches(current.newestFrom));
-  if (!joins || from === null) {
+  if (from === null || !(reaches(newestHeld) || reaches(current.newestFrom))) {
     return {
       run,
       calls: page.calls,
       nextBefore: page.nextBefore,
-      extended: false,
       newestFrom: page.nextBefore,
       loaded: true,
       problem: null,
@@ -108,7 +104,6 @@ export function applyStatus(list: CallsList, status: DaemonStatus): CallsList {
   return {
     run,
     ...capped([...page.calls, ...older], nextBefore),
-    extended: true,
     newestFrom: from,
     loaded: true,
     problem: null,
@@ -145,7 +140,6 @@ export function applyOlder(
     list: {
       ...list,
       ...capped([...list.calls, ...older], page.nextBefore),
-      extended: true,
     },
     error: null,
   };

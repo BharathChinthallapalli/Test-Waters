@@ -140,18 +140,18 @@ export function describeCall(
     ? formatCount(totalInputTokens(usage), locale)
     : NO_USAGE;
   const tokensOut = usage ? formatCount(usage.outputTokens, locale) : NO_USAGE;
+  const breakdown = usage ? inputTokensBreakdown(usage, locale) : null;
   const duration = formatCallDuration(call.durationMs);
   const path = call.path === MESSAGES_PATH ? null : call.path;
 
+  // The words a sighted reader sees: "50,527 in, 180 out".
   const label = [
     time.text,
     call.model ?? "Model not reported",
     path,
     call.streamed ? "streamed" : null,
     outcome.label,
-    usage
-      ? `${tokensIn} tokens in, ${tokensOut} tokens out`
-      : "no token counts",
+    usage ? `${tokensIn} in, ${tokensOut} out` : "no token counts",
     duration,
   ]
     .filter((part) => part !== null)
@@ -186,8 +186,8 @@ export function describeCall(
   details.push({
     key: "tokens",
     label: "Tokens",
-    value: usage
-      ? `${inputTokensBreakdown(usage, locale)}. ${tokensOut} output tokens.`
+    value: breakdown
+      ? `${breakdown}. ${tokensOut} output tokens.`
       : "Not reported by the provider.",
   });
   if (call.ttfbMs !== null) {
@@ -225,13 +225,102 @@ export function describeCall(
     streamed: call.streamed,
     outcome,
     tokensIn,
-    tokensInTitle: usage ? inputTokensBreakdown(usage, locale) : null,
+    tokensInTitle: breakdown,
     tokensOut,
     duration,
     label,
     details,
     headers: call.rateLimitHeaders.filter(([name]) => name !== "request-id"),
   };
+}
+
+/**
+ * What a row's view depends on besides its record: the whole minutes since it
+ * started (which also give the hours), the day it is now, and the locale. A
+ * record never changes once written, so within one daemon run a position and
+ * this key say everything {@link describeCall} reads.
+ */
+function timeKey(call: CallSummary, nowMs: number, locale?: string): string {
+  const elapsedMinutes = Math.floor((nowMs - call.startedAtMs) / 60_000);
+  return `${elapsedMinutes}|${new Date(nowMs).toDateString()}|${locale ?? ""}`;
+}
+
+/**
+ * The same record: the held calls keep their objects between refreshes, and
+ * the newest page's fresh copies are compared by fields no two records share.
+ * A guard against a reused pid or position, not the common path.
+ */
+function sameRecord(a: CallSummary, b: CallSummary): boolean {
+  return (
+    a === b ||
+    (a.traceId === b.traceId &&
+      a.startedAtMs === b.startedAtMs &&
+      a.durationMs === b.durationMs &&
+      a.requestId === b.requestId &&
+      a.outcome === b.outcome)
+  );
+}
+
+interface CachedRow {
+  call: CallSummary;
+  key: string;
+  view: CallRowView;
+}
+
+/** Row views from the last refresh, by position within one run. */
+let rowCache = new Map<string, CachedRow>();
+let rowCacheRun: string | null = null;
+
+/**
+ * {@link describeCall} for every held call, reusing the last refresh's view of
+ * a call whose {@link timeKey} hasn't changed: on most refreshes that is every
+ * row but the new ones. Only the calls shown now are kept.
+ */
+function describeRows(
+  list: CallsList,
+  nowMs: number,
+  locale?: string,
+): CallRowView[] {
+  if (rowCacheRun !== list.run) {
+    rowCache = new Map();
+    rowCacheRun = list.run;
+  }
+  const next = new Map<string, CachedRow>();
+  const views = list.calls.map((call) => {
+    const position = String(call.globalPos);
+    const key = timeKey(call, nowMs, locale);
+    const cached = rowCache.get(position);
+    const view =
+      cached !== undefined &&
+      cached.key === key &&
+      sameRecord(cached.call, call)
+        ? cached.view
+        : describeCall(call, nowMs, locale);
+    next.set(position, { call, key, view });
+    return view;
+  });
+  rowCache = next;
+  return views;
+}
+
+/**
+ * What "Load older" says to a screen reader when it succeeds (a failure is the
+ * text by the button). `ended` is true only when the daemon said no older
+ * records remain; an empty page with a cursor is not the end.
+ */
+export function describeOlderLoaded(
+  added: number,
+  ended: boolean,
+  locale?: string,
+): string {
+  const loaded =
+    added === 0
+      ? "No readable calls in that part of the log."
+      : `Loaded ${formatCount(added, locale)} older ${added === 1 ? "call" : "calls"}.`;
+  if (ended) {
+    return `${loaded} That is the oldest recorded call.`;
+  }
+  return added === 0 ? `${loaded} Load older to keep looking.` : loaded;
 }
 
 export type LoadOlder = "hidden" | "ready" | "loading";
@@ -333,7 +422,7 @@ export function describeCalls(
       problem?.state === "failed"
         ? `Couldn't refresh the list: ${problem.message} Showing the calls loaded before.`
         : null,
-    rows: list.calls.map((call) => describeCall(call, nowMs, locale)),
+    rows: describeRows(list, nowMs, locale),
     loadOlder:
       list.nextBefore === null || atLimit
         ? "hidden"

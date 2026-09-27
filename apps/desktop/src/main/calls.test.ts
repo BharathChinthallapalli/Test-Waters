@@ -78,10 +78,10 @@ test("an entry is flattened; byte counts and the provider aren't passed on", () 
         startedAtMs: 1_790_000_000_000,
         ttfbMs: 420,
         durationMs: 3200,
-        // Sorted by name.
+        // retry-after first, then the rest by name.
         rateLimitHeaders: [
-          ["anthropic-ratelimit-requests-remaining", "49"],
           ["retry-after", "12"],
+          ["anthropic-ratelimit-requests-remaining", "49"],
         ],
         traceId: "0af7651916cd43dd8448eb211c80319c",
         userAgent: "claude-cli/2.1.0 (external, cli)",
@@ -153,6 +153,61 @@ test("long strings are cut, control characters replaced, headers capped", () => 
   assert.equal(clip("short", 10), "short");
   // Cut by code point, so a surrogate pair is never split.
   assert.equal(clip("😀😀😀", 2), "😀…");
+});
+
+test("bidi embeddings, overrides and isolates are neutralised", () => {
+  // "Trojan Source" controls: U+202A to U+202E and U+2066 to U+2069.
+  const bidi = [
+    0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069,
+  ].map((code) => String.fromCodePoint(code));
+  for (const control of bidi) {
+    assert.equal(
+      clip(`a${control}b`, 10),
+      "a�b",
+      control.codePointAt(0)?.toString(16),
+    );
+  }
+  // Neighbours that only mark direction, or join text, are left alone.
+  for (const kept of ["‎", "‏", "⁥", "⁪", " "]) {
+    assert.equal(clip(`a${kept}b`, 10), `a${kept}b`);
+  }
+  const call = parseCallsList(
+    page([entry(1, record({ model: "claude‮gnp.exe" }))]),
+  )?.calls[0];
+  assert.equal(call?.model, "claude�gnp.exe");
+});
+
+test("the header cap keeps retry-after, x-should-retry and request-id first", () => {
+  const many = Object.fromEntries(
+    Array.from({ length: 40 }, (_, i) => [
+      `anthropic-ratelimit-unified-${String(i).padStart(2, "0")}`,
+      "v",
+    ]),
+  );
+  const call = parseCallsList(
+    page([
+      entry(
+        1,
+        record({
+          rateLimitHeaders: {
+            ...many,
+            "x-should-retry": "true",
+            "request-id": "req_1",
+            "retry-after": "17",
+          },
+        }),
+      ),
+    ]),
+  )?.calls[0];
+  assert.ok(call);
+  const names = call.rateLimitHeaders.map(([name]) => name);
+  assert.equal(names.length, LIMITS.rateLimitHeaders);
+  assert.deepEqual(names.slice(0, 4), [
+    "retry-after",
+    "x-should-retry",
+    "request-id",
+    "anthropic-ratelimit-unified-00",
+  ]);
 });
 
 test("what the main process builds always passes the renderer's check", () => {
