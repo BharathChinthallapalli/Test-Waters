@@ -122,13 +122,25 @@ export class LoggingProxy {
   /** Names who is sent to this proxy, for the report. */
   readonly process: string;
   readonly attempts: Attempt[] = [];
+  /**
+   * Errors the listening server reported after it started, such as failing
+   * to accept a connection. A proxy that stopped accepting could miss a
+   * request, so the check fails on any.
+   */
+  readonly errors: string[] = [];
   phase = "";
   #port = 0;
+  #listening = false;
   readonly #sockets = new Set<net.Socket>();
   readonly #server = net.createServer((socket) => this.#accept(socket));
 
   constructor(process: string) {
     this.process = process;
+    this.#server.on("error", (error) => {
+      if (this.#listening) {
+        this.errors.push(error.message);
+      }
+    });
   }
 
   /** Listens on an unused loopback port. */
@@ -141,6 +153,7 @@ export class LoggingProxy {
       });
     });
     this.#port = (this.#server.address() as net.AddressInfo).port;
+    this.#listening = true;
   }
 
   /** `127.0.0.1:<port>`, for `--proxy-server`. */
