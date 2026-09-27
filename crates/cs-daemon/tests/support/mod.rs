@@ -4,21 +4,30 @@
 #![allow(dead_code)] // Each test file uses a different subset.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use cs_daemon::rpc::{Handler, RpcError};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 
 /// Answers `version` like the daemon's bootstrap handler, and `slow` after 300 ms.
-pub struct TestHandler;
+/// `slow_started` is notified when a `slow` call begins, so a test can act while it
+/// runs without guessing with a sleep.
+#[derive(Default)]
+pub struct TestHandler {
+    pub slow_started: Arc<Notify>,
+}
 
 impl Handler for TestHandler {
     async fn call(&self, method: &str, _params: Option<Value>) -> Result<Value, RpcError> {
         match method {
             "version" => Ok(json!({ "daemonVersion": "test" })),
             "slow" => {
+                // Stores a permit if nobody waits yet.
+                self.slow_started.notify_one();
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok(json!("slow"))
             }

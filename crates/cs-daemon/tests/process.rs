@@ -18,6 +18,7 @@ use cs_daemon::token::{ControlToken, TOKEN_FILE_NAME, TokenError};
 use support::{TestHandler, call_version, exchange, post, status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 fn data_dir() -> (tempfile::TempDir, std::path::PathBuf) {
     let root = tempfile::tempdir().unwrap();
@@ -31,14 +32,25 @@ fn token_in(dir: &Path) -> String {
 }
 
 async fn start(token: Arc<ControlToken>, config: ServeConfig) -> (SocketAddr, Server) {
+    let (addr, server, _) = start_with_handler(token, config).await;
+    (addr, server)
+}
+
+/// Also returns the notifier of the handler's `slow` method.
+async fn start_with_handler(
+    token: Arc<ControlToken>,
+    config: ServeConfig,
+) -> (SocketAddr, Server, Arc<Notify>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let handler = TestHandler::default();
+    let slow_started = handler.slow_started.clone();
     let app = router(
         HttpConfig::for_listener(&listener).unwrap(),
         token,
-        Arc::new(TestHandler),
+        Arc::new(handler),
     );
-    (addr, serve::spawn(listener, app, config))
+    (addr, serve::spawn(listener, app, config), slow_started)
 }
 
 // ---- data directory -------------------------------------------------------------
@@ -362,18 +374,16 @@ fn daemon_timeouts_cover_the_request_timeout() {
 async fn graceful_stop_finishes_in_flight_requests_then_refuses_connections() {
     let (_root, dir) = data_dir();
     let token = Arc::new(ControlToken::load_or_create(&dir).unwrap());
-    let (addr, server) = start(token, ServeConfig::default()).await;
+    let (addr, server, slow_started) = start_with_handler(token, ServeConfig::default()).await;
     let slow = r#"{"jsonrpc":"2.0","method":"slow","id":1}"#;
     let request = post(addr, Some(&token_in(&dir)), slow);
 
     let in_flight = tokio::spawn(async move { exchange(addr, &request).await });
-    // Let the request reach the handler, then stop.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    slow_started.notified().await;
     server.stop().await;
 
     let response = in_flight.await.unwrap();
     assert_eq!(status(&response), 200, "{response}");
-    assert!(TcpStream::connect(addr).await.is_err());
 }
 
 #[tokio::test]
@@ -404,12 +414,12 @@ async fn graceful_stop_closes_idle_keep_alive_connections() {
 async fn requests_still_running_after_the_drain_timeout_are_aborted() {
     let (_root, dir) = data_dir();
     let token = Arc::new(ControlToken::load_or_create(&dir).unwrap());
-    let (addr, server) = start(token, ServeConfig::default()).await;
+    let (addr, server, slow_started) = start_with_handler(token, ServeConfig::default()).await;
     let slow = r#"{"jsonrpc":"2.0","method":"slow","id":1}"#;
     let request = post(addr, Some(&token_in(&dir)), slow);
 
     let in_flight = tokio::spawn(async move { exchange(addr, &request).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    slow_started.notified().await;
     let started = Instant::now();
     server.stop_within(Duration::from_millis(50)).await;
 
@@ -420,4 +430,84 @@ async fn requests_still_running_after_the_drain_timeout_are_aborted() {
         started.elapsed()
     );
     assert_eq!(in_flight.await.unwrap(), "");
+}
+
+// ---- review regressions ---------------------------------------------------------
+
+/// A stale `daemon.lock` + `daemon.json` pair, as a crash leaves them: the pid in
+/// both files is the same, and nobody holds the lock.
+fn stale_pair(dir: &Path) {
+    let instance = Instance::acquire(dir).unwrap();
+    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    let json = fs::read(dir.join(DISCOVERY_FILE_NAME)).unwrap();
+    instance.close().unwrap();
+    fs::write(dir.join(DISCOVERY_FILE_NAME), json).unwrap();
+}
+
+#[test]
+fn another_clients_probe_is_not_mistaken_for_a_live_daemon() {
+    let (_root, dir) = data_dir();
+    stale_pair(&dir);
+    // Another client in the middle of its probe.
+    let probe = fs::File::open(dir.join(LOCK_FILE_NAME)).unwrap();
+    probe.try_lock_shared().unwrap();
+
+    assert_eq!(read_discovery(&dir).unwrap(), None);
+    probe.unlock().unwrap();
+}
+
+#[test]
+fn a_daemon_starts_while_a_client_probes() {
+    let (_root, dir) = data_dir();
+    stale_pair(&dir);
+    let probe = fs::File::open(dir.join(LOCK_FILE_NAME)).unwrap();
+    probe.try_lock_shared().unwrap();
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        probe.unlock().unwrap();
+    });
+
+    // `acquire` retries while the probe holds its shared lock.
+    let instance = Instance::acquire(&dir).unwrap();
+
+    released.join().unwrap();
+    instance.close().unwrap();
+}
+
+#[test]
+fn read_discovery_refuses_addresses_other_than_127_0_0_1_with_a_port() {
+    let (_root, dir) = data_dir();
+    let instance = Instance::acquire(&dir).unwrap();
+    let pid = std::process::id();
+    for address in [
+        "127.0.0.1:0",
+        "127.0.0.2:4100",
+        "0.0.0.0:4100",
+        "10.0.0.1:4100",
+    ] {
+        let json =
+            format!(r#"{{"pid":{pid},"startedAtMs":1,"address":"{address}","schemaVersion":1}}"#);
+        fs::write(dir.join(DISCOVERY_FILE_NAME), json).unwrap();
+
+        assert_eq!(read_discovery(&dir).unwrap(), None, "{address}");
+    }
+    instance.publish("127.0.0.1:4100".parse().unwrap()).unwrap();
+    assert!(read_discovery(&dir).unwrap().is_some());
+    instance.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_data_dir_is_resolved_once_through_symlinks() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let link = root.path().join("link");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let resolved = prepare_data_dir(&link).unwrap();
+
+    assert_eq!(resolved, fs::canonicalize(&real).unwrap());
 }

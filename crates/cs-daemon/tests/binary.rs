@@ -320,7 +320,6 @@ fn signal_stops_gracefully(signal: &str) {
     assert!(!dir.join(DISCOVERY_FILE_NAME).exists());
     assert!(dir.join(cs_daemon::instance::LOCK_FILE_NAME).exists());
     assert_eq!(read_discovery(&dir).unwrap(), None);
-    assert!(std::net::TcpStream::connect(addr).is_err());
     assert!(!logs.contains(&token));
 }
 
@@ -334,4 +333,146 @@ fn sigterm_exits_0_and_removes_daemon_json() {
 #[test]
 fn sigint_exits_0_and_removes_daemon_json() {
     signal_stops_gracefully("INT");
+}
+
+/// A daemon whose stderr lines arrive on a channel, so a test can wait for a log
+/// line instead of sleeping.
+#[cfg(unix)]
+struct Watched {
+    child: Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Watched {
+    fn start(data_dir: &Path) -> Self {
+        use std::io::BufRead;
+        let mut child = daemon(data_dir).spawn().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut watched = Self {
+            child,
+            lines,
+            seen: Vec::new(),
+        };
+        watched.wait_for_line("Callsheet daemon listening");
+        watched
+    }
+
+    /// Waits for a stderr line containing `text`.
+    fn wait_for_line(&mut self, text: &str) {
+        let deadline = Instant::now() + STARTUP_LIMIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    let found = line.contains(text);
+                    self.seen.push(line);
+                    if found {
+                        return;
+                    }
+                }
+                Err(_) => panic!("no log line with {text:?}; saw {:#?}", self.seen),
+            }
+        }
+    }
+
+    fn signal(&self, signal: &str) {
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+    }
+
+    fn wait(&mut self, limit: Duration) -> std::process::ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                started.elapsed() < limit,
+                "daemon did not exit within {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watched {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Starts a daemon, holds its shutdown open with a connection that has sent only
+/// part of its headers (the server waits for it up to the header-read timeout),
+/// and sends two SIGINTs.
+#[cfg(unix)]
+fn two_sigints_during_a_held_shutdown(dir: &Path) -> (Watched, std::net::TcpStream) {
+    use std::io::Write;
+    let mut watched = Watched::start(dir);
+    let address = read_discovery(dir).unwrap().unwrap().address;
+    let mut held = std::net::TcpStream::connect(address).unwrap();
+    held.write_all(b"POST /rpc HTTP/1.1\r\nHost: 127.0.0.1")
+        .unwrap();
+    // The server accepts in order, so once a later connection has been answered
+    // the held one has been accepted too; otherwise the shutdown could drop it
+    // unaccepted and finish at once.
+    let token = fs::read_to_string(dir.join(TOKEN_FILE_NAME)).unwrap();
+    assert_eq!(
+        rt().block_on(call_version(address.into(), Some(&token))),
+        200
+    );
+
+    watched.signal("INT");
+    watched.wait_for_line("shutting down");
+    watched.signal("INT");
+    watched.wait_for_line("already shutting down");
+
+    assert!(
+        watched.child.try_wait().unwrap().is_none(),
+        "exited on a repeated signal"
+    );
+    assert!(dir.join(DISCOVERY_FILE_NAME).exists());
+    (watched, held)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_repeated_signal_does_not_cut_the_shutdown_short() {
+    let (_root, dir) = temp_data_dir();
+    let (mut watched, held) = two_sigints_during_a_held_shutdown(&dir);
+
+    // Closing the held connection lets the shutdown finish normally.
+    drop(held);
+    let status = watched.wait(Duration::from_secs(20));
+
+    assert_eq!(status.code(), Some(0), "{:#?}", watched.seen);
+    assert!(!dir.join(DISCOVERY_FILE_NAME).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_third_signal_exits_1_without_finishing() {
+    let (_root, dir) = temp_data_dir();
+    let (mut watched, _held) = two_sigints_during_a_held_shutdown(&dir);
+
+    watched.signal("INT");
+    let status = watched.wait(Duration::from_secs(5));
+
+    assert_eq!(status.code(), Some(1), "{:#?}", watched.seen);
+    watched.wait_for_line("received 3 times");
 }

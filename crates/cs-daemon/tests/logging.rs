@@ -55,7 +55,7 @@ async fn token_and_header_values_never_appear_in_the_logs() {
     let app = router(
         HttpConfig::for_listener(&listener).unwrap(),
         token.clone(),
-        Arc::new(support::TestHandler),
+        Arc::new(support::TestHandler::default()),
     );
     let config = ServeConfig {
         header_read_timeout: Duration::from_millis(200),

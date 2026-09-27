@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     if let Err(error) = logging::init(level) {
         return fail(&error, ExitCode::FAILURE);
     }
-    let (instance, token) = match prepare(&config) {
+    let (config, instance, token) = match prepare(config) {
         Ok(prepared) => prepared,
         Err(error) => return fail(error.as_ref(), ExitCode::FAILURE),
     };
@@ -63,12 +63,13 @@ fn fail(error: &dyn Error, code: ExitCode) -> ExitCode {
 }
 
 /// The data directory, the instance lock and the token: everything before the
-/// runtime starts.
-fn prepare(config: &Config) -> Result<(Instance, Arc<ControlToken>), Box<dyn Error>> {
-    instance::prepare_data_dir(&config.data_dir)?;
+/// runtime starts. The returned config holds the data directory as resolved by
+/// `prepare_data_dir`, used for everything after.
+fn prepare(mut config: Config) -> Result<(Config, Instance, Arc<ControlToken>), Box<dyn Error>> {
+    config.data_dir = instance::prepare_data_dir(&config.data_dir)?;
     let instance = Instance::acquire(&config.data_dir)?;
     let token = ControlToken::load_or_create(&config.data_dir)?;
-    Ok((instance, Arc::new(token)))
+    Ok((config, instance, Arc::new(token)))
 }
 
 async fn run(
@@ -114,10 +115,28 @@ async fn run(
     tracing::info!(signal = signal.name(), "shutting down");
     // Unit `wire` (task 11) passes the store writer's drain here.
     let drain = shutdown::nothing_to_drain();
-    tokio::select! {
-        stopped = shutdown::graceful(server, signal.drain_timeout(), drain, instance) => stopped?,
-        second = signals.recv() => {
-            return Err(format!("{second} during shutdown; exiting without finishing it").into());
+    let stopping = shutdown::graceful(server, signal.drain_timeout(), drain, instance);
+    tokio::pin!(stopping);
+    let mut received = 1;
+    loop {
+        tokio::select! {
+            stopped = &mut stopping => {
+                stopped?;
+                break;
+            }
+            again = signals.recv() => {
+                received += 1;
+                if received >= shutdown::SIGNALS_TO_FORCE_EXIT {
+                    return Err(format!(
+                        "{again} received {received} times; exiting without finishing the shutdown"
+                    )
+                    .into());
+                }
+                tracing::warn!(
+                    signal = again.name(),
+                    "already shutting down; the next signal exits without finishing"
+                );
+            }
         }
     }
     tracing::info!("Callsheet daemon stopped");

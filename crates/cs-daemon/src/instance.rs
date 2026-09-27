@@ -20,23 +20,36 @@
 //! **Discovery.** Once the listener is bound, `daemon.json`
 //! (`{ "pid", "startedAtMs", "address", "schemaVersion" }`) is written owner-only
 //! and atomically, and it is removed on graceful shutdown. A crash leaves it
-//! behind; the next daemon removes it right after taking the lock. Clients use
-//! [`read_discovery`], which returns the record only while `daemon.lock` is locked
-//! by a live daemon and, on Unix, only when the pid in the lock file is the pid in
-//! `daemon.json`, so a stale file never receives the token.
+//! behind; the next daemon removes it right after taking the lock.
 //!
-//! On Windows the lock covers the whole file, and an exclusive `LockFileEx` lock
-//! "denies all other processes both read and write access" to it (Microsoft
-//! Learn, `LockFileEx`, Remarks), so no other process can read the pid in
-//! `daemon.lock`. There the check is only
-//! that the lock is held. The one gap: right after a crash, between the new daemon
-//! taking the lock and removing the old `daemon.json` (no I/O in between but that
-//! write of the pid), a client could read the old address.
+//! Clients use [`read_discovery`]. It returns the record only when:
+//! - `daemon.lock` is exclusively locked by someone else. The probe is a *shared*
+//!   `try_lock_shared`: probing clients never block each other, so a client can't
+//!   mistake another client's probe for a live daemon, while the daemon's
+//!   exclusive lock makes every probe fail;
+//! - `daemon.json` exists and its address is `127.0.0.1` with a non-zero port;
+//! - on Unix, the pid written into `daemon.lock` equals the one in `daemon.json`.
+//!
+//! **Residual gaps.** This makes a stale `daemon.json` unlikely to receive the
+//! token, not impossible:
+//! - Unix: between a new daemon's `try_lock` and its writing its own pid into
+//!   `daemon.lock`, the lock file still holds the crashed daemon's pid, which
+//!   matches the old `daemon.json`. A client probing in that window (two system
+//!   calls long) gets the old address.
+//! - Windows: an exclusive `LockFileEx` lock "denies all other processes both read
+//!   and write access" to the file (Microsoft Learn, `LockFileEx`, Remarks), so
+//!   clients can't read the pid in `daemon.lock` and only the lock is checked.
+//!   The window runs from the new daemon's lock to its removal of the old
+//!   `daemon.json`. Also, Windows may keep a killed process's lock "depending upon
+//!   available system resources" (same page) for a moment after the process is
+//!   gone, and during that time the old `daemon.json` passes the check.
+//! - Follow-up: checking that the pid is alive (and is a `cs-daemon`) would close
+//!   both, but needs `libc` / Win32 calls with `unsafe`, which is denied here.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,9 +63,9 @@ pub const LOCK_FILE_NAME: &str = "daemon.lock";
 pub const DISCOVERY_FILE_NAME: &str = "daemon.json";
 
 /// How often, and how long apart, [`Instance::acquire`] retries a held lock
-/// before giving up: [`read_discovery`] takes the lock for a moment to see if it is
-/// free, and a daemon starting at that moment must not mistake the client for
-/// another daemon.
+/// before giving up: [`read_discovery`] takes a shared lock for a moment to see if
+/// the file is locked, and a daemon starting at that moment must not mistake the
+/// client for another daemon.
 const LOCK_ATTEMPTS: u32 = 25;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 
@@ -131,9 +144,11 @@ impl fmt::Display for InstanceError {
 /// The message already includes the underlying error.
 impl std::error::Error for InstanceError {}
 
-/// Creates the data directory owner-only if it is missing, and checks one that
-/// already exists (see the module docs).
-pub fn prepare_data_dir(path: &Path) -> Result<(), InstanceError> {
+/// Creates the data directory owner-only if it is missing, checks it (see the
+/// module docs), and returns the path to use from then on. On Unix that is the
+/// path resolved once with `fs::canonicalize`, so a symlink swapped in after the
+/// check can't redirect later file operations; on Windows it is `path` as given.
+pub fn prepare_data_dir(path: &Path) -> Result<PathBuf, InstanceError> {
     let data_dir_error = |source| InstanceError::DataDir {
         path: path.to_path_buf(),
         source,
@@ -147,13 +162,27 @@ pub fn prepare_data_dir(path: &Path) -> Result<(), InstanceError> {
             _ => data_dir_error(error),
         });
     }
-    let metadata = fs::metadata(path).map_err(data_dir_error)?;
+    let resolved = resolve(path).map_err(data_dir_error)?;
+    let metadata = fs::metadata(&resolved).map_err(data_dir_error)?;
     if !metadata.is_dir() {
         return Err(InstanceError::NotADirectory {
             path: path.to_path_buf(),
         });
     }
-    check_owner_only(path, &metadata)
+    check_owner_only(&resolved, &metadata)?;
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
+/// `fs::canonicalize` on Windows returns a `\\?\` path; `fsperm` already makes
+/// paths absolute and verbatim itself.
+#[cfg(not(unix))]
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    Ok(path.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -330,13 +359,14 @@ fn read_discovery_file(data_dir: &Path) -> io::Result<Option<Discovery>> {
 /// For clients: the running daemon's discovery record, or `None` when no daemon
 /// is running with `data_dir` (or one is still starting).
 ///
-/// `None` unless `daemon.lock` is locked by another open file (a live daemon,
-/// possibly in this process) and `daemon.json` exists; on Unix also unless the pid
-/// in `daemon.lock` equals the one in `daemon.json`. Only then may a client send
-/// the token to the address.
+/// `None` unless `daemon.lock` is exclusively locked by another open file (a live
+/// daemon, possibly in this process), `daemon.json` exists and names
+/// `127.0.0.1:<non-zero port>`, and on Unix the pid in `daemon.lock` equals the one
+/// in `daemon.json`. Only then may a client send the token to the address. See the
+/// module docs for the gaps that remain.
 ///
-/// To test the lock this takes it for a moment when it is free; a daemon starting
-/// at that moment retries ([`Instance::acquire`]).
+/// To test the lock this takes a shared lock for a moment when it is free; a
+/// daemon starting at that moment retries ([`Instance::acquire`]).
 pub fn read_discovery(data_dir: &Path) -> io::Result<Option<Discovery>> {
     let lock_path = data_dir.join(LOCK_FILE_NAME);
     let lock = match File::open(&lock_path) {
@@ -344,7 +374,8 @@ pub fn read_discovery(data_dir: &Path) -> io::Result<Option<Discovery>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    match lock.try_lock() {
+    // Shared: another client's probe doesn't block this one (module docs).
+    match lock.try_lock_shared() {
         Ok(()) => {
             lock.unlock()?;
             return Ok(None);
@@ -355,6 +386,9 @@ pub fn read_discovery(data_dir: &Path) -> io::Result<Option<Discovery>> {
     let Some(discovery) = read_discovery_file(data_dir)? else {
         return Ok(None);
     };
+    if *discovery.address.ip() != Ipv4Addr::LOCALHOST || discovery.address.port() == 0 {
+        return Ok(None);
+    }
     if cfg!(unix) && lock_holder_pid(&lock_path) != Some(discovery.pid) {
         return Ok(None);
     }

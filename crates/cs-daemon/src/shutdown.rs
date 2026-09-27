@@ -1,13 +1,15 @@
 //! Graceful shutdown (R1.3).
 //!
 //! Owned by unit `daemon-proc`. [`Signals`] waits for the first of:
-//! - Unix: `SIGINT` (Ctrl+C), `SIGTERM` and `SIGHUP` (terminal closed), through
-//!   `tokio::signal::unix::signal(SignalKind::interrupt() / terminate() /
-//!   hangup())` (tokio 1.53.1 `src/signal/unix.rs`). `tokio::signal::ctrl_c` is the
-//!   same `SIGINT` listener on Unix, but it registers only when first polled; these
-//!   register when [`Signals::install`] runs.
-//! - Windows: `tokio::signal::windows::ctrl_c`, `ctrl_break` and `ctrl_close`
-//!   (console closed; `src/signal/windows.rs`). After a close event Windows ends
+//! - Unix: `SIGINT` (Ctrl+C) and `SIGTERM`, through
+//!   `tokio::signal::unix::signal(SignalKind::interrupt() / terminate())` (tokio
+//!   1.53.1 `src/signal/unix.rs`). `tokio::signal::ctrl_c` is the same `SIGINT`
+//!   listener on Unix, but it registers only when first polled; these register
+//!   when [`Signals::install`] runs. `SIGHUP` is deliberately not handled:
+//!   registering a handler replaces an inherited "ignore", so `nohup cs-daemon &`
+//!   would stop at logout.
+//! - Windows: `tokio::signal::windows::ctrl_c` and `ctrl_close` (console closed;
+//!   `src/signal/windows.rs`). After a close event Windows ends
 //!   the process when the handler returns or after `SPI_GETHUNGAPPTIMEOUT`, 5 s by
 //!   default (Microsoft Learn, "HandlerRoutine callback function", Timeouts).
 //!   tokio's handler waits (`src/signal/windows/sys.rs`), so the whole shutdown
@@ -23,9 +25,11 @@
 //!    ([`crate::instance::Instance::close`]);
 //! 4. `main` exits with status 0, or 1 if a step failed.
 //!
-//! Every step runs even when an earlier one failed. A second signal during the
-//! shutdown makes `main` stop waiting and exit 1 at once: the lock is released
-//! with the process, and the next start removes the `daemon.json` left behind.
+//! Every step runs even when an earlier one failed. Terminals and wrappers often
+//! deliver one Ctrl+C twice, so a repeated signal during the shutdown is only
+//! logged; the [`SIGNALS_TO_FORCE_EXIT`]th signal makes `main` stop waiting and
+//! exit 1 at once. The lock is then released with the process, and the next start
+//! removes the `daemon.json` left behind.
 
 use std::error::Error;
 use std::fmt;
@@ -49,6 +53,10 @@ pub fn nothing_to_drain() -> DrainHook {
     Box::new(|| Box::pin(async { Ok(()) }))
 }
 
+/// The number of signals (the first one included) after which `main` stops a
+/// shutdown in progress and exits 1.
+pub const SIGNALS_TO_FORCE_EXIT: u32 = 3;
+
 /// How long connections get after a Windows console close event, leaving the
 /// rest of the 5 s Windows allows to the drain hook and the cleanup.
 pub const CLOSE_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -60,12 +68,8 @@ pub enum Signal {
     Interrupt,
     /// Unix `SIGTERM`.
     Terminate,
-    /// Unix `SIGHUP`.
-    Hangup,
     /// Windows `CTRL_C_EVENT`.
     CtrlC,
-    /// Windows `CTRL_BREAK_EVENT`.
-    CtrlBreak,
     /// Windows `CTRL_CLOSE_EVENT`.
     CtrlClose,
 }
@@ -76,9 +80,7 @@ impl Signal {
         match self {
             Self::Interrupt => "SIGINT",
             Self::Terminate => "SIGTERM",
-            Self::Hangup => "SIGHUP",
             Self::CtrlC => "CTRL_C_EVENT",
-            Self::CtrlBreak => "CTRL_BREAK_EVENT",
             Self::CtrlClose => "CTRL_CLOSE_EVENT",
         }
     }
@@ -105,12 +107,8 @@ pub struct Signals {
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    hangup: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
-    #[cfg(windows)]
-    ctrl_break: tokio::signal::windows::CtrlBreak,
     #[cfg(windows)]
     ctrl_close: tokio::signal::windows::CtrlClose,
 }
@@ -125,15 +123,13 @@ impl Signals {
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt())?,
                 terminate: signal(SignalKind::terminate())?,
-                hangup: signal(SignalKind::hangup())?,
             })
         }
         #[cfg(windows)]
         {
-            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
+            use tokio::signal::windows::{ctrl_c, ctrl_close};
             Ok(Self {
                 ctrl_c: ctrl_c()?,
-                ctrl_break: ctrl_break()?,
                 ctrl_close: ctrl_close()?,
             })
         }
@@ -153,14 +149,12 @@ impl Signals {
             tokio::select! {
                 _ = self.interrupt.recv() => Signal::Interrupt,
                 _ = self.terminate.recv() => Signal::Terminate,
-                _ = self.hangup.recv() => Signal::Hangup,
             }
         }
         #[cfg(windows)]
         {
             tokio::select! {
                 _ = self.ctrl_c.recv() => Signal::CtrlC,
-                _ = self.ctrl_break.recv() => Signal::CtrlBreak,
                 _ = self.ctrl_close.recv() => Signal::CtrlClose,
             }
         }
