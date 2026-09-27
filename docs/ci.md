@@ -201,13 +201,14 @@ have seen it.
   systemd-resolved's D-Bus interface), and I/O submitted through `io_uring`,
   make no `connect` or `send` call in the traced processes. A `send` or `write`
   on an already connected socket isn't traced, but its `connect` is.
-- **The daemon's HTTP client.** `cs-daemon` has no outbound client today:
-  reqwest is in `cs-proxy`, which the daemon doesn't depend on yet (it will
-  from task 8). Today the daemon legs prove that its idle start and its
-  pairing with the app make no connections. Once the proxy is wired in, they
-  also cover reqwest, which honours `HTTPS_PROXY` (cs-proxy turns proxies off
-  only for a loopback upstream), and anything it connects directly shows in
-  the trace.
+- **Calls routed through the daemon's proxy.** Since feature 03, task 8, the
+  daemon runs the model-call proxy: its reqwest client (which honours
+  `HTTPS_PROXY`; cs-proxy turns proxies off only for a loopback upstream) is
+  built at startup but opens no connection and resolves no name until a call
+  arrives. The daemon legs cover that idle state (the proxy's loopback
+  listener, its `proxy-port` file and its recorder are local only). A call a
+  user sends through the proxy goes to the provider by design, and no leg
+  sends one.
 - **Anything after the user acts.** The app is left idle; no button is pressed
   and no network feature is turned on.
 
