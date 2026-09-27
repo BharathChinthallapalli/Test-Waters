@@ -33,9 +33,9 @@ pub async fn erase(store: &Store, params: Option<Value>) -> Result<Value, RpcErr
     to_value(&result)
 }
 
+/// By name only: see [`super::core::object_params`].
 fn parse<T: DeserializeOwned>(params: Option<Value>) -> Result<T, RpcError> {
-    let params = params.ok_or_else(RpcError::invalid_params)?;
-    serde_json::from_value(params).map_err(|_| RpcError::invalid_params())
+    super::core::object_params(params)
 }
 
 fn to_value(result: &impl Serialize) -> Result<Value, RpcError> {
@@ -146,7 +146,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_shared_content(dir.path()).await;
 
-        for params in [None, Some(json!({})), Some(json!({ "runId": 7 }))] {
+        for params in [
+            None,
+            Some(json!({})),
+            Some(json!({ "runId": 7 })),
+            Some(json!(["a"])),
+            Some(json!({ "runId": "a", "extra": 1 })),
+        ] {
             let error = plan(&store, params).await.unwrap_err();
             assert_eq!(error.code, codes::INVALID_PARAMS);
         }
@@ -154,6 +160,7 @@ mod tests {
             None,
             Some(json!({ "runId": "a" })),
             Some(json!({ "planId": "x" })),
+            Some(json!(["a", "x"])),
         ] {
             let error = erase(&store, params).await.unwrap_err();
             assert_eq!(error.code, codes::INVALID_PARAMS);

@@ -94,9 +94,10 @@ pub struct SettingsResult {
 }
 
 /// Params of `settings.setCaptureContent`.
+/// Given by name; unknown members are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(export))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetCaptureContentParams {
     pub enabled: bool,
 }
@@ -148,9 +149,10 @@ pub struct VerifyResult {
 }
 
 /// Params of `content.erasePlan`.
+/// Given by name; unknown members are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(export))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErasePlanParams {
     pub run_id: String,
 }
@@ -171,9 +173,10 @@ pub struct ErasePlanResult {
 }
 
 /// Params of `content.erase`: the plan the user confirmed.
+/// Given by name; unknown members are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(export))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EraseParams {
     pub run_id: String,
     pub plan_id: String,

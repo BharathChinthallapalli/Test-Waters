@@ -9,6 +9,11 @@
 //! after its writer has carried out every queued write. A startup failure prints
 //! one line naming the file or value involved, never a secret, and exits 1.
 //!
+//! A signal while the store opens or the backup check runs stops the daemon
+//! before it listens (exit 0). At exit, blocking tasks still running (a keychain
+//! call waiting on an unlock prompt) get [`BLOCKING_TASKS_GRACE`] and are then
+//! abandoned, so the process always ends.
+//!
 //! **The store** uses the OS keychain (`cs_store::secrets::os_keychain`), which is
 //! contacted only when content capture needs the key, never at startup.
 //!
@@ -28,14 +33,17 @@
 //!   with a warning** and keeps the backups. The database is sound, and the
 //!   problem is tamper evidence the user inspects through `events.verify`, which
 //!   needs a running daemon; the backup holds the log as it was before migrating,
-//!   for comparison. The check runs again at every start until the log verifies.
+//!   for comparison. The check, and the warning, repeat at every start until
+//!   the log verifies or an erasure removes the backups. Deliberately: the
+//!   warning stays visible for as long as the problem exists, and a full verify
+//!   only costs startup time while a backup is present.
 
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cs_daemon::config::{self, Command, Config, USAGE, USAGE_EXIT_CODE};
 use cs_daemon::http::{self, HttpConfig};
@@ -77,11 +85,26 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(error) => return fail(&error, ExitCode::FAILURE),
     };
-    match runtime.block_on(run(config, instance, token, started)) {
+    let result = runtime.block_on(run(config, instance, token, started));
+    // Dropping a runtime waits for every `spawn_blocking` task, with no limit. A
+    // keychain call can sit in one for as long as an unlock prompt stays open
+    // (`cs_store::secrets::SecretStore::content_key`), and would then keep the
+    // process alive after a finished shutdown, or after the forced exit on a
+    // repeated signal. The shutdown steps are done by now, so give such tasks a
+    // moment and then abandon them.
+    runtime.shutdown_timeout(BLOCKING_TASKS_GRACE);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(error.as_ref(), ExitCode::FAILURE),
     }
 }
+
+/// How long blocking tasks still running at exit get before they are abandoned.
+const BLOCKING_TASKS_GRACE: Duration = Duration::from_secs(1);
+
+/// After this long, a shutdown still waiting for the store's writer logs that
+/// it is still waiting.
+const SLOW_DRAIN: Duration = Duration::from_secs(5);
 
 /// Prints a one-line error to stderr and returns `code`.
 fn fail(error: &dyn Error, code: ExitCode) -> ExitCode {
@@ -106,11 +129,43 @@ async fn run(
     started: Instant,
 ) -> Result<(), Box<dyn Error>> {
     // Before `daemon.json` exists, so a signal sent as soon as a client can see the
-    // daemon already shuts it down gracefully. A signal that arrives while the
-    // store opens is handled once the daemon is up.
+    // daemon already shuts it down gracefully.
     let mut signals =
         Signals::install().map_err(|error| format!("cannot handle shutdown signals: {error}"))?;
-    let store = open_store(&config.data_dir).await?;
+    // Opening (and migrating) the store and checking a migration backup can take
+    // a while; a signal meanwhile stops the daemon without starting it. Work
+    // left on a blocking thread is abandoned at exit (`BLOCKING_TASKS_GRACE`):
+    // each migration is its own transaction, and a half-written backup is
+    // checked and deleted by the next start.
+    let opening = async {
+        let store = open_store(&config.data_dir).await?;
+        if let Err(error) = check_migration_backups(&store, &config.data_dir).await {
+            let _ = store.close().await;
+            return Err(error);
+        }
+        Ok::<_, Box<dyn Error>>(store)
+    };
+    let store = tokio::select! {
+        opened = opening => match opened {
+            Ok(store) => store,
+            Err(error) => {
+                // The error that matters is the startup failure.
+                let _ = instance.close();
+                return Err(error);
+            }
+        },
+        signal = signals.recv() => {
+            tracing::info!(signal = signal.name(), "stopped while starting");
+            // The store may still be opening or migrating on a blocking thread
+            // that is only abandoned, not stopped, so `daemon.lock` must stay
+            // held until the process ends: unlocking now would let a restarted
+            // daemon migrate the same database alongside it. Leaking the handle
+            // leaves the lock to the operating system, which releases it at
+            // exit. `daemon.json` was never written by this process.
+            std::mem::forget(instance);
+            return Ok(());
+        }
+    };
     let server = match start(&config, &instance, token, Arc::clone(&store), started).await {
         Ok(server) => server,
         Err(error) => {
@@ -171,8 +226,8 @@ async fn open_store(data_dir: &Path) -> Result<Arc<Store>, Box<dyn Error>> {
     Ok(Arc::new(store))
 }
 
-/// Everything from the migration backup check to `daemon.json`. On failure
-/// nothing is left serving; the caller closes the store and the instance.
+/// The listener, the server and `daemon.json`. On failure nothing is left
+/// serving; the caller closes the store and the instance.
 async fn start(
     config: &Config,
     instance: &Instance,
@@ -180,7 +235,6 @@ async fn start(
     store: Arc<Store>,
     started: Instant,
 ) -> Result<Server, Box<dyn Error>> {
-    check_migration_backups(&store, &config.data_dir).await?;
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|error| format!("cannot listen on {}: {error}", config.listen))?;
@@ -216,13 +270,19 @@ async fn start(
 /// `PRAGMA integrity_check` and a full verify; see the module docs for what
 /// happens otherwise.
 async fn check_migration_backups(store: &Store, data_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let present = store.migrated().backup.is_some()
-        || count_migration_backups(data_dir).map_err(|error| {
-            format!(
-                "cannot list migration backups in {}: {error}",
-                data_dir.display()
-            )
-        })? > 0;
+    let present = store.migrated().backup.is_some() || {
+        let dir = data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || count_migration_backups(&dir))
+            .await
+            .map_err(|_| "listing the migration backups did not finish")?
+            .map_err(|error| {
+                format!(
+                    "cannot list migration backups in {}: {error}",
+                    data_dir.display()
+                )
+            })?
+            > 0
+    };
     if !present {
         return Ok(());
     }
@@ -289,14 +349,22 @@ async fn check_migration_backups(store: &Store, data_dir: &Path) -> Result<(), B
 }
 
 /// The drain step of the shutdown: closes the store once its writer has
-/// carried out every queued write.
+/// carried out every queued write, logging if that takes longer than
+/// [`SLOW_DRAIN`]. `Store::close` may be called again while a call waits.
 fn close_store(store: Arc<Store>) -> DrainHook {
     Box::new(move || {
         Box::pin(async move {
-            store
-                .close()
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            let closed = match tokio::time::timeout(SLOW_DRAIN, store.close()).await {
+                Ok(closed) => closed,
+                Err(_) => {
+                    tracing::warn!(
+                        waited_ms = u64::try_from(SLOW_DRAIN.as_millis()).unwrap_or(u64::MAX),
+                        "shutdown: still waiting for the store to finish its queued writes"
+                    );
+                    store.close().await
+                }
+            };
+            closed.map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
         })
     })
 }

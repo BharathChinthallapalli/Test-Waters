@@ -7,7 +7,6 @@
 // binary fails the test; it is never skipped.
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { once } from "node:events";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
@@ -46,6 +45,8 @@ let dataDir: string;
 let daemon: ChildProcess;
 let exited: Promise<[number | null, NodeJS.Signals | null]>;
 let stderr = "";
+/** Set when the process could not be started (or signalled). */
+let spawnError: Error | undefined;
 let discovery: Discovery;
 
 /** What one HTTP exchange returned. */
@@ -129,6 +130,9 @@ function client(address: string) {
 async function waitForDiscovery(): Promise<Discovery> {
   const deadline = Date.now() + STARTUP_LIMIT_MS;
   for (;;) {
+    if (spawnError) {
+      assert.fail(`cannot start ${DAEMON_BIN}: ${spawnError.message}`);
+    }
     if (daemon.exitCode !== null || daemon.signalCode !== null) {
       assert.fail(`the daemon exited during startup: ${stderr}`);
     }
@@ -160,23 +164,34 @@ before(async () => {
   daemon = spawn(DAEMON_BIN, ["--data-dir", dataDir], {
     stdio: ["ignore", "ignore", "pipe"],
   });
+  // Without a listener, an 'error' (spawn or kill failed) would be thrown.
+  daemon.on("error", (error) => {
+    spawnError = error;
+  });
   daemon.stderr?.setEncoding("utf8");
   daemon.stderr?.on("data", (chunk: string) => {
     stderr += chunk;
   });
-  exited = once(daemon, "exit") as Promise<
-    [number | null, NodeJS.Signals | null]
-  >;
+  // 'exit' only; a spawn failure is recorded by the 'error' listener above.
+  exited = new Promise((resolve) => {
+    daemon.once("exit", (code, signal) => resolve([code, signal]));
+  });
   discovery = await waitForDiscovery();
 });
 
 after(async () => {
-  if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
+  // No pid: the process never started, so there is nothing to wait for.
+  if (
+    daemon?.pid !== undefined &&
+    daemon.exitCode === null &&
+    daemon.signalCode === null
+  ) {
     daemon.kill("SIGKILL");
     await exited;
   }
   if (root) {
-    await rm(root, { recursive: true, force: true });
+    // Windows may hold the files of a process that just ended for a moment.
+    await rm(root, { recursive: true, force: true, maxRetries: 5 });
   }
 });
 
@@ -202,8 +217,14 @@ test("health and version answer with the generated types", async () => {
 
   const version = await api.call<VersionResult>("version");
   const cargoToml = await readFile(path.join(REPO_ROOT, "Cargo.toml"), "utf8");
-  const workspaceVersion =
-    /^\[workspace\.package\]\s*\nversion = "([^"]+)"/m.exec(cargoToml)?.[1];
+  // The `version` key of the `[workspace.package]` table, wherever it sits in
+  // the table and however it is spaced.
+  const table = cargoToml
+    .split(/^\s*\[workspace\.package\]\s*$/m)[1]
+    ?.split(/^\s*\[/m)[0];
+  const workspaceVersion = table
+    ? /^\s*version\s*=\s*"([^"]+)"/m.exec(table)?.[1]
+    : undefined;
   assert.ok(workspaceVersion);
   assert.deepEqual(version.result, { daemonVersion: workspaceVersion });
 });

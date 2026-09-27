@@ -330,6 +330,14 @@ mod tests {
             ("content.erasePlan", None),
             ("content.erasePlan", Some(json!({ "runId": 1 }))),
             ("content.erase", Some(json!({ "runId": "a" }))),
+            // By position, or with unknown members: refused, not guessed at.
+            ("settings.setCaptureContent", Some(json!([true]))),
+            (
+                "settings.setCaptureContent",
+                Some(json!({ "enabled": true, "extra": 1 })),
+            ),
+            ("content.erasePlan", Some(json!(["a"]))),
+            ("content.erase", Some(json!(["a", "0"]))),
         ] {
             let error = f.methods.call(method, params.clone()).await.unwrap_err();
             assert_eq!(error, RpcError::invalid_params(), "{method} {params:?}");

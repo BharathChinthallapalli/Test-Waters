@@ -2,5 +2,6 @@
 
 /**
  * Params of `content.erase`: the plan the user confirmed.
+ * Given by name; unknown members are refused.
  */
 export type EraseParams = { runId: string, planId: string, };

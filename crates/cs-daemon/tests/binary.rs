@@ -44,7 +44,12 @@ struct Running {
 
 impl Running {
     fn start(data_dir: &Path) -> Self {
-        let mut child = daemon(data_dir).spawn().unwrap();
+        Self::spawn(&mut daemon(data_dir), data_dir)
+    }
+
+    /// Spawns `command`, a [`daemon`] for `data_dir`, and waits until it listens.
+    fn spawn(command: &mut Command, data_dir: &Path) -> Self {
+        let mut child = command.spawn().unwrap();
         let started = Instant::now();
         loop {
             // The pid check skips a `daemon.json` left by a killed daemon, which
@@ -479,6 +484,62 @@ fn a_third_signal_exits_1_without_finishing() {
 
     assert_eq!(status.code(), Some(1), "{:#?}", watched.seen);
     watched.wait_for_line("received 3 times");
+}
+
+/// On Linux the keychain is the Secret Service on the D-Bus session bus. A bus
+/// socket that accepts and never answers makes the keychain call behind
+/// `settings.setCaptureContent` block for good on a blocking thread, as an
+/// unlock prompt nobody answers would. A graceful stop must still end the
+/// process: dropping a tokio runtime would wait for that thread forever.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_keychain_call_that_never_returns_does_not_keep_the_process_alive() {
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    let (root, dir) = temp_data_dir();
+    let bus_path = root.path().join("bus.sock");
+    let bus = UnixListener::bind(&bus_path).unwrap();
+    let (accepted, bus_contacted) = std::sync::mpsc::channel();
+    // Detached: it holds every connection open, unanswered, until the test ends.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in bus.incoming() {
+            let Ok(stream) = stream else { break };
+            held.push(stream);
+            let _ = accepted.send(());
+        }
+    });
+    let bus_address = format!("unix:path={}", bus_path.display());
+    let running = Running::spawn(
+        daemon(&dir).env("DBUS_SESSION_BUS_ADDRESS", bus_address),
+        &dir,
+    );
+    let token = fs::read_to_string(dir.join(TOKEN_FILE_NAME)).unwrap();
+    let addr: std::net::SocketAddr = running.discovery.address.into();
+    let enable = r#"{"jsonrpc":"2.0","method":"settings.setCaptureContent","params":{"enabled":true},"id":1}"#;
+    let mut request = std::net::TcpStream::connect(addr).unwrap();
+    request
+        .write_all(support::post(addr, Some(&token), enable).as_bytes())
+        .unwrap();
+    bus_contacted
+        .recv_timeout(STARTUP_LIMIT)
+        .expect("the keychain call never reached the bus");
+
+    let sent = Command::new("kill")
+        .args(["-TERM", &running.pid().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    // The open request holds the drain until its 10 s timeout answers it.
+    let (status, output) = running.wait(Duration::from_secs(40));
+
+    let logs = stderr(&output);
+    assert_eq!(status.code(), Some(0), "{logs}");
+    assert!(logs.contains("Callsheet daemon stopped"), "{logs}");
+    assert!(!dir.join(DISCOVERY_FILE_NAME).exists());
+    assert!(!logs.contains(&token));
+    drop(request);
 }
 
 // ---- migration backups at startup ---------------------------------------------

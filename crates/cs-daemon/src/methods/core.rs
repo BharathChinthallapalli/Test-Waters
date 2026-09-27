@@ -2,7 +2,8 @@
 //! `settings.setCaptureContent`. Owned by unit `wire`.
 //!
 //! Every method here except `settings.setCaptureContent` takes no params:
-//! `params` absent or `{}`, anything else is -32602 ([`no_params`]).
+//! `params` absent or `{}`, anything else is -32602 ([`no_params`]). Methods
+//! with params take them by name only ([`object_params`]).
 //! Errors the client can't fix are -32603 with a fixed message; the cause goes
 //! to the log, and neither ever contains a token, a request or content.
 //!
@@ -23,6 +24,7 @@ use cs_core::control::{
 use cs_store::migrate::CURRENT_SCHEMA_VERSION;
 use cs_store::{Store, StoreError};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::rpc::RpcError;
@@ -92,9 +94,7 @@ pub fn settings_get(store: &Store, params: Option<Value>) -> Result<Value, RpcEr
 /// a usable keychain fails with 1001 and the store's reason for the user, and
 /// capture stays off (R5.4).
 pub async fn set_capture_content(store: &Store, params: Option<Value>) -> Result<Value, RpcError> {
-    let params: SetCaptureContentParams = params
-        .and_then(|params| serde_json::from_value(params).ok())
-        .ok_or_else(RpcError::invalid_params)?;
+    let params: SetCaptureContentParams = object_params(params)?;
     let capture_content = store
         .set_capture_content(params.enabled)
         .await
@@ -106,6 +106,18 @@ pub async fn set_capture_content(store: &Store, params: Option<Value>) -> Result
             other => store_failure("settings.setCaptureContent", &other),
         })?;
     to_value(&SettingsResult { capture_content })
+}
+
+/// Params given by name: a JSON object with exactly the type's members (the
+/// params types deny unknown fields). Absent params, by-position params (an
+/// array) and anything that doesn't fit are -32602.
+pub fn object_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, RpcError> {
+    match params {
+        Some(params @ Value::Object(_)) => {
+            serde_json::from_value(params).map_err(|_| RpcError::invalid_params())
+        }
+        _ => Err(RpcError::invalid_params()),
+    }
 }
 
 /// Accepts absent params or `{}`; anything else is -32602.

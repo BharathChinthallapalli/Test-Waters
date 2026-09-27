@@ -2,5 +2,6 @@
 
 /**
  * Params of `settings.setCaptureContent`.
+ * Given by name; unknown members are refused.
  */
 export type SetCaptureContentParams = { enabled: boolean, };
