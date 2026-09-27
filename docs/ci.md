@@ -11,7 +11,7 @@
 | TypeScript (Biome, typecheck, test, audit) | `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test`, `pnpm audit` |
 | Generated types are current | `node scripts/gen-types.ts --check` (ADR 0009) |
 | TypeScript client against the daemon | `cargo build -p cs-daemon --locked`, then `pnpm -C packages/api-types test:integration` |
-| Desktop makes no outbound requests | Builds the desktop app and `cs-daemon`, then `node scripts/egress-check.ts` under Xvfb (see [below](#the-egress-check)) |
+| Desktop makes no outbound requests | Builds the desktop app and `cs-daemon`, then `node scripts/egress-check.ts` under Xvfb, with logging proxies and strace (see [below](#the-egress-check)) |
 | **CI passed** | Always runs; fails unless every job above succeeded |
 
 Run the same gates locally before pushing:
@@ -67,60 +67,127 @@ the app's settings can't show that: after #33 turned the spellchecker off, the
 app still downloaded a dictionary on every start through a loader that
 `webRequest` doesn't see (`docs/progress.md`, 2026-09-27). The job **Desktop
 makes no outbound requests** (issue #56) starts the real binaries and watches
-what they try to reach. `apps/desktop/scripts/egress-check.ts`:
+what they try to reach in two independent ways:
 
-1. Starts three logging proxies on `127.0.0.1`
-   (`apps/desktop/scripts/logging-proxy.ts`). Each answers every request with
-   403 and forwards nothing. It records the method and the destination
-   (`host:port`, from the CONNECT target or the absolute URL) of the request
-   line, never the path, query, headers or body. Bytes that aren't a request
-   line count too, as "(unparsed)".
-2. Starts `scripts/fake-daemon.ts` on loopback, so the app has a daemon to talk to.
-3. Starts the built desktop app (Electron, under Xvfb) with a fresh profile
-   (`--user-data-dir` in a temporary directory), then again with the same
-   profile, as **first start** and **restart**. Each run is routed two ways:
-   - Chromium's network stack through `--proxy-server=127.0.0.1:<port>`;
-   - Node in the main process through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`
-     with `NODE_USE_ENV_PROXY=1`, which is what makes Node's `fetch` and global
-     HTTP agent use them.
+- **Logging proxies** name the destination of every request that honours a
+  proxy setting. Three run on `127.0.0.1`
+  (`apps/desktop/scripts/logging-proxy.ts`), one per way out, so each request
+  is attributed to what sent it. Each answers every request with 403 and
+  forwards nothing. It records the method and the destination (`host:port`,
+  from the CONNECT target or the absolute URL) of the request line, never the
+  path, query, headers or body. Bytes that aren't a request line count too, as
+  "(unparsed)".
+- **A syscall trace** catches what ignores the proxies. Every process under
+  test runs under `strace -f`, which records each `connect`, `sendto`,
+  `sendmsg` and `sendmmsg` of the process and of every process it starts
+  (`apps/desktop/scripts/syscall-trace.ts`), each message of a `sendmmsg`
+  included. It fails on a socket call to an IPv4 or IPv6 address that isn't
+  local: local means `127.0.0.0/8`, `::1`, their IPv4-mapped forms
+  (`::ffff:127.x.x.x`) and the unspecified addresses `0.0.0.0` and `::`, which
+  Linux connects to this host. It also fails on any call to port 53 (a DNS
+  query, even to Ubuntu's local stub resolver on `127.0.0.53`), on a
+  connection to a local resolver's socket (systemd-resolved, Avahi), and on
+  any address family other than IP, UNIX, netlink and `AF_UNSPEC` (which
+  disconnects a socket). strace runs with `-s 0`, so no data is ever printed,
+  only addresses.
 
-   `NO_PROXY` is empty, so a client that honours these variables would send
-   even loopback requests to the proxy. The app's daemon client (`agent: false`,
-   `127.0.0.1` only) connects directly and must not appear.
-4. For each run, checks over the DevTools protocol, as `scripts/screenshot.ts`
-   does, that the `app://renderer` page opened with the title "Callsheet" and
-   reached the daemon ("Daemon running"). The debugging port is
-   `--remote-debugging-port=0` on loopback; Chromium writes the port it chose
-   to the profile's `DevToolsActivePort` file. It then leaves the app idle for
-   20 s and stops it with SIGTERM.
-5. Starts `cs-daemon` alone with a temporary `--data-dir` and the proxy
-   variables pointing at the third proxy, checks that it publishes
-   `daemon.json`, leaves it idle for 10 s and checks that SIGTERM stops it with
-   exit status 0.
+`apps/desktop/scripts/egress-check.ts` then runs, in order:
 
-The job fails if any proxy saw a request, or if a positive check failed. It
-prints each destination with its count, the phase and the process: "desktop
-app: Chromium", "desktop app: main-process Node" or "cs-daemon", so an app
-failure and a daemon failure are told apart. It uploads nothing. Output with
-the spellchecker fix (`setSpellCheckerLanguages([])`) removed:
+1. **The canary** (`scripts/egress-canary.ts`): a small Electron main process
+   started with exactly the app's switches and environment (below), which
+   tries every way out the check claims to see:
+   - a main-process `fetch`, which must reach the proxy named by
+     `HTTPS_PROXY`;
+   - `net.fetch` in the default session and `fetch` in a separate session
+     partition, which must reach the `--proxy-server` proxy;
+   - a request to a link-local address, which must reach the same proxy;
+   - a raw TCP connection from the main process, a direct connection from
+     Chromium's network service (a session set to `mode: "direct"`) and a DNS
+     lookup, which the syscall trace must show.
+
+   Host names end in `.invalid` and addresses are in `192.0.2.0/24`
+   (TEST-NET-1), so nothing can succeed. If a backstop misses its canary, the
+   check fails: an Electron or Node change has disabled it, and the rest of the
+   check would prove nothing. `NODE_USE_ENV_PROXY` in particular is marked
+   "Stability: 1.1 - Active development" in Node 24's docs.
+2. **First start**: `scripts/fake-daemon.ts` on loopback, then the built
+   desktop app (Electron, under Xvfb) with a fresh profile (`--user-data-dir`
+   in a temporary directory).
+3. **Restart**: the real `cs-daemon` built by the job, with a temporary
+   `--data-dir`, then the app again with the same profile, pointed at that
+   daemon, so the real pairing is exercised. The daemon runs behind its own
+   proxy and under strace too.
+4. **Idle start**: `cs-daemon` alone with a new `--data-dir` and no client.
+
+The app and the canary are routed three ways:
+
+- Chromium's network stack through `--proxy-server=127.0.0.1:<port>`, with
+  `--proxy-bypass-list=<-loopback>`. That special rule removes Chromium's
+  implicit bypass rules (`localhost`, `*.localhost`, `[::1]`, `127.0.0.1/8`,
+  `169.254/16` and `[FE80::]/10`, Chromium's `net/docs/proxy.md`), so loopback
+  and link-local requests, cloud metadata addresses included, go to the proxy
+  as well.
+- Node in the main process through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`
+  with `NODE_USE_ENV_PROXY=1`, which makes Node's `fetch` and global HTTP
+  agent use them. `NO_PROXY` is empty, so a client that honours these
+  variables would send even loopback requests to the proxy. The app's daemon
+  client (`agent: false`, `127.0.0.1` only) connects directly and must not
+  appear.
+- Everything, whatever it honours, through the syscall trace.
+
+For each app run the check reads the page over the DevTools protocol, as
+`scripts/screenshot.ts` does: the `app://renderer` page must open with the title
+"Callsheet" and reach its daemon ("Daemon running"). The debugging port is
+`--remote-debugging-port=0` on loopback; Chromium writes the port it chose to
+the profile's `DevToolsActivePort` file. Every DevTools step gives up after 2 s
+and the whole wait after 20 s. The app is then left idle for 20 s and stopped
+with SIGTERM. Each daemon run must publish `daemon.json` and exit with status 0
+on SIGTERM; alone, it is left idle for 10 s first.
+
+The job fails if a proxy saw a request, if the trace shows a socket call beyond
+this machine, if the canary missed anything, or if a positive check failed. It
+prints each finding with its count, the phase and the process ("desktop app:
+Chromium", "desktop app: main-process Node", "cs-daemon", or the traced thread's
+name), so an app failure and a daemon failure are told apart, and writes the
+same tally to the job summary. It uploads nothing. Output with the spellchecker
+fix (`setSpellCheckerLanguages([])`) removed:
 
 ```text
-Outbound requests (every one refused with 403, none forwarded): 2
+Outbound requests at the proxies (every one refused with 403, none forwarded): 2
   FAIL  desktop app: Chromium (--proxy-server), first start: redirector.gvt1.com:443 x1
   FAIL  desktop app: Chromium (--proxy-server), restart: redirector.gvt1.com:443 x1
-desktop app: FAIL (2 outbound requests, 0 other problems)
-cs-daemon: PASS (0 outbound requests, 0 other problems)
+Socket calls beyond this machine in the syscall trace: 0
+desktop app: FAIL (2 proxied requests, 0 traced socket calls, 0 other problems)
+cs-daemon: PASS (0 proxied requests, 0 traced socket calls, 0 other problems)
+egress check: PASS (0 proxied requests, 0 traced socket calls, 0 other problems)
 ```
 
-`--allow host:port` (repeatable) reports a destination as allowed instead of
-failing. It exists for a later test that routes a user's model request to a
-provider on purpose. The idle-start check in CI passes none.
+And with a DNS lookup and an HTTPS request with its own agent added to the
+main process, neither of which uses a proxy. The UDP connections to port 0
+came from the same thread right after the lookup, to the two addresses
+`example.com` resolved to; connecting a UDP socket sends no packet, but they
+are reported with the rest:
+
+```text
+Socket calls beyond this machine in the syscall trace: 8
+  FAIL  desktop app (strace), first start: connect UDP 8.8.8.8:53 by thread "libuv-worker" (non-loopback address) x1
+  FAIL  desktop app (strace), first start: connect UDP 172.66.147.243:0 by thread "libuv-worker" (non-loopback address) x1
+  FAIL  desktop app (strace), first start: connect UDP 104.20.23.154:0 by thread "libuv-worker" (non-loopback address) x1
+  FAIL  desktop app (strace), first start: connect TCP 93.184.215.14:443 by thread "electron" (non-loopback address) x1
+  …the same four for restart…
+desktop app: FAIL (0 proxied requests, 8 traced socket calls, 0 other problems)
+```
+
+`--allow host:port` (repeatable) reports a destination at the proxies as
+allowed instead of failing. It exists for a later test that routes a user's
+model request to a provider on purpose. The idle-start check in CI passes none.
 
 **What it proves:** on Linux (`ubuntu-24.04`), during startup and 20 s of idle,
-with and without an existing profile, neither Chromium's HTTP, HTTPS and
-WebSocket requests nor Node's `fetch` and global-agent requests in the main
-process leave the app, and the idle daemon makes no request through the proxy
-variables that its HTTP client honours.
+with and without an existing profile, and against both a stand-in and the real
+daemon, no process of the app or of `cs-daemon` connects or sends to an
+address beyond this machine, looks up a name through DNS, or makes an HTTP
+request through a proxy; and the canary shows each of those backstops would
+have seen it.
 
 **What it doesn't prove:**
 
@@ -129,25 +196,22 @@ variables that its HTTP client honours.
   and Linux download Hunspell dictionaries "from a Google CDN by default",
   Electron's spellchecker guide), so they remain uncovered until a job there can
   launch the app.
-- **Traffic that isn't an HTTP request through a proxy.** Electron's
-  `--proxy-server` "only affects requests with HTTP protocol, including HTTPS and
-  WebSocket requests" (Electron 44 command-line switches). Chromium defers name
-  resolution to an HTTP proxy for the requests it sends there ("name resolution
-  is always deferred to the proxy", `net/docs/proxy.md`), but its proxy
-  documentation says nothing about DNS prefetching, WebRTC or other UDP, so a
-  DNS lookup or a UDP packet would not be seen. Chromium also never proxies
-  `localhost`, `127.0.0.1/8`, `[::1]` or link-local addresses (its implicit
-  bypass rules, unless `<-loopback>` is set), so loopback traffic isn't seen
-  either; that is intended here.
-- **Node clients that ignore the proxy variables.** A main-process request made
-  with its own agent (as the daemon client does, on purpose) or a raw socket
-  connects directly; only `fetch` and the global agent are covered. The daemon
-  leg covers what its HTTP client (reqwest with `system-proxy`) sends through
-  the variables, not a connection made another way.
+- **Traffic that no traced system call starts.** A request handed to another
+  process over D-Bus or another local socket (for example a name lookup through
+  systemd-resolved's D-Bus interface), and I/O submitted through `io_uring`,
+  make no `connect` or `send` call in the traced processes. A `send` or `write`
+  on an already connected socket isn't traced, but its `connect` is.
+- **The daemon's HTTP client.** `cs-daemon` has no outbound client today:
+  reqwest is in `cs-proxy`, which the daemon doesn't depend on yet (it will
+  from task 8). Today the daemon legs prove that its idle start and its
+  pairing with the app make no connections. Once the proxy is wired in, they
+  also cover reqwest, which honours `HTTPS_PROXY` (cs-proxy turns proxies off
+  only for a loopback upstream), and anything it connects directly shows in
+  the trace.
 - **Anything after the user acts.** The app is left idle; no button is pressed
   and no network feature is turned on.
 
-Run it locally on Linux with Xvfb, from the repository root:
+Run it locally on Linux with Xvfb and strace, from the repository root:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -159,11 +223,37 @@ xvfb-run -a -s "-screen 0 1280x800x24" node scripts/egress-check.ts
 ```
 
 Options: `--daemon-bin <path>` (default `CS_DAEMON_BIN`, then
-`target/debug/cs-daemon`), `--idle-seconds` (20), `--daemon-idle-seconds` (10)
-and `--electron-arg <switch>`. Where Chromium's sandbox can't run, such as a
-container running as root, add `--electron-arg=--no-sandbox` locally; CI never
-passes it. The proxy code has its own tests in `pnpm -r test`
-(`scripts/logging-proxy.test.ts`).
+`target/debug/cs-daemon`), `--idle-seconds` (20), `--daemon-idle-seconds` (10),
+`--electron-arg <switch>` and `--trace-as-user <user>`. Where Chromium's
+sandbox can't run, such as a container running as root, add
+`--electron-arg=--no-sandbox` locally; CI never passes it. Where Chromium uses
+the setuid sandbox, as on Ubuntu 24.04, pass `--trace-as-user "$(id -un)"`,
+which needs sudo without a password. Ctrl-C stops every process under test
+(SIGTERM, then SIGKILL; one that survives both isn't waited for) and removes
+the temporary files. The proxy and trace parsing have their own tests
+in `pnpm -r test` (`scripts/logging-proxy.test.ts`,
+`scripts/syscall-trace.test.ts`).
+
+### Why strace, and why it runs as root in CI
+
+The job keeps Chromium's sandbox on. On Ubuntu 24.04 that is the setuid
+sandbox: AppArmor restricts unprivileged user namespaces, so Chromium's
+namespace sandbox can't start, and the job makes Electron's `chrome-sandbox`
+helper root-owned with mode 4755 (Chromium's
+`docs/security/apparmor-userns-restrictions.md`, option 3). Under a tracer
+without privileges, "setuid and setgid programs are executed without effective
+privileges" (strace.1), and Chromium then aborts with "The setuid sandbox is not
+running as root". So in CI, `--trace-as-user` runs strace as root through `sudo`
+and starts each traced process as the job's user with `strace -u`, the option
+strace documents for running setuid programs correctly under tracing. Nothing
+under test runs as root. Lifting the AppArmor restriction instead would weaken
+the runner for a test, and `--no-sandbox` would test a configuration users
+don't run.
+
+A network namespace with only loopback (`unshare -n`) was the alternative. It
+would stop egress but not report it: a lookup or a connection would just fail,
+and the check would pass without saying what tried to leave. strace names the
+thread, the address and the phase.
 
 ## Windows
 
@@ -235,8 +325,9 @@ blocked.
 - No caches: every run starts from a clean install.
 - cargo-deny is the prebuilt release binary, verified against a SHA-256 pinned
   in the workflow; update the version and the hash together.
-- The egress job installs Xvfb with `apt-get install xvfb` from the runner's
-  Ubuntu archive, by package name; no third-party action. Electron 44 has no
+- The egress job uses the Xvfb already on the `ubuntu-24.04` image and installs
+  strace with `apt-get install strace` from the runner's Ubuntu archive, by
+  package name; no third-party action. Electron 44 has no
   install script (so pnpm's build-script settings and
   `ELECTRON_SKIP_BINARY_DOWNLOAD` play no part) and downloads its binary on first
   use; the job runs its `install-electron` command first, which checks the
@@ -245,7 +336,9 @@ blocked.
   Chromium's namespace sandbox can't start there and Electron aborts. The
   egress job makes Electron's `chrome-sandbox` helper root-owned with mode 4755,
   Chromium's setuid sandbox, instead of passing `--no-sandbox`: the app runs
-  sandboxed, as users run it.
+  sandboxed, as users run it. strace then runs as root through `sudo` and
+  starts the processes under test as the job's user
+  ([why](#why-strace-and-why-it-runs-as-root-in-ci)).
 
 ## Sources
 
@@ -272,5 +365,14 @@ blocked.
     sandbox helper:
     https://github.com/chromium/chromium/blob/main/docs/security/apparmor-userns-restrictions.md
     and https://github.com/chromium/chromium/blob/main/docs/linux/suid_sandbox_development.md
-  - Node 24 built-in proxy support (`NODE_USE_ENV_PROXY`, global agent only):
+  - Node 24 built-in proxy support (`NODE_USE_ENV_PROXY`, global agent only,
+    "Stability: 1.1 - Active development"):
     https://github.com/nodejs/node/blob/v24.x/doc/api/http.md#built-in-proxy-support
+  - Xvfb on the runner image (`xvfb` in the apt package list; strace isn't):
+    https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+  - strace 6.8 (`-f`, `-s`, `-yy`, `-Y`, `-u`, `-I`, exit status, setuid
+    programs under tracing):
+    https://github.com/strace/strace/blob/v6.8/doc/strace.1.in
+  - sudo (`--preserve-env`, `--non-interactive`, exit status):
+    https://github.com/sudo-project/sudo/blob/main/docs/sudo.man.in
+  - `.invalid` (RFC 6761) and TEST-NET-1 (RFC 5737) for the canary's targets.

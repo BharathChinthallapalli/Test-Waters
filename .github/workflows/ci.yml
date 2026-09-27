@@ -146,9 +146,12 @@ jobs:
       - run: pnpm -C packages/api-types test:integration
 
   # Nothing leaves the machine by default (PRIVACY.md, issue #56): the built
-  # desktop app (fresh profile, then a restart) and cs-daemon start behind
-  # logging proxies that refuse every request, and any request fails the job.
-  # See docs/ci.md for what this does and doesn't cover.
+  # desktop app (fresh profile, then a restart against the real daemon) and
+  # cs-daemon start behind logging proxies that refuse every request, and
+  # under strace, which records every socket they connect or send to. Any
+  # request, or any socket call beyond this machine, fails the job; a canary
+  # first proves both backstops see traffic. See docs/ci.md for what this does
+  # and doesn't cover.
   egress:
     name: Desktop makes no outbound requests
     runs-on: ubuntu-24.04
@@ -167,10 +170,11 @@ jobs:
         with:
           node-version-file: .node-version
           package-manager-cache: false
-      - name: Install Xvfb
+      # Xvfb is on the ubuntu-24.04 image already; strace isn't.
+      - name: Install strace
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends xvfb
+          sudo apt-get install --yes --no-install-recommends strace
       - run: pnpm install --frozen-lockfile
       # Electron 44 has no install script: its binary is downloaded on first
       # use. Download it here, checked against the checksums in the electron
@@ -191,9 +195,15 @@ jobs:
           sudo chmod 4755 "$helper"
       - run: pnpm -C apps/desktop build
       - run: cargo build -p cs-daemon --locked
-      - name: Start the app and the daemon behind logging proxies
+      # Under an unprivileged tracer the setuid helper runs without root and
+      # Chromium aborts, so strace runs as root through sudo and starts each
+      # traced process as this user (`strace -u`); nothing under test runs as
+      # root. The check also writes its tally to the job summary.
+      - name: Start the app and the daemon behind logging proxies, under strace
         working-directory: apps/desktop
-        run: xvfb-run -a -s "-screen 0 1280x800x24" node scripts/egress-check.ts
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" \
+            node scripts/egress-check.ts --trace-as-user "$(id -un)"
 
   ci-passed:
     name: CI passed
