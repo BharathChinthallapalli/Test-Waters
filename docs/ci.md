@@ -81,11 +81,12 @@ what they try to reach. `apps/desktop/scripts/egress-check.ts`:
    `NO_PROXY` is empty, so a client that honours these variables would send
    even loopback requests to the proxy. The app's daemon client (`agent: false`,
    `127.0.0.1` only) connects directly and must not appear.
-4. For each run, checks over the DevTools protocol (`--remote-debugging-port=0`
-   on loopback; the port comes from the profile's `DevToolsActivePort` file, as
-   in `scripts/screenshot.ts`) that the `app://renderer` page opened with the
-   title "Callsheet" and reached the daemon ("Daemon running"). It then leaves
-   the app idle for 20 s and stops it with SIGTERM.
+4. For each run, checks over the DevTools protocol, as `scripts/screenshot.ts`
+   does, that the `app://renderer` page opened with the title "Callsheet" and
+   reached the daemon ("Daemon running"). The debugging port is
+   `--remote-debugging-port=0` on loopback; Chromium writes the port it chose
+   to the profile's `DevToolsActivePort` file. It then leaves the app idle for
+   20 s and stops it with SIGTERM.
 5. Starts `cs-daemon` alone with a temporary `--data-dir` and the proxy
    variables pointing at the third proxy, checks that it publishes
    `daemon.json`, leaves it idle for 10 s and checks that SIGTERM stops it with
