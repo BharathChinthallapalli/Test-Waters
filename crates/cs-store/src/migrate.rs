@@ -200,9 +200,20 @@ pub fn remove_migration_backups_except(data_dir: &Path, keep: Option<&OsStr>) ->
         if keep == Some(entry.file_name().as_os_str()) {
             Ok(false)
         } else {
-            fs::remove_file(entry.path()).map(|()| true)
+            remove_backup(&entry.path())
         }
     })
+}
+
+/// Deletes one backup and returns `true`. A backup that is already gone counts
+/// as removed: startup's cleanup after verifying and an erasure retry at the
+/// same open can race for it.
+fn remove_backup(path: &Path) -> io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// How many files [`remove_migration_backups`] would delete now. For the
@@ -588,6 +599,22 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 1);
         assert!(conn.prepare("SELECT * FROM half").is_err());
         assert!(backup_path(dir.path(), 1).exists());
+    }
+
+    /// Startup's post-verify cleanup and an erasure retry can race for the
+    /// same backup; whichever loses must not report a failure.
+    #[test]
+    fn a_backup_already_gone_counts_as_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = backup_path(dir.path(), 1);
+        fs::write(&backup, b"").unwrap();
+
+        assert!(remove_backup(&backup).unwrap());
+        assert!(!backup.exists());
+        assert!(remove_backup(&backup).unwrap(), "already gone");
+        let blocked = dir.path().join("backup-v2.db");
+        fs::create_dir(&blocked).unwrap();
+        assert!(remove_backup(&blocked).is_err(), "other errors still fail");
     }
 
     #[test]

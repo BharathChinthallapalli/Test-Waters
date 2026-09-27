@@ -8,10 +8,11 @@
 //! # Plan (dry run, R6.1)
 //! [`plan_in`] reads, for one run: the distinct content addresses its events
 //! refer to (`event_content`), the other runs whose events refer to any of them,
-//! and how many of those addresses still have a blob. The plan ID is
-//! `hex(SHA-256(canonical_json({"addresses", "runId", "sharedWithRuns"})))` with
-//! both lists sorted (byte order, the same as SQLite's `BINARY` collation), so the
-//! same state always gives the same ID. A dry run changes nothing.
+//! and how many of those addresses still have a blob (`contentItems`). The plan
+//! ID is
+//! `hex(SHA-256(canonical_json({"addresses", "contentItems", "runId", "sharedWithRuns"})))`
+//! with both lists sorted (byte order, the same as SQLite's `BINARY` collation),
+//! so the same state always gives the same ID. A dry run changes nothing.
 //!
 //! # Erase (R6.2–R6.4)
 //! One command on the writer thread, so no append can interleave:
@@ -21,7 +22,7 @@
 //!    [`EraseError::PlanOutOfDate`] if its ID differs from the confirmed one (a
 //!    new event may have made another run share the content since the plan);
 //! 3. in one transaction: delete the blobs (`secure_delete=ON` overwrites them),
-//!    append a [`CONTENT_ERASED_KIND`] event to the run whose body is exactly
+//!    if any were deleted append a [`CONTENT_ERASED_KIND`] event to the run whose body is exactly
 //!    `{"addresses": [...], "affectedRuns": [...], "planId": "<hex>"}` (both lists
 //!    sorted, `affectedRuns` being the other runs) and no content, and set the
 //!    setting [`ERASURE_PENDING_SETTING`] to `"1"`;
@@ -40,24 +41,25 @@
 //! needs it until the migrated database has verified. A new erasure removes it
 //! too, since it may hold that erasure's content.
 //!
-//! **Plan IDs name addresses, not blobs.** Once erased, a run's addresses stay in
-//! `event_content`, so its plan (and plan ID) stays the same. Confirming the
-//! same plan ID again erases the same addresses again, including a blob that a
-//! later event stored anew with the same content; it never erases content the
-//! user wasn't shown, because an address identifies exactly one content.
+//! **Plan IDs include `contentItems`.** Once erased, a run's addresses stay in
+//! `event_content` but its `contentItems` drops to 0, so replaying a used plan
+//! ID is refused as out of date. So is a plan that showed 0 items after a later
+//! event stored one of its contents anew: erase never deletes more blobs than
+//! the confirmed plan showed.
 //!
 //! **Verification contract (shared with unit `verify`):** a missing blob counts
 //! as erased if any later `content.erased` event, in any run, lists its address.
 //! Events of the other runs are therefore covered by the erased run's event.
 //!
-//! **A run without content** is a valid erase: its plan lists no addresses, and
-//! erasing deletes nothing and appends no event (there is nothing to record),
-//! but still truncates the WAL and removes backups, as the plan's
-//! `backupsToRemove` said. It reports `erasedItems: 0`.
+//! **Nothing to delete** (a run without content, or an erased run confirmed
+//! again with a fresh plan) is a valid erase: it deletes nothing and appends no
+//! event, since there is nothing to record (a blob delete and its event always
+//! commit together), but it still truncates the WAL and removes backups, as the
+//! plan's `backupsToRemove` said. It reports `erasedItems: 0`.
 //!
-//! **Erasing again** is allowed: the plan lists the same addresses, with
-//! `contentItems` counting only blobs that came back (new events with the same
-//! content). It appends another `content.erased` event.
+//! **Erasing again** with a fresh plan is allowed: `contentItems` counts only
+//! blobs that came back (new events with the same content), and erasing them
+//! appends another `content.erased` event.
 //!
 //! Checkpoint semantics from the SQLite 3.53.2 source bundled by
 //! `libsqlite3-sys` 0.38.2 (`sqlite3/sqlite3.c`): `walCheckpoint` truncates the
@@ -111,12 +113,14 @@ pub(crate) struct ErasePlan {
 }
 
 impl ErasePlan {
-    /// `hex(SHA-256(canonical_json({"addresses", "runId", "sharedWithRuns"})))`.
+    /// `hex(SHA-256(canonical_json({"addresses", "contentItems", "runId",
+    /// "sharedWithRuns"})))`.
     pub(crate) fn plan_id(&self) -> Result<String, StoreError> {
         let identity = json!({
             "runId": self.run_id,
             "addresses": self.addresses,
             "sharedWithRuns": self.shared_with_runs,
+            "contentItems": self.content_items,
         });
         let canonical = canonical_json(&identity)
             .map_err(|error| StoreError::Hash(EventHashError::Canonicalization(error)))?;
@@ -541,6 +545,40 @@ mod tests {
             .count()
     }
 
+    /// Content no other data contains: 64 random bytes, in hex.
+    fn marker() -> String {
+        let mut random = [0u8; 64];
+        getrandom::fill(&mut random).unwrap();
+        format!("callsheet-erase-marker-{}", hex::encode(random))
+    }
+
+    /// How often `marker` occurs in the file `name` of `dir` (0 if it's absent).
+    fn marker_count(dir: &Path, name: &str, marker: &str) -> usize {
+        fs::read(dir.join(name))
+            .map(|bytes| occurrences(&bytes, marker.as_bytes()))
+            .unwrap_or(0)
+    }
+
+    /// Searches every file in `dir` for `marker`, printing each count after
+    /// `label`, and asserts it is in none. Returns the file names searched.
+    fn assert_marker_in_no_file(dir: &Path, marker: &str, label: &str) -> Vec<String> {
+        let mut searched = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file(), "only files here");
+            let bytes = fs::read(entry.path()).unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let found = occurrences(&bytes, marker.as_bytes());
+            println!(
+                "{label}: {name} ({} bytes): marker found {found} times",
+                bytes.len()
+            );
+            assert_eq!(found, 0, "erased content found in {name}");
+            searched.push(name);
+        }
+        searched
+    }
+
     /// A `VACUUM INTO` copy of the database, as a migration backup would be.
     fn backup_copy(dir: &Path, name: &str) {
         let conn = Connection::open_with_flags(
@@ -578,7 +616,7 @@ mod tests {
         // Pinned: sorted lists, canonical JSON (keys sorted), SHA-256, hex.
         let addresses = sorted(vec![address(b"alpha"), address(b"beta")]);
         let expected = format!(
-            r#"{{"addresses":["{}","{}"],"runId":"a","sharedWithRuns":["b"]}}"#,
+            r#"{{"addresses":["{}","{}"],"contentItems":2,"runId":"a","sharedWithRuns":["b"]}}"#,
             addresses[0], addresses[1]
         );
         assert_eq!(a.plan_id, hex::encode(Sha256::digest(expected.as_bytes())));
@@ -752,7 +790,71 @@ mod tests {
         assert!(!store.erasure_pending());
         assert!(!pending_setting(&store).await);
         let again = store.erase_plan("a").await.unwrap();
-        assert_eq!((again.content_items, again.plan_id), (0, plan.plan_id));
+        assert_eq!(again.content_items, 0);
+        assert_ne!(again.plan_id, plan.plan_id, "contentItems is in the ID");
+    }
+
+    /// A used plan ID can't be confirmed again, and a fresh plan of an erased
+    /// run deletes nothing and records nothing.
+    #[tokio::test]
+    async fn replaying_a_used_plan_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path()).await;
+        seed(&store).await;
+        let plan = store.erase_plan("a").await.unwrap();
+        store.erase("a", &plan.plan_id).await.unwrap();
+        let after_erase = (events(&store).await, blob_addresses(&store).await);
+
+        let replay = store.erase("a", &plan.plan_id).await;
+
+        assert!(
+            matches!(replay, Err(EraseError::PlanOutOfDate)),
+            "{replay:?}"
+        );
+        assert_eq!(
+            (events(&store).await, blob_addresses(&store).await),
+            after_erase,
+            "no new event"
+        );
+
+        let fresh = store.erase_plan("a").await.unwrap();
+        let erased = store.erase("a", &fresh.plan_id).await.unwrap();
+        assert_eq!(erased.erased_items, 0);
+        assert_eq!(
+            (events(&store).await, blob_addresses(&store).await),
+            after_erase,
+            "nothing deleted, nothing recorded"
+        );
+    }
+
+    /// A plan that showed no content can't erase content stored after it.
+    #[tokio::test]
+    async fn a_plan_showing_nothing_is_refused_once_content_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path()).await;
+        seed(&store).await;
+        let first = store.erase_plan("a").await.unwrap();
+        store.erase("a", &first.plan_id).await.unwrap();
+        let empty = store.erase_plan("a").await.unwrap();
+        assert_eq!(empty.content_items, 0);
+
+        // Same addresses, same sharing runs: only the blob count changes.
+        append(&store, "a", 6, &[b"alpha"]).await;
+        let before = (events(&store).await, blob_addresses(&store).await);
+        assert!(before.1.contains(&address(b"alpha")));
+
+        let refused = store.erase("a", &empty.plan_id).await;
+
+        assert!(
+            matches!(refused, Err(EraseError::PlanOutOfDate)),
+            "{refused:?}"
+        );
+        assert_eq!((events(&store).await, blob_addresses(&store).await), before);
+        let fresh = store.erase_plan("a").await.unwrap();
+        assert_eq!(
+            (&fresh.shared_with_runs, fresh.content_items),
+            (&empty.shared_with_runs, 1)
+        );
     }
 
     #[tokio::test]
@@ -777,9 +879,7 @@ mod tests {
     async fn erased_bytes_are_in_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = open(dir.path()).await;
-        let mut random = [0u8; 64];
-        getrandom::fill(&mut random).unwrap();
-        let marker = format!("callsheet-erase-marker-{}", hex::encode(random));
+        let marker = marker();
         // Large enough for overflow pages, plus a small one in a later event.
         let large = marker.repeat(200);
         let small = format!("second:{marker}");
@@ -799,14 +899,8 @@ mod tests {
         append(&store, "b", 4, &[small.as_bytes()]).await;
         backup_copy(dir.path(), "backup-v0.db");
 
-        let needle = marker.as_bytes();
-        let count_in = |name: &str| {
-            fs::read(dir.path().join(name))
-                .map(|bytes| occurrences(&bytes, needle))
-                .unwrap_or(0)
-        };
         for name in [DATABASE_FILE_NAME, "callsheet.db-wal", "backup-v0.db"] {
-            let found = count_in(name);
+            let found = marker_count(dir.path(), name, &marker);
             println!("byte search before erasing: {name}: marker found {found} times");
             assert!(found > 0, "the search finds the copy in {name}");
         }
@@ -819,20 +913,7 @@ mod tests {
         assert_eq!(erased.backups_removed, 1);
         assert_eq!(blob_addresses(&store).await, [address(b"unrelated")]);
 
-        let mut searched = Vec::new();
-        for entry in fs::read_dir(dir.path()).unwrap() {
-            let entry = entry.unwrap();
-            assert!(entry.file_type().unwrap().is_file(), "only files here");
-            let bytes = fs::read(entry.path()).unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let found = occurrences(&bytes, needle);
-            println!(
-                "byte search: {name} ({} bytes): marker found {found} times",
-                bytes.len()
-            );
-            assert_eq!(found, 0, "erased content found in {name}");
-            searched.push(name);
-        }
+        let searched = assert_marker_in_no_file(dir.path(), &marker, "byte search");
         assert!(searched.iter().any(|name| name == DATABASE_FILE_NAME));
         assert!(!searched.iter().any(|name| name.starts_with("backup-v")));
     }
@@ -913,7 +994,10 @@ mod tests {
         };
         let store = open_removing(dir.path(), remover, Duration::from_millis(50)).await;
         seed(&store).await;
+        let marker = marker();
+        append(&store, "a", 6, &[marker.as_bytes()]).await;
         backup_copy(dir.path(), "backup-v0.db");
+        assert!(marker_count(dir.path(), "backup-v0.db", &marker) > 0);
         let plan = store.erase_plan("a").await.unwrap();
 
         let outcome = store.erase("a", &plan.plan_id).await;
@@ -937,6 +1021,7 @@ mod tests {
         .await;
         assert!(!pending_setting(&store).await);
         assert!(!dir.path().join("backup-v0.db").exists());
+        assert_marker_in_no_file(dir.path(), &marker, "byte search after a retry");
     }
 
     /// A retry leaves the backup this open's migration made (it holds no
@@ -977,10 +1062,13 @@ mod tests {
         let failing: BackupRemover =
             Arc::new(|_: &Path, _: Option<&OsStr>| Err(io::Error::other("stuck")));
         let hour = Duration::from_secs(3600);
+        let marker = marker();
         {
             let store = open_removing(dir.path(), failing, hour).await;
             seed(&store).await;
+            append(&store, "a", 6, &[marker.as_bytes()]).await;
             backup_copy(dir.path(), "backup-v0.db");
+            assert!(marker_count(dir.path(), "backup-v0.db", &marker) > 0);
             let plan = store.erase_plan("a").await.unwrap();
             assert!(matches!(
                 store.erase("a", &plan.plan_id).await,
@@ -997,5 +1085,6 @@ mod tests {
         .await;
         assert!(!pending_setting(&store).await);
         assert!(!dir.path().join("backup-v0.db").exists());
+        assert_marker_in_no_file(dir.path(), &marker, "byte search after the retry at open");
     }
 }

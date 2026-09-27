@@ -86,8 +86,8 @@
 //! One read-only connection behind a `std::sync::Mutex` serves every read, so
 //! reads run one at a time on a blocking thread. [`Store::read`] holds the read
 //! gate (`tokio::sync::RwLock`) shared for the whole SQLite read transaction;
-//! [`Store::exclude_readers`] takes it exclusively, which waits for open reads to
-//! finish and holds new ones back.
+//! erasure takes it exclusively, which waits for open reads to finish and holds
+//! new ones back.
 //!
 //! # Erasure (R6)
 //! [`Store::erase_plan`] is a read; [`Store::erase`] is one writer command that
@@ -109,7 +109,7 @@ use cs_core::control::{ErasePlanResult, EraseResult};
 use cs_core::event::{self, BodyError, EventHashError, HashedEvent, MAX_SAFE_INTEGER, ZERO_HASH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::content::{self, ContentKey};
 use crate::db::{self, OpenError};
@@ -574,8 +574,10 @@ impl Store {
     /// While the guard is held, [`Store::read`] (and everything built on it,
     /// such as [`Store::blob_count`]) waits for it, so calling one from the
     /// holder deadlocks. So does [`Store::erase`], whose writer command takes
-    /// the gate itself: never hold this guard across an erase.
-    pub async fn exclude_readers(&self) -> OwnedRwLockWriteGuard<()> {
+    /// the gate itself: never hold this guard across an erase. That is why it
+    /// exists for tests only; erasure takes the gate on the writer thread.
+    #[cfg(test)]
+    pub(crate) async fn exclude_readers(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.gate).write_owned().await
     }
 
@@ -1125,7 +1127,9 @@ impl WriterState {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let erased_items = erase::delete_blobs(&tx, &plan.addresses)?;
-        if !plan.addresses.is_empty() {
+        // Nothing deleted, nothing to record: a blob delete and its event
+        // always commit together, so verification never misses one.
+        if erased_items > 0 {
             // Built directly rather than through `ValidEvent::new`: the body is
             // ours, has no numbers and no `content`, and must not be refused
             // for size, or a run with many addresses could never be erased.
