@@ -7,13 +7,88 @@
       content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>Callsheet</title>
     <link rel="stylesheet" href="style.css" />
+    <script type="module" src="app.js"></script>
   </head>
   <body>
-    <main>
-      <h1>Callsheet</h1>
-      <p>Desktop shell. Nothing is connected yet.</p>
+    <main class="pane" aria-labelledby="headline">
+      <header class="status">
+        <span class="mark" id="mark" data-tone="pending" aria-hidden="true">
+          <svg class="mark-icon mark-ok" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" class="mark-fill" />
+            <path d="M7.5 12.4l3 3 6-6.3" class="mark-glyph-stroke" />
+          </svg>
+          <svg class="mark-icon mark-off" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.75" class="mark-ring" />
+          </svg>
+          <svg
+            class="mark-icon mark-pending"
+            viewBox="0 0 24 24"
+            focusable="false"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="8.75" class="mark-track" />
+            <path d="M12 3.25a8.75 8.75 0 0 1 8.75 8.75" class="mark-arc" />
+          </svg>
+          <svg
+            class="mark-icon mark-warning"
+            viewBox="0 0 24 24"
+            focusable="false"
+            aria-hidden="true"
+          >
+            <path
+              d="M10.3 3.4a2 2 0 0 1 3.4 0l8.1 14.1a2 2 0 0 1-1.7 3H3.9a2 2 0 0 1-1.7-3z"
+              class="mark-fill"
+            />
+            <path d="M12 8.6v5" class="mark-glyph-stroke" />
+            <circle cx="12" cy="16.9" r="1.15" class="mark-glyph-fill" />
+          </svg>
+          <svg
+            class="mark-icon mark-danger"
+            viewBox="0 0 24 24"
+            focusable="false"
+            aria-hidden="true"
+          >
+            <path
+              d="M8.1 2.6h7.8l5.5 5.5v7.8l-5.5 5.5H8.1l-5.5-5.5V8.1z"
+              class="mark-fill"
+            />
+            <path d="M12 7.4v5.6" class="mark-glyph-stroke" />
+            <circle cx="12" cy="16.4" r="1.15" class="mark-glyph-fill" />
+          </svg>
+        </span>
+        <div class="status-text" role="status" aria-live="polite">
+          <h1 id="headline" class="headline">Checking for the daemon</h1>
+          <p id="message" class="message">This usually takes less than a second.</p>
+        </div>
+      </header>
+
+      <section id="notice" class="notice" hidden>
+        <h2 id="notice-title" class="notice-title">Notice</h2>
+        <p id="notice-text" class="notice-text"></p>
+      </section>
+
+      <section id="next-step" class="next-step" aria-label="What to do next" hidden>
+        <p id="next-step-text" class="next-step-text"></p>
+        <div id="command-row" class="command-row" hidden>
+          <code id="command" class="command"></code>
+          <button id="copy" class="button" type="button">Copy</button>
+        </div>
+        <p id="next-step-after" class="next-step-after" hidden></p>
+      </section>
+
+      <dl id="details" class="details" aria-label="Daemon details" hidden></dl>
+
+      <p id="aside" class="aside" hidden>
+        <strong id="aside-title" class="aside-title">Note</strong>
+        <span id="aside-text"></span>
+      </p>
+
+      <footer class="footer">
+        <p id="checked" class="checked">&nbsp;</p>
+      </footer>
     </main>
   </body>
 </html>

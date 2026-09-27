@@ -3,12 +3,10 @@
   "compilerOptions": {
     "noEmit": false,
     "rootDir": "src",
-    "outDir": "dist"
+    "outDir": "dist",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": []
   },
-  "include": [
-    "src/main/**/*.ts",
-    "src/preload/**/*.ts",
-    "src/preload/**/*.cts"
-  ],
+  "include": ["src/renderer/**/*.ts"],
   "exclude": ["src/**/*.test.ts"]
 }

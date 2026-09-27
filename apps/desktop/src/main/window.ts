@@ -10,6 +10,11 @@ export function createWindowOptions(
   return {
     width: 1100,
     height: 720,
+    // The status screen's narrow layout starts below 560 px; smaller than this
+    // it would have to clip or scroll sideways.
+    minWidth: 420,
+    minHeight: 480,
+    title: "Callsheet",
     show: false,
     webPreferences: {
       preload: preloadPath,

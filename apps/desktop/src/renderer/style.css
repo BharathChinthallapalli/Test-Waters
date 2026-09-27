@@ -1,15 +1,460 @@
+/*
+ * Callsheet status screen. Standards: .kiro/steering/ui.md.
+ * Colours are semantic tokens; style.test.ts checks their WCAG contrast in both
+ * themes, so change a value there and here together.
+ */
+
+/* Tokens: light theme (default) */
 :root {
   color-scheme: light dark;
-  font-family: system-ui, sans-serif;
+
+  --font-ui:
+    system-ui, -apple-system, "Segoe UI", "Noto Sans", Ubuntu, Cantarell,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas,
+    "Liberation Mono", "DejaVu Sans Mono", monospace;
+
+  /* Type scale: size / line height */
+  --text-caption: 12px;
+  --leading-caption: 16px;
+  --text-body: 13px;
+  --leading-body: 20px;
+  --text-title: 20px;
+  --leading-title: 28px;
+
+  /* Spacing scale: 4 px base */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --radius-s: 6px;
+  --radius-m: 8px;
+  --radius-l: 10px;
+
+  --color-bg: #f5f5f7;
+  --color-surface: #ffffff;
+  --color-border: #dddde3;
+  --color-text: #1a1a1e;
+  --color-text-secondary: #54545e;
+  --color-text-tertiary: #686872;
+  --color-code-bg: #f0f0f3;
+  --color-focus: #0a5fd1;
+  --color-button: #ffffff;
+  --color-button-hover: #f0f0f3;
+  --color-button-border: #c4c4cc;
+
+  --color-ok: #177a3c;
+  --color-ok-subtle: #e4f3e8;
+  --color-off: #686872;
+  --color-off-subtle: #ececf0;
+  --color-pending: #0a5fd1;
+  --color-pending-subtle: #e4eefc;
+  --color-warning: #945800;
+  --color-warning-subtle: #fbf1dc;
+  --color-danger: #c0262d;
+  --color-danger-subtle: #fbe9e9;
+  --color-info: #0a5fd1;
+  --color-info-subtle: #eaf1fc;
+  --color-on-mark: #ffffff;
+}
+
+/* Tokens: dark theme */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #151518;
+    --color-surface: #1d1d21;
+    --color-border: #303036;
+    --color-text: #ececf0;
+    --color-text-secondary: #a9a9b3;
+    --color-text-tertiary: #92929c;
+    --color-code-bg: #26262b;
+    --color-focus: #6aa6ff;
+    --color-button: #26262b;
+    --color-button-hover: #303036;
+    --color-button-border: #45454d;
+
+    --color-ok: #4cc26e;
+    --color-ok-subtle: #16301f;
+    --color-off: #92929c;
+    --color-off-subtle: #26262b;
+    --color-pending: #6aa6ff;
+    --color-pending-subtle: #172a45;
+    --color-warning: #e6a93f;
+    --color-warning-subtle: #36280f;
+    --color-danger: #ff7b72;
+    --color-danger-subtle: #3d1b1c;
+    --color-info: #6aa6ff;
+    --color-info-subtle: #182638;
+    --color-on-mark: #151518;
+  }
+}
+
+/* Base */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--color-bg);
 }
 
 body {
   margin: 0;
-  display: grid;
   min-height: 100vh;
-  place-items: center;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
 }
 
-main {
-  text-align: center;
+h1,
+h2,
+p,
+dl,
+dd {
+  margin: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+/* `hidden` must win over the display these blocks set below. */
+.notice[hidden],
+.aside[hidden],
+.next-step[hidden],
+.command-row[hidden] {
+  display: none;
+}
+
+/* Layout */
+.pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  max-width: 600px;
+  margin: 0 auto;
+  padding: var(--space-7) var(--space-6);
+}
+
+/* Status: mark, headline and message */
+/* The header band has a fixed height (see .status-text), so what follows never
+   moves between states; the hairline makes its space part of the layout. */
+.status {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.status-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  /* One title line plus two message lines, so the block below never jumps. */
+  min-height: calc(
+    var(--leading-title) +
+    var(--space-1) +
+    2 *
+    var(--leading-body)
+  );
+  min-width: 0;
+}
+
+.headline {
+  font-size: var(--text-title);
+  line-height: var(--leading-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.message {
+  color: var(--color-text-secondary);
+}
+
+.mark {
+  --tone: var(--color-pending);
+  --tone-subtle: var(--color-pending-subtle);
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-l);
+  background: var(--tone-subtle);
+  color: var(--tone);
+}
+
+.mark[data-tone="ok"] {
+  --tone: var(--color-ok);
+  --tone-subtle: var(--color-ok-subtle);
+}
+
+.mark[data-tone="off"] {
+  --tone: var(--color-off);
+  --tone-subtle: var(--color-off-subtle);
+}
+
+.mark[data-tone="warning"] {
+  --tone: var(--color-warning);
+  --tone-subtle: var(--color-warning-subtle);
+}
+
+.mark[data-tone="danger"] {
+  --tone: var(--color-danger);
+  --tone-subtle: var(--color-danger-subtle);
+}
+
+.mark-icon {
+  display: none;
+  width: 22px;
+  height: 22px;
+}
+
+.mark[data-tone="ok"] .mark-ok,
+.mark[data-tone="off"] .mark-off,
+.mark[data-tone="pending"] .mark-pending,
+.mark[data-tone="warning"] .mark-warning,
+.mark[data-tone="danger"] .mark-danger {
+  display: block;
+}
+
+.mark-fill {
+  fill: currentColor;
+}
+
+.mark-glyph-fill {
+  fill: var(--color-on-mark);
+}
+
+.mark-glyph-stroke {
+  fill: none;
+  stroke: var(--color-on-mark);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.mark-ring,
+.mark-track,
+.mark-arc {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+}
+
+.mark-track {
+  opacity: 0.25;
+}
+
+.mark-arc {
+  stroke-linecap: round;
+  transform-origin: 12px 12px;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mark-arc {
+    animation: none;
+  }
+}
+
+/* Warning callout, above the details */
+.notice {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 40%, transparent);
+  border-radius: var(--radius-m);
+  background: var(--color-warning-subtle);
+}
+
+.notice-title,
+.aside-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  font-weight: 600;
+}
+
+/* A shape as well as a colour: a triangle for a warning, a circled "i" for a note. */
+.notice-title::before,
+.aside-title::before {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--color-on-mark);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.notice-title::before {
+  content: "!";
+  padding-top: 3px;
+  background: var(--color-warning);
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+
+.aside-title::before {
+  content: "i";
+  border-radius: 50%;
+  background: var(--color-info);
+}
+
+.notice-text {
+  color: var(--color-text);
+}
+
+/* Information about the details: a quiet caption below them */
+.aside {
+  display: grid;
+  gap: 2px;
+  margin-top: calc(-1 * var(--space-2));
+  color: var(--color-text-secondary);
+}
+
+.aside-title {
+  color: var(--color-text);
+}
+
+/* Next step */
+.next-step {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.next-step-after {
+  color: var(--color-text-secondary);
+}
+
+.command-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.command {
+  flex: 1;
+  min-width: 0;
+  padding: 6px var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-s);
+  background: var(--color-code-bg);
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  overflow-wrap: anywhere;
+  user-select: all;
+  cursor: text;
+}
+
+.button {
+  flex: none;
+  /* As tall as one line of .command, and wide enough for "Copied". */
+  height: calc(var(--leading-body) + 14px);
+  min-width: 72px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-button-border);
+  border-radius: var(--radius-s);
+  background: var(--color-button);
+  color: var(--color-text);
+  font: inherit;
+  font-weight: 500;
+  cursor: default;
+}
+
+.button:hover {
+  background: var(--color-button-hover);
+}
+
+.button:active {
+  background: var(--color-border);
+}
+
+/* Details: aligned label–value rows */
+.details {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-m);
+  background: var(--color-surface);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+}
+
+.row + .row {
+  border-top: 1px solid var(--color-border);
+}
+
+.row dt {
+  color: var(--color-text-secondary);
+}
+
+.row dd {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.value {
+  overflow-wrap: anywhere;
+}
+
+.value.mono {
+  font-family: var(--font-mono);
+}
+
+.value.muted {
+  color: var(--color-text-tertiary);
+}
+
+.note {
+  color: var(--color-text-secondary);
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+}
+
+/* Footer */
+.footer {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+}
+
+/* Narrow windows, down to the 420 px minimum: tighter margins and labels */
+@media (max-width: 520px) {
+  .pane {
+    padding: var(--space-5) var(--space-4);
+  }
+
+  .row {
+    grid-template-columns: 116px minmax(0, 1fr);
+    gap: var(--space-3);
+  }
 }
