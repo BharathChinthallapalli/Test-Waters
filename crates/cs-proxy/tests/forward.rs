@@ -1014,3 +1014,81 @@ async fn a_path_the_url_parser_would_change_is_refused() {
     assert_eq!(head.status, 200);
     assert_eq!(upstream.received()[0].target, "/v1/models?after_id=%27a%27");
 }
+
+// ------------------------------------------------------------ requested model
+
+/// A mock answering every request with `status` and this JSON body.
+async fn json_upstream(status: u16, body: &'static [u8]) -> MockUpstream {
+    MockUpstream::start(move |_| {
+        let length = body.len().to_string();
+        response(
+            status,
+            &[
+                ("content-type", "application/json"),
+                ("content-length", &length),
+            ],
+            full(body),
+        )
+    })
+    .await
+}
+
+const JSON: &[(&str, &str)] = &[("content-type", "application/json")];
+
+#[tokio::test]
+async fn a_refused_call_records_the_requested_model() {
+    let upstream = json_upstream(
+        401,
+        br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    )
+    .await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let body = br#"{"model":"claude-requested","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let request = request_bytes("POST", "/v1/messages", &proxy.host(), JSON, body);
+    let (head, _) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 401);
+
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.status, 401);
+    assert_eq!(record.outcome, CallOutcome::UpstreamError);
+    assert_eq!(record.error_type.as_deref(), Some("authentication_error"));
+    assert_eq!(record.model.as_deref(), Some("claude-requested"));
+}
+
+#[tokio::test]
+async fn the_model_that_served_the_call_wins_over_the_requested_one() {
+    let upstream = json_upstream(
+        200,
+        br#"{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-served","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#,
+    )
+    .await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let body = br#"{"model":"claude-requested","max_tokens":1,"messages":[]}"#;
+    let request = request_bytes("POST", "/v1/messages", &proxy.host(), JSON, body);
+    let (head, _) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 200);
+
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.outcome, CallOutcome::Completed);
+    assert_eq!(record.model.as_deref(), Some("claude-served"));
+}
+
+#[tokio::test]
+async fn a_malformed_request_body_records_no_model_and_is_forwarded_unchanged() {
+    let upstream = json_upstream(
+        400,
+        br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad json"}}"#,
+    )
+    .await;
+    let proxy = TestProxy::start(&upstream.base(), false).await;
+    let body = br#"{"model": "claude-requested", "messages": [ "#;
+    let request = request_bytes("POST", "/v1/messages", &proxy.host(), JSON, body);
+    let (head, _) = RawClient::exchange(proxy.addr, &request).await;
+    assert_eq!(head.status, 400);
+    assert_eq!(&upstream.received()[0].body[..], &body[..]);
+
+    let record = &proxy.sink.wait_for(1).await[0].record;
+    assert_eq!(record.outcome, CallOutcome::UpstreamError);
+    assert_eq!(record.model, None);
+    assert_eq!(record.request_bytes, body.len() as u64);
+}

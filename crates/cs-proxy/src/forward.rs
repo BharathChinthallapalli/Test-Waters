@@ -9,6 +9,14 @@
 //! [`crate::CallSink`]. Requests whose path doesn't start with `/v1/` are
 //! forwarded but not recorded.
 //!
+//! The recorded `model` is the one that served the call when the response
+//! names it (the observer's), otherwise the one requested: the request body's
+//! top-level `"model"` string, read only from a `/v1/` `POST` with a JSON
+//! content type, at most [`MAX_MODEL_BYTES`], and `None` on any parse failure.
+//! That covers calls the provider refused (a 401, a 429) before naming a model.
+//! Nothing else is read or kept from the request body, and the body is
+//! forwarded as it came.
+//!
 //! The request is forwarded to the upstream base URL plus the request's path
 //! and query. The `url` crate reqwest takes percent-encodes a few characters
 //! hyper accepts (`'` in a query; `"`, `{`, `}` and non-ASCII in a path), so
@@ -74,11 +82,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use cs_core::llm::{CallOutcome, LlmCallRecord};
 use cs_store::writer::{MAX_CONTENT_BYTES, MAX_CONTENT_ITEMS};
-use http::header::{CONTENT_LENGTH, HOST, ORIGIN, USER_AGENT};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, USER_AGENT};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use crate::headers;
 use crate::observe::{Observed, ResponseObserver};
@@ -94,6 +104,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest `userAgent` recorded, in bytes.
 pub const MAX_USER_AGENT_BYTES: usize = 200;
+
+/// Longest requested `model` recorded, in bytes (the observer's cap too).
+pub const MAX_MODEL_BYTES: usize = 256;
 
 /// Provider name recorded for every call in feature 03.
 const PROVIDER: &str = "anthropic";
@@ -368,6 +381,7 @@ impl Proxy {
                 request_bytes: body.len() as u64,
                 trace_id: trace::trace_context(&parts.headers).trace_id,
                 user_agent: user_agent(&parts.headers),
+                requested_model: requested_model(&parts.method, &parts.headers, &body),
                 capture,
             }
         }));
@@ -546,6 +560,8 @@ struct CallStart {
     request_bytes: u64,
     trace_id: String,
     user_agent: Option<String>,
+    /// The request's `model`, for a response that names none.
+    requested_model: Option<String>,
     capture: Option<Capture>,
 }
 
@@ -571,7 +587,7 @@ impl CallStart {
             status,
             outcome,
             streamed: observed.streamed,
-            model: observed.model,
+            model: observed.model.or(self.requested_model),
             request_id: observed.request_id,
             stop_reason: observed.stop_reason,
             error_type: observed.error_type,
@@ -976,6 +992,94 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// The request body's top-level `"model"` string (see the module docs): only
+/// for a `POST` with a JSON content type, only a string of 1 to
+/// [`MAX_MODEL_BYTES`], and `None` if the body isn't a JSON object.
+fn requested_model(method: &Method, headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    // A derived struct also reads an array by position; only an object counts.
+    let is_object = body.trim_ascii_start().first() == Some(&b'{');
+    if method != Method::POST || !is_json(headers) || !is_object {
+        return None;
+    }
+    serde_json::from_slice::<ModelOnly>(body).ok()?.model.0
+}
+
+/// A request body read for its `model` only; every other field is skipped
+/// with [`IgnoredAny`], which keeps nothing.
+#[derive(Deserialize)]
+struct ModelOnly {
+    #[serde(default)]
+    model: ModelName,
+}
+
+/// A string of 1 to [`MAX_MODEL_BYTES`]; any other JSON value is skipped
+/// (with [`IgnoredAny`], so nothing is buffered) and gives `None`.
+#[derive(Default)]
+struct ModelName(Option<String>);
+
+impl<'de> Deserialize<'de> for ModelName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ModelNameVisitor)
+    }
+}
+
+struct ModelNameVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ModelNameVisitor {
+    type Value = ModelName;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<ModelName, E> {
+        let fits = !text.is_empty() && text.len() <= MAX_MODEL_BYTES;
+        Ok(ModelName(fits.then(|| text.to_owned())))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<ModelName, E> {
+        Ok(ModelName(None))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<ModelName, E> {
+        Ok(ModelName(None))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<ModelName, E> {
+        Ok(ModelName(None))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<ModelName, E> {
+        Ok(ModelName(None))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<ModelName, E> {
+        Ok(ModelName(None))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<ModelName, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(ModelName(None))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<ModelName, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(ModelName(None))
+    }
+}
+
+/// `application/json` or a `+json` media type, parameters ignored.
+fn is_json(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    essence.eq_ignore_ascii_case("application/json")
+        || essence
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+}
+
 /// The client's `User-Agent`, cut to at most [`MAX_USER_AGENT_BYTES`] on a
 /// character boundary.
 fn user_agent(headers: &HeaderMap) -> Option<String> {
@@ -1139,6 +1243,69 @@ mod tests {
         let request_over = Capture::new(Bytes::from(vec![1; MAX_CONTENT_BYTES + 1]));
         assert!(request_over.request.is_empty());
         assert_eq!(request_over.into_content(), (Vec::new(), Some(true)));
+    }
+
+    #[test]
+    fn the_requested_model_is_a_top_level_string_from_a_json_post_only() {
+        let json = |content_type: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+            headers
+        };
+        let post = Method::POST;
+        let body =
+            br#"{"max_tokens":1,"messages":[{"role":"user","content":"hi"}],"model":"claude-x"}"#;
+        let model = |method: &Method, headers: &HeaderMap, body: &[u8]| {
+            requested_model(method, headers, body)
+        };
+        for content_type in [
+            "application/json",
+            "Application/JSON; charset=utf-8",
+            "application/vnd.x+json",
+        ] {
+            assert_eq!(
+                model(&post, &json(content_type), body).as_deref(),
+                Some("claude-x"),
+                "{content_type}"
+            );
+        }
+
+        let ok = json("application/json");
+        assert_eq!(model(&Method::GET, &ok, body), None, "not a POST");
+        assert_eq!(model(&post, &HeaderMap::new(), body), None, "no type");
+        assert_eq!(model(&post, &json("text/plain"), body), None);
+        assert_eq!(model(&post, &json("application/jsonx"), body), None);
+        for not_a_model in [
+            &b"{\"model\": \"claude-x\","[..],
+            b"",
+            b"[\"claude-x\"]",
+            b"\"claude-x\"",
+            b"{\"model\":7}",
+            b"{\"model\":null}",
+            b"{\"model\":{\"model\":\"x\"}}",
+            b"{\"model\":\"\"}",
+            b"{\"messages\":[{\"model\":\"nested\"}]}",
+            b"{\"model\":\"a\",\"model\":\"b\"}",
+        ] {
+            assert_eq!(
+                model(&post, &ok, not_a_model),
+                None,
+                "{}",
+                String::from_utf8_lossy(not_a_model)
+            );
+        }
+        let exact = format!(r#"{{"model":"{}"}}"#, "m".repeat(MAX_MODEL_BYTES));
+        assert_eq!(
+            model(&post, &ok, exact.as_bytes()).map(|m| m.len()),
+            Some(MAX_MODEL_BYTES)
+        );
+        let long = format!(r#"{{"model":"{}"}}"#, "m".repeat(MAX_MODEL_BYTES + 1));
+        assert_eq!(model(&post, &ok, long.as_bytes()), None);
+        // Escapes are decoded like any JSON string.
+        assert_eq!(
+            model(&post, &ok, br#"{"model":"claude\u002dx"}"#).as_deref(),
+            Some("claude-x")
+        );
     }
 
     #[test]
@@ -1318,6 +1485,7 @@ mod tests {
             request_bytes: 2,
             trace_id: "t".into(),
             user_agent: None,
+            requested_model: None,
             capture: None,
         };
         let recording = Recording {
