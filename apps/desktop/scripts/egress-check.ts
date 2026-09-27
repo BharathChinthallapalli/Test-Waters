@@ -102,10 +102,18 @@ function environment(
   return { ...env, ...extra };
 }
 
+/** How a child ended; `error` is set when it could not be started. */
+interface Exit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error?: string;
+}
+
 /** A started child process in its own process group, with output to a file. */
 interface Running {
   child: ChildProcess;
-  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  /** Never rejects. */
+  exited: Promise<Exit>;
   logFile: string;
 }
 
@@ -121,19 +129,18 @@ async function start(
     stdio: ["ignore", log.fd, log.fd],
     detached: true,
   });
-  const exited = new Promise<{
-    code: number | null;
-    signal: NodeJS.Signals | null;
-  }>((resolve, reject) => {
-    child.once("error", reject);
+  const exited = new Promise<Exit>((resolve) => {
+    child.once("error", (error) =>
+      resolve({ code: null, signal: null, error: error.message }),
+    );
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  exited.catch(() => {}).finally(() => log.close());
+  exited.finally(() => log.close());
   return { child, exited, logFile };
 }
 
 /** SIGTERM to the whole process group, then SIGKILL after a grace period. */
-async function stop(running: Running): Promise<number | null> {
+async function stop(running: Running): Promise<Exit> {
   const signal = (name: NodeJS.Signals) => {
     try {
       if (running.child.pid) {
@@ -147,10 +154,18 @@ async function stop(running: Running): Promise<number | null> {
     signal("SIGTERM");
   }
   const timer = setTimeout(() => signal("SIGKILL"), STOP_TIMEOUT_MS);
-  const { code } = await running.exited;
+  const exit = await running.exited;
   clearTimeout(timer);
   signal("SIGKILL"); // helpers left in the group
-  return code;
+  return exit;
+}
+
+/** "exit code 1", "signal SIGSEGV" or "could not start: …", for messages. */
+function describeExit({ code, signal, error }: Exit): string {
+  if (error) {
+    return `could not start: ${error}`;
+  }
+  return signal ? `signal ${signal}` : `exit code ${code}`;
 }
 
 async function logTail(file: string): Promise<string> {
@@ -304,14 +319,15 @@ async function runApp(phase: string): Promise<void> {
     appEnv,
     path.join(tmp, `app-${phase.replace(/\W+/g, "-")}.log`),
   );
-  let exitedEarly = false;
-  app.exited.then(() => {
-    exitedEarly = true;
+  let earlyExit: Exit | null = null;
+  app.exited.then((exit) => {
+    earlyExit = exit;
   });
+  const exitedEarly = () => earlyExit !== null;
   try {
     const deadline = Date.now() + RENDERER_TIMEOUT_MS;
     let page: PageState | null = null;
-    while (!exitedEarly && Date.now() < deadline) {
+    while (!exitedEarly() && Date.now() < deadline) {
       page = await readPage(profileDir).catch(() => null);
       if (page?.title === APP_TITLE && page.headline === DAEMON_RUNNING) {
         break;
@@ -329,13 +345,13 @@ async function runApp(phase: string): Promise<void> {
       });
     }
     const idleUntil = Date.now() + idleMs;
-    while (!exitedEarly && Date.now() < idleUntil) {
+    while (!exitedEarly() && Date.now() < idleUntil) {
       await pause(POLL_MS);
     }
-    if (exitedEarly) {
+    if (earlyExit) {
       problems.push({
         component: "desktop app",
-        message: `${phase}: the app exited before the idle period ended`,
+        message: `${phase}: the app ended before the idle period did (${describeExit(earlyExit)})`,
       });
     }
   } finally {
@@ -356,23 +372,31 @@ async function runDaemon(phase: string): Promise<void> {
     environment(daemonProxy.url),
     path.join(tmp, "daemon.log"),
   );
-  daemon.exited.catch(() => {});
-  const started = Date.now();
+  let earlyExit: Exit | null = null;
+  daemon.exited.then((exit) => {
+    earlyExit = exit;
+  });
   const published = await waitForFile(
     path.join(dataDir, "daemon.json"),
     DAEMON_START_TIMEOUT_MS,
   );
-  await pause(Math.max(0, started + daemonIdleMs - Date.now()));
-  const exitedEarly = daemon.child.exitCode !== null;
-  const code = await stop(daemon).catch(() => null);
-  if (published && !exitedEarly && code === 0) {
+  if (published) {
+    // Idle time counts from publication, as the app's counts from its page.
+    const idleUntil = Date.now() + daemonIdleMs;
+    while (earlyExit === null && Date.now() < idleUntil) {
+      await pause(POLL_MS);
+    }
+  }
+  const ended: Exit | null = earlyExit;
+  const exit = await stop(daemon);
+  if (published && ended === null && exit.code === 0) {
     positives.push(
       `cs-daemon, ${phase}: published daemon.json, exited 0 on SIGTERM`,
     );
   } else {
     problems.push({
       component: "cs-daemon",
-      message: `${phase}: daemon.json ${published ? "published" : "never published"}, ${exitedEarly ? "exited before SIGTERM" : "stopped by SIGTERM"} with exit code ${code}`,
+      message: `${phase}: daemon.json ${published ? "published" : "never published"}; ${ended ? "ended by itself" : "stopped with SIGTERM"} (${describeExit(exit)})`,
     });
     console.error(`--- cs-daemon log, ${phase} (last lines) ---`);
     console.error(await logTail(daemon.logFile));
