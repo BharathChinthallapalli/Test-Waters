@@ -187,6 +187,9 @@ importers:
 
   packages/api-types:
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.6
+        version: 24.13.6
       typescript:
         specifier: 7.0.2
         version: 7.0.2

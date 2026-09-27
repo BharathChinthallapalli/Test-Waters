@@ -1,6 +1,7 @@
 //! Serves the control API's HTTP layer on `127.0.0.1:<random port>` with a fixed
 //! demo token and a toy handler that answers only `version`, for trying the layer
-//! with `curl`. Not the daemon: no store, no token file, no discovery file.
+//! with `curl`. Not the daemon: no store, no token file, no discovery file. Served
+//! with [`cs_daemon::serve`] (header-read timeout), like the daemon; Ctrl+C stops it.
 //!
 //! ```sh
 //! cargo run -p cs-daemon --example rpc_http_demo
@@ -8,11 +9,11 @@
 //!   --data '{"jsonrpc":"2.0","method":"version","id":1}' http://127.0.0.1:<port>/rpc
 //! ```
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use cs_daemon::http::{HttpConfig, StaticToken, router};
 use cs_daemon::rpc::{Handler, RpcError};
+use cs_daemon::serve::{self, DRAIN_TIMEOUT, ServeConfig};
 use serde_json::{Value, json};
 
 /// A demo token; the daemon generates a random one per install.
@@ -44,9 +45,11 @@ async fn main() -> std::io::Result<()> {
         Arc::new(DemoHandler),
     );
     println!("listening on 127.0.0.1:{port}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    serve::serve(listener, app, ServeConfig::default(), async {
+        // An error means Ctrl+C can't be caught; stop at once rather than never.
+        let _ = tokio::signal::ctrl_c().await;
+        DRAIN_TIMEOUT
+    })
+    .await;
+    Ok(())
 }

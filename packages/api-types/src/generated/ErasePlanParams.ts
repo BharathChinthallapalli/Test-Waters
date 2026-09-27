@@ -2,5 +2,6 @@
 
 /**
  * Params of `content.erasePlan`.
+ * Given by name; unknown members are refused.
  */
 export type ErasePlanParams = { runId: string, };

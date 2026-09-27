@@ -1,5 +1,6 @@
-//! The control API's HTTP stack over a real loopback socket: `axum::serve`, hyper's
-//! HTTP/1.1 parsing, the layers and dispatch, driven with raw bytes.
+//! The control API's HTTP stack over a real loopback socket: `cs_daemon::serve`
+//! (the daemon's server), hyper's HTTP/1.1 parsing, the layers and dispatch,
+//! driven with raw bytes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 use cs_daemon::http::{HttpConfig, StaticToken, router};
 use cs_daemon::rpc::{Handler, RpcError};
+use cs_daemon::serve::{self, ServeConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,13 +59,7 @@ async fn whole_stack_over_a_loopback_socket() {
         Arc::new(StaticToken::new(TOKEN)),
         Arc::new(Version),
     );
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    });
+    let server = serve::spawn(listener, app, ServeConfig::default());
     let bearer = format!("Authorization: Bearer {TOKEN}\r\n");
     let call = r#"{"jsonrpc":"2.0","method":"version","id":1}"#;
 
@@ -93,5 +89,5 @@ async fn whole_stack_over_a_loopback_socket() {
         forbidden.starts_with("HTTP/1.1 403 Forbidden\r\n"),
         "{forbidden}"
     );
-    server.abort();
+    server.stop().await;
 }
