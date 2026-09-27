@@ -443,6 +443,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "rustix",
  "serde",
  "serde_json",
  "subtle",

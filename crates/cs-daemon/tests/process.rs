@@ -142,7 +142,7 @@ fn unix_data_dir_owned_by_another_uid_is_refused() {
         ),
         "{error}"
     );
-    // The probe file is gone, and nothing was changed.
+    // Nothing was created in it or changed.
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     assert_eq!(fs::metadata(&dir).unwrap().uid(), 65534);
 }

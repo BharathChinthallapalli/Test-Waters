@@ -7,7 +7,9 @@
 //! database), and on Windows SQLite's `-wal`/`-shm` files get their ACL from it
 //! (`cs_store::db` module docs), so its permissions matter:
 //! - Unix: the directory must have no group or other permission bits and be
-//!   owned by the user running the daemon, or the daemon refuses to start.
+//!   owned by the daemon's effective uid (`rustix::process::geteuid`), which
+//!   owns every file the daemon creates, or the daemon refuses to start. The
+//!   mode is checked first, then the owner; neither check creates anything.
 //! - Windows: the directory must be owned by the current user and have a
 //!   protected DACL whose allow ACEs are all for that user
 //!   (`cs_store::fsperm::owner_only_problem`), or the daemon refuses to start.
@@ -88,14 +90,17 @@ pub use cs_core::control::Discovery;
 /// the path involved and never a file's contents.
 #[derive(Debug)]
 pub enum InstanceError {
-    /// Creating the data directory, or reading its metadata, failed.
+    /// Creating the data directory failed.
     DataDir { path: PathBuf, source: io::Error },
+    /// The data directory exists, but reading its path, metadata or (Windows)
+    /// security descriptor to check it failed.
+    DataDirCheck { path: PathBuf, source: io::Error },
     /// The data directory path exists and is not a directory.
     NotADirectory { path: PathBuf },
     /// Unix: the data directory has group or other permission bits.
     DataDirNotOwnerOnly { path: PathBuf, mode: u32 },
-    /// Unix: the data directory is owned by `owner`, not by `current`, the uid
-    /// that owns the files this process creates.
+    /// Unix: the data directory is owned by `owner`, not by `current`, the
+    /// daemon's effective uid.
     DataDirNotOwned {
         path: PathBuf,
         owner: u32,
@@ -125,6 +130,13 @@ impl fmt::Display for InstanceError {
                     path.display()
                 )
             }
+            Self::DataDirCheck { path, source } => {
+                write!(
+                    f,
+                    "cannot check data directory {}: {source}",
+                    path.display()
+                )
+            }
             Self::NotADirectory { path } => {
                 write!(f, "data directory {} is not a directory", path.display())
             }
@@ -146,8 +158,9 @@ impl fmt::Display for InstanceError {
             ),
             Self::DataDirAclNotOwnerOnly { path, problem } => write!(
                 f,
-                "data directory {} {problem}, but only you may have access to it; move it away \
-                 so Callsheet re-creates it owner-only, or pass another --data-dir",
+                "data directory {} {problem}, but only you may have access to it; move it aside \
+                 (its database and token stay in the old location) so Callsheet re-creates it \
+                 owner-only, or pass another --data-dir",
                 path.display()
             ),
             Self::Lock { path, source } => write!(f, "cannot lock {}: {source}", path.display()),
@@ -174,28 +187,56 @@ impl std::error::Error for InstanceError {}
 /// path resolved once with `fs::canonicalize`, so a symlink swapped in after the
 /// check can't redirect later file operations; on Windows it is `path` as given.
 pub fn prepare_data_dir(path: &Path) -> Result<PathBuf, InstanceError> {
-    let data_dir_error = |source| InstanceError::DataDir {
-        path: path.to_path_buf(),
-        source,
-    };
-    if let Err(error) = fsperm::create_dir_all_owner_only(path) {
+    prepare_data_dir_for(path, &Account::current())
+}
+
+/// [`prepare_data_dir`], with the account the directory must belong to given,
+/// so tests can check a refusal without another account to own the directory.
+fn prepare_data_dir_for(path: &Path, account: &Account) -> Result<PathBuf, InstanceError> {
+    if let Err(source) = fsperm::create_dir_all_owner_only(path) {
         // Creating fails with "already exists" when the path is a file.
         return Err(match fs::metadata(path) {
             Ok(metadata) if !metadata.is_dir() => InstanceError::NotADirectory {
                 path: path.to_path_buf(),
             },
-            _ => data_dir_error(error),
+            _ => InstanceError::DataDir {
+                path: path.to_path_buf(),
+                source,
+            },
         });
     }
-    let resolved = resolve(path).map_err(data_dir_error)?;
-    let metadata = fs::metadata(&resolved).map_err(data_dir_error)?;
+    let check_error = |source| InstanceError::DataDirCheck {
+        path: path.to_path_buf(),
+        source,
+    };
+    let resolved = resolve(path).map_err(check_error)?;
+    let metadata = fs::metadata(&resolved).map_err(check_error)?;
     if !metadata.is_dir() {
         return Err(InstanceError::NotADirectory {
             path: path.to_path_buf(),
         });
     }
-    check_owner_only(&resolved, &metadata)?;
+    check_owner_only(&resolved, &metadata, account)?;
     Ok(resolved)
+}
+
+/// The account the data directory must belong to.
+struct Account {
+    /// Unix: the effective uid. "The owner (user ID) of the new file is set to
+    /// the effective user ID of the process" (Linux man-pages, open(2),
+    /// `O_CREAT`), so it owns every file the daemon creates. On Windows,
+    /// `fsperm` compares against the current user's SID itself.
+    #[cfg(unix)]
+    uid: u32,
+}
+
+impl Account {
+    fn current() -> Self {
+        Self {
+            #[cfg(unix)]
+            uid: rustix::process::geteuid().as_raw(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -210,8 +251,13 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// The mode first, then the owner, from `metadata` alone.
 #[cfg(unix)]
-fn check_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), InstanceError> {
+fn check_owner_only(
+    path: &Path,
+    metadata: &fs::Metadata,
+    account: &Account,
+) -> Result<(), InstanceError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let mode = metadata.permissions().mode() & 0o7777;
@@ -221,54 +267,29 @@ fn check_owner_only(path: &Path, metadata: &fs::Metadata) -> Result<(), Instance
             mode,
         });
     }
-    let current = new_file_owner(path).map_err(|source| InstanceError::DataDir {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    check_owner(path, metadata.uid(), current)
-}
-
-#[cfg(unix)]
-fn check_owner(path: &Path, owner: u32, current: u32) -> Result<(), InstanceError> {
-    if owner != current {
+    if metadata.uid() != account.uid {
         return Err(InstanceError::DataDirNotOwned {
             path: path.to_path_buf(),
-            owner,
-            current,
+            owner: metadata.uid(),
+            current: account.uid,
         });
     }
     Ok(())
 }
 
-/// The uid that owns the files this process creates, read from a probe file
-/// created owner-only in `dir` and removed again. "The owner (user ID) of the
-/// new file is set to the effective user ID of the process" (Linux man-pages,
-/// open(2), `O_CREAT`). Stable std has no `getuid` (`UnixStream::peer_cred` is
-/// unstable in Rust 1.98.1, feature `peer_credentials_unix_socket`), and `libc`
-/// would need `unsafe`.
-#[cfg(unix)]
-fn new_file_owner(dir: &Path) -> io::Result<u32> {
-    use std::os::unix::fs::MetadataExt;
-
-    let mut suffix = [0u8; 8];
-    getrandom::fill(&mut suffix).map_err(io::Error::other)?;
-    let probe = dir.join(format!(".owner-probe-{}", hex::encode(suffix)));
-    let file = fsperm::create_new_owner_only(&probe)?;
-    let owner = file.metadata().map(|metadata| metadata.uid());
-    drop(file);
-    fs::remove_file(&probe)?;
-    owner
-}
-
 #[cfg(windows)]
-fn check_owner_only(path: &Path, _metadata: &fs::Metadata) -> Result<(), InstanceError> {
+fn check_owner_only(
+    path: &Path,
+    _metadata: &fs::Metadata,
+    _account: &Account,
+) -> Result<(), InstanceError> {
     match fsperm::owner_only_problem(path) {
         Ok(None) => Ok(()),
         Ok(Some(problem)) => Err(InstanceError::DataDirAclNotOwnerOnly {
             path: path.to_path_buf(),
             problem,
         }),
-        Err(source) => Err(InstanceError::DataDir {
+        Err(source) => Err(InstanceError::DataDirCheck {
             path: path.to_path_buf(),
             source,
         }),
@@ -278,7 +299,11 @@ fn check_owner_only(path: &Path, _metadata: &fs::Metadata) -> Result<(), Instanc
 /// `fsperm` can't create the directory on other platforms, so this is never
 /// reached.
 #[cfg(not(any(unix, windows)))]
-fn check_owner_only(_path: &Path, _metadata: &fs::Metadata) -> Result<(), InstanceError> {
+fn check_owner_only(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+    _account: &Account,
+) -> Result<(), InstanceError> {
     Ok(())
 }
 
@@ -531,43 +556,92 @@ mod tests {
         assert!(unknown.to_string().contains("unknown pid"), "{unknown}");
     }
 
+    /// An account that doesn't own the directories this process creates.
     #[cfg(unix)]
-    #[test]
-    fn unix_owner_must_be_the_current_uid() {
-        let path = Path::new("/data");
-
-        assert!(check_owner(path, 1000, 1000).is_ok());
-        let error = check_owner(path, 65534, 1000).unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                InstanceError::DataDirNotOwned {
-                    owner: 65534,
-                    current: 1000,
-                    ..
-                }
-            ),
-            "{error}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("/data") && message.contains("uid 65534") && !message.contains('\n'),
-            "{message}"
-        );
+    fn another_account() -> Account {
+        Account {
+            uid: Account::current().uid ^ 1,
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_new_file_owner_is_this_process_and_leaves_nothing() {
+    fn unix_a_directory_of_another_account_is_refused_and_left_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let dir = prepare_data_dir(&root.path().join("data")).unwrap();
+        let before = fs::metadata(&dir).unwrap();
+        let expected = another_account();
+
+        let error = prepare_data_dir_for(&dir, &expected).unwrap_err();
+
+        match &error {
+            InstanceError::DataDirNotOwned { owner, current, .. } => {
+                assert_eq!(*owner, before.uid());
+                assert_eq!(*current, expected.uid);
+            }
+            other => panic!("{other}"),
+        }
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.display().to_string())
+                && message.contains(&format!("uid {}", before.uid()))
+                && message.contains("--data-dir")
+                && !message.contains('\n'),
+            "{message}"
+        );
+        // Nothing was created in it or changed.
+        let after = fs::metadata(&dir).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_the_mode_is_checked_before_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = prepare_data_dir(&root.path().join("data")).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+
+        let error = prepare_data_dir_for(&dir, &another_account()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                InstanceError::DataDirNotOwnerOnly { mode: 0o750, .. }
+            ),
+            "{error}"
+        );
+    }
+
+    /// The effective uid is the one that owns what this process creates.
+    #[cfg(unix)]
+    #[test]
+    fn unix_the_current_account_owns_the_files_this_process_creates() {
         use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
 
-        let uid = new_file_owner(root.path()).unwrap();
+        assert_eq!(
+            Account::current().uid,
+            fs::metadata(root.path()).unwrap().uid()
+        );
+    }
 
-        // The temporary directory was created by this process too.
-        assert_eq!(uid, fs::metadata(root.path()).unwrap().uid());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    #[test]
+    fn check_failures_say_check_not_create() {
+        let error = InstanceError::DataDirCheck {
+            path: PathBuf::from("data"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot check data directory data: "),
+            "{error}"
+        );
     }
 
     #[test]
@@ -581,6 +655,8 @@ mod tests {
 
         assert!(
             message.starts_with("data directory data grants access to other accounts")
+                && message
+                    .contains("move it aside (its database and token stay in the old location)")
                 && message.contains("--data-dir")
                 && !message.contains('\n'),
             "{message}"

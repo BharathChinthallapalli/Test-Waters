@@ -30,6 +30,10 @@ tower-http = { version = "0.7.1", default-features = false, features = ["timeout
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "std"] }
 
+# Already in the tree through tempfile and async-io; `geteuid` is a safe call.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["io-util"] }

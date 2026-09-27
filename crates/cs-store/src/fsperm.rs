@@ -121,8 +121,9 @@ mod imp {
 /// - the single ACE `(A;<flags>;FA;;;<SID>)` allows `FILE_ALL_ACCESS` to the SID
 ///   of the user that owns the process token (`GetTokenInformation(TokenUser)`).
 ///
-/// There is never a NULL DACL: the SDDL format cannot express one, and a
-/// descriptor without our ACE is never passed to a create call.
+/// There is never a NULL DACL: every SDDL string built here has `D:P` and our
+/// ACE, and a descriptor without that ACE is never passed to a create call.
+/// (SDDL can express a NULL DACL, as `D:NO_ACCESS_CONTROL`; the tests use it.)
 ///
 /// Paths are made absolute and always given the `\\?\` prefix, like std's
 /// `get_long_path` (`library/std/src/sys/path/windows.rs`) except that std leaves
@@ -149,9 +150,10 @@ mod imp {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
@@ -420,9 +422,21 @@ mod imp {
                     // `SidStart` inside the ACE.
                     let sid: PSID =
                         unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
-                    // SAFETY: `sid` points into the ACL and `user` at a valid
-                    // SID; EqualSid is only given SIDs that IsValidSid accepts.
-                    if unsafe { IsValidSid(sid) == 0 || EqualSid(sid, user) == 0 } {
+                    // SAFETY: `sid` points into the ACE, inside the ACL.
+                    if unsafe { IsValidSid(sid) } == 0 {
+                        return Ok(false);
+                    }
+                    // SAFETY: IsValidSid accepted `sid`, as GetLengthSid requires.
+                    let sid_len = unsafe { GetLengthSid(sid) } as usize;
+                    // The whole SID must lie inside the ACE before EqualSid
+                    // reads it.
+                    let sid_end = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart) + sid_len;
+                    if usize::from(header.AceSize) < sid_end {
+                        return Ok(false);
+                    }
+                    // SAFETY: `sid` is a valid SID lying inside the ACE (checked
+                    // above) and `user` a valid SID.
+                    if unsafe { EqualSid(sid, user) } == 0 {
                         return Ok(false);
                     }
                 }
@@ -982,8 +996,12 @@ mod tests {
                 format!("O:{sid}D:P(OA;;FR;bf967a86-0de6-11d0-a285-00aa003049e2;;{sid})"),
                 Some(AclProblem::OthersAllowed),
             ),
-            // No DACL at all allows everyone full access.
+            // No DACL at all, or a NULL one, allows everyone full access.
             (format!("O:{sid}"), Some(AclProblem::OthersAllowed)),
+            (
+                format!("O:{sid}D:NO_ACCESS_CONTROL"),
+                Some(AclProblem::OthersAllowed),
+            ),
             (format!("O:{sid}D:{owner_ace}"), Some(AclProblem::Inherited)),
             (format!("O:BAD:P{owner_ace}"), Some(AclProblem::NotOwner)),
             (format!("D:P{owner_ace}"), Some(AclProblem::NotOwner)),
