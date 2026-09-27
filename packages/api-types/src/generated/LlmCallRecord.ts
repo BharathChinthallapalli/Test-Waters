@@ -57,7 +57,8 @@ traceId: string,
  */
 userAgent?: string, 
 /**
- * Capture was on but the bodies were over the store's content cap, so none
- * were stored.
+ * Capture was on but none of the bodies were stored: they were over the
+ * store's content cap, or the content key couldn't be loaded (a locked
+ * keychain, say).
  */
 contentTruncated?: boolean, };

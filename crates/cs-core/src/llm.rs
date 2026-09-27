@@ -106,8 +106,9 @@ pub struct LlmCallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub user_agent: Option<String>,
-    /// Capture was on but the bodies were over the store's content cap, so none
-    /// were stored.
+    /// Capture was on but none of the bodies were stored: they were over the
+    /// store's content cap, or the content key couldn't be loaded (a locked
+    /// keychain, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub content_truncated: Option<bool>,
