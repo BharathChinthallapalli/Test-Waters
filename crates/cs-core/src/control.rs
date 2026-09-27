@@ -27,6 +27,12 @@ pub struct Discovery {
     pub address: SocketAddrV4,
     /// The schema version of the running daemon's store.
     pub schema_version: u32,
+    /// Where the model-call proxy listens (feature 03): `127.0.0.1:<port>`.
+    /// Clients point `ANTHROPIC_BASE_URL` at `http://<proxyAddress>`. Absent
+    /// when the daemon runs without a proxy listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(type = "string | null", optional))]
+    pub proxy_address: Option<SocketAddrV4>,
 }
 
 /// Result of the `version` method.
@@ -48,6 +54,7 @@ pub mod methods {
     pub const EVENTS_VERIFY: &str = "events.verify";
     pub const CONTENT_ERASE_PLAN: &str = "content.erasePlan";
     pub const CONTENT_ERASE: &str = "content.erase";
+    pub const CALLS_LIST: &str = "calls.list";
 }
 
 /// Params of methods that take none. Clients send `{}` or omit `params`.
@@ -78,6 +85,27 @@ pub struct HealthResult {
     pub last_global_position: u64,
     /// An erasure deleted content but a copy may remain until a retry succeeds.
     pub erasure_pending: bool,
+    /// The model-call proxy (feature 03); absent when it isn't running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub proxy: Option<ProxyHealth>,
+}
+
+/// The proxy's part of a `health` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyHealth {
+    /// `127.0.0.1:<port>`: point `ANTHROPIC_BASE_URL` at `http://<address>`.
+    #[cfg_attr(test, ts(type = "string"))]
+    pub address: SocketAddrV4,
+    /// Calls recorded since the daemon started.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub calls_recorded: u64,
+    /// Calls forwarded but not recorded because the record queue was full or
+    /// the store refused the write, since the daemon started.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub records_dropped: u64,
 }
 
 /// Result of `token.rotate`. The new token is in the token file, never in a response.

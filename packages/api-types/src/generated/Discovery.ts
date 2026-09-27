@@ -26,4 +26,10 @@ address: string,
 /**
  * The schema version of the running daemon's store.
  */
-schemaVersion: number, };
+schemaVersion: number, 
+/**
+ * Where the model-call proxy listens (feature 03): `127.0.0.1:<port>`.
+ * Clients point `ANTHROPIC_BASE_URL` at `http://<proxyAddress>`. Absent
+ * when the daemon runs without a proxy listener.
+ */
+proxyAddress?: string | null, };
