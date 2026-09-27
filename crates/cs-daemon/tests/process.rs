@@ -113,6 +113,98 @@ fn unix_data_dir_open_to_others_is_refused() {
     }
 }
 
+/// Needs root, which can create a directory owned by someone else; skipped
+/// otherwise (the uid comparison itself is a unit test in `instance.rs`).
+#[cfg(unix)]
+#[test]
+fn unix_data_dir_owned_by_another_uid_is_refused() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::tempdir().unwrap();
+    if fs::metadata(root.path()).unwrap().uid() != 0 {
+        eprintln!("skipped: not running as root");
+        return;
+    }
+    let dir = root.path().join("data");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+
+    let error = prepare_data_dir(&dir).unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            InstanceError::DataDirNotOwned {
+                owner: 65534,
+                current: 0,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    // Nothing was created in it or changed.
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    assert_eq!(fs::metadata(&dir).unwrap().uid(), 65534);
+}
+
+/// The DACL as `icacls` prints it, to show that a refused directory is left as
+/// it was.
+#[cfg(windows)]
+fn icacls(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_data_dir_made_by_std_is_refused_and_left_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("data");
+    // Takes the parent's inheritable ACEs, and no protected DACL.
+    fs::create_dir(&dir).unwrap();
+    let before = icacls(&dir, &[]);
+
+    let error = prepare_data_dir(&dir).unwrap_err();
+
+    assert!(
+        matches!(error, InstanceError::DataDirAclNotOwnerOnly { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--data-dir"), "{error}");
+    assert_eq!(icacls(&dir, &[]), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_data_dir_with_an_everyone_ace_is_refused_and_left_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("data");
+    prepare_data_dir(&dir).unwrap();
+    // Everyone (S-1-1-0) may read; `*` marks a numeric SID (Microsoft Learn,
+    // "icacls", Remarks).
+    icacls(&dir, &["/grant", "*S-1-1-0:(OI)(CI)(R)"]);
+    let before = icacls(&dir, &[]);
+
+    let error = prepare_data_dir(&dir).unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            InstanceError::DataDirAclNotOwnerOnly {
+                problem: cs_store::fsperm::AclProblem::OthersAllowed,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(icacls(&dir, &[]), before);
+}
+
 // ---- lock and discovery ---------------------------------------------------------
 
 #[test]
