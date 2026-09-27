@@ -7,9 +7,11 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json"
+    "test:integration": "node --test test/daemon.integration.test.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
   },
   "devDependencies": {
+    "@types/node": "^24.13.6",
     "typescript": "7.0.2"
   }
 }

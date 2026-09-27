@@ -10,6 +10,7 @@
 | Rust dependencies (cargo-deny) | `cargo deny check` (licences, advisories, bans, sources; see `deny.toml`) |
 | TypeScript (Biome, typecheck, test, audit) | `pnpm biome check .`, `pnpm -r typecheck`, `pnpm -r test`, `pnpm audit` |
 | Generated types are current | `node scripts/gen-types.ts --check` (ADR 0009) |
+| TypeScript client against the daemon | `cargo build -p cs-daemon --locked`, then `pnpm -C packages/api-types test:integration` |
 | **CI passed** | Always runs; fails unless every job above succeeded |
 
 Run the same gates locally before pushing:
@@ -23,7 +24,26 @@ pnpm biome check .
 pnpm -r typecheck
 pnpm -r test
 pnpm check-types
+cargo build -p cs-daemon --locked
+pnpm -C packages/api-types test:integration
 ```
+
+## The daemon client test
+
+`packages/api-types/test/daemon.integration.test.ts` (feature 02, R2.8 and
+R2.9) starts the built `cs-daemon` binary with a temporary `--data-dir` and the
+default listen address (port 0), reads `daemon.json` and the token, calls
+`health` and `version` typed with the generated types, checks 401 for a missing
+or wrong token, rotates the token (the old one gets 401, a client re-reads the
+file once and succeeds), then sends `SIGTERM` and checks exit status 0 and that
+`daemon.json` is gone. It uses only Node built-ins.
+
+It needs the binary, so it is not part of `pnpm -r test` (the `ts` job has no
+Rust toolchain) and has its own script instead. It fails, never skips, when the
+binary is missing. The binary is `target/debug/cs-daemon[.exe]` at the
+repository root unless `CS_DAEMON_BIN` names another path (for example with a
+custom `CARGO_TARGET_DIR`). Its test files are type-checked by `pnpm -r
+typecheck` through `packages/api-types/tsconfig.test.json`.
 
 `pnpm audit` and the advisory part of `cargo deny check` read live advisory
 databases, so `main` can turn red with no code change when a new advisory is

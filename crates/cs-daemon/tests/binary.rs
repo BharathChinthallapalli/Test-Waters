@@ -1,5 +1,6 @@
 //! The built `cs-daemon` binary, with a temporary `--data-dir`: argument checks,
-//! single instance, files and modes, token reuse, logs and signals.
+//! single instance, files and modes, token reuse, logs, signals and the
+//! migration backup check at startup.
 
 mod support;
 
@@ -293,6 +294,7 @@ fn unix_files_are_owner_only() {
         DISCOVERY_FILE_NAME,
         TOKEN_FILE_NAME,
         cs_daemon::instance::LOCK_FILE_NAME,
+        cs_store::db::DATABASE_FILE_NAME,
     ] {
         assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
     }
@@ -317,8 +319,10 @@ fn signal_stops_gracefully(signal: &str) {
     assert_eq!(status.code(), Some(0), "{signal}: {logs}");
     assert!(logs.contains(&format!("SIG{signal}")), "{logs}");
     assert!(logs.contains("Callsheet daemon stopped"), "{logs}");
+    assert!(!logs.contains("drain failed"), "{logs}");
     assert!(!dir.join(DISCOVERY_FILE_NAME).exists());
     assert!(dir.join(cs_daemon::instance::LOCK_FILE_NAME).exists());
+    assert!(dir.join(cs_store::db::DATABASE_FILE_NAME).exists());
     assert_eq!(read_discovery(&dir).unwrap(), None);
     assert!(!logs.contains(&token));
 }
@@ -475,4 +479,152 @@ fn a_third_signal_exits_1_without_finishing() {
 
     assert_eq!(status.code(), Some(1), "{:#?}", watched.seen);
     watched.wait_for_line("received 3 times");
+}
+
+// ---- migration backups at startup ---------------------------------------------
+
+/// Part of each event body, so a test can find the events in the database file.
+const MARKER: &str = "tamper-me-aaaa";
+
+/// Creates a data directory whose database holds two events of run `r`, all of
+/// them in `callsheet.db` (none in the WAL), and returns the events table's page
+/// size and root page.
+fn database_with_events(dir: &Path) -> (i64, i64) {
+    use cs_store::secrets::InMemorySecretStore;
+    use cs_store::{AppendEvent, Store};
+
+    cs_daemon::instance::prepare_data_dir(dir).unwrap();
+    rt().block_on(async {
+        let secrets = std::sync::Arc::new(InMemorySecretStore::new([1; 32]));
+        let store = Store::open(dir, secrets).unwrap();
+        for n in 0..2 {
+            store
+                .append(AppendEvent {
+                    run_id: "r".to_owned(),
+                    kind: "test.event".to_owned(),
+                    ts_ms: 1_790_000_000_000 + n,
+                    body: serde_json::json!({ "marker": MARKER, "n": n }),
+                    content: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        // An erase with nothing to delete still truncates the WAL into the
+        // database file, which is the file the tests edit.
+        let plan = store.erase_plan("r").await.unwrap();
+        store.erase("r", &plan.plan_id).await.unwrap();
+        let layout = store
+            .read(|conn| {
+                let page_size = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+                let root = conn.query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'events'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((page_size, root))
+            })
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        layout
+    })
+}
+
+/// A migration backup, as a start that failed after migrating leaves it.
+fn plant_backup(dir: &Path) -> PathBuf {
+    let backup = dir.join("backup-v0.db");
+    fs::write(&backup, b"a backup").unwrap();
+    backup
+}
+
+fn database_file(dir: &Path) -> PathBuf {
+    dir.join(cs_store::db::DATABASE_FILE_NAME)
+}
+
+/// Replaces the first event's `MARKER` in the database file with `to`.
+fn edit_first_event(dir: &Path, to: &str) {
+    assert_eq!(MARKER.len(), to.len());
+    let path = database_file(dir);
+    let mut bytes = fs::read(&path).unwrap();
+    let found: Vec<usize> = bytes
+        .windows(MARKER.len())
+        .enumerate()
+        .filter(|(_, window)| *window == MARKER.as_bytes())
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(found.len(), 2, "one per event body");
+    let at = found[0];
+    bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+    fs::write(&path, bytes).unwrap();
+}
+
+/// Calls `events.verify` on a running daemon and returns its result.
+fn events_verify(daemon: &Running, dir: &Path) -> serde_json::Value {
+    let token = fs::read_to_string(dir.join(TOKEN_FILE_NAME)).unwrap();
+    let addr = daemon.discovery.address.into();
+    let body = r#"{"jsonrpc":"2.0","method":"events.verify","id":1}"#;
+    let request = support::post(addr, Some(&token), body);
+    let response = rt().block_on(support::exchange(addr, &request));
+    let (_, payload) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str::<serde_json::Value>(payload).unwrap()["result"].clone()
+}
+
+#[test]
+fn a_backup_is_deleted_once_the_database_checks_out() {
+    let (_root, dir) = temp_data_dir();
+    database_with_events(&dir);
+    let backup = plant_backup(&dir);
+
+    let daemon = Running::start(&dir);
+
+    assert!(!backup.exists(), "the backup was kept");
+    assert_eq!(events_verify(&daemon, &dir)["ok"], true);
+    let logs = stderr(&daemon.kill());
+    assert!(logs.contains("migration backups deleted"), "{logs}");
+}
+
+#[test]
+fn a_backup_is_kept_with_a_warning_when_the_log_does_not_verify() {
+    let (_root, dir) = temp_data_dir();
+    database_with_events(&dir);
+    edit_first_event(&dir, "tamper-me-bbbb");
+    let backup = plant_backup(&dir);
+
+    let daemon = Running::start(&dir);
+
+    assert!(backup.exists(), "the backup was deleted");
+    let verified = events_verify(&daemon, &dir);
+    assert_eq!(verified["ok"], false, "{verified}");
+    assert_eq!(verified["firstProblem"]["kind"], "eventHashMismatch");
+    let logs = stderr(&daemon.kill());
+    assert!(logs.contains("the event log does not verify"), "{logs}");
+    assert!(!logs.contains("migration backups deleted"), "{logs}");
+}
+
+#[test]
+fn a_damaged_database_with_a_backup_stops_startup_and_keeps_the_backup() {
+    let (_root, dir) = temp_data_dir();
+    let (page_size, root) = database_with_events(&dir);
+    // Overwrites the page-type byte of the events table's root page (a leaf,
+    // since the table is small), leaving the settings the store reads at open.
+    let path = database_file(&dir);
+    let mut bytes = fs::read(&path).unwrap();
+    let page_type = usize::try_from((root - 1) * page_size).unwrap();
+    bytes[page_type] = 0x42;
+    fs::write(&path, bytes).unwrap();
+    let backup = plant_backup(&dir);
+
+    let output = run_to_end(&mut daemon(&dir));
+
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    let error: Vec<&str> = message
+        .lines()
+        .filter(|line| line.starts_with("cs-daemon:"))
+        .collect();
+    assert_eq!(error.len(), 1, "{message}");
+    assert!(error[0].contains("integrity_check"), "{message}");
+    assert!(error[0].contains("kept for recovery"), "{message}");
+    assert!(backup.exists());
+    assert!(!dir.join(DISCOVERY_FILE_NAME).exists());
 }

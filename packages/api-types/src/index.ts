@@ -1,5 +1,6 @@
 // TypeScript types generated from Rust by ts-rs (ADR 0009). Never edit files
 // under generated/; change the Rust type and run `pnpm gen-types` instead.
+export type { Discovery } from "./generated/Discovery.ts";
 export type { EraseParams } from "./generated/EraseParams.ts";
 export type { ErasePlanParams } from "./generated/ErasePlanParams.ts";
 export type { ErasePlanResult } from "./generated/ErasePlanResult.ts";

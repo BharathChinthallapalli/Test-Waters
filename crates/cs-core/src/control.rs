@@ -1,6 +1,33 @@
-//! Wire types of the daemon's JSON-RPC control API (ADR 0003).
+//! Wire types of the daemon's JSON-RPC control API (ADR 0003), and the
+//! discovery record clients read to find the daemon.
+
+use std::net::SocketAddrV4;
 
 use serde::{Deserialize, Serialize};
+
+/// The contents of `daemon.json` in the data directory: where a running daemon
+/// listens. Written owner-only once the listener is bound, removed on graceful
+/// shutdown (feature 02 design, "Single instance and discovery").
+///
+/// Clients send the token to `address` only while the daemon holds
+/// `daemon.lock` and, on Unix, the pid in `daemon.lock` equals `pid`. Readers
+/// ignore unknown fields, so a later daemon can add some.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "camelCase")]
+pub struct Discovery {
+    /// The daemon's process id.
+    pub pid: u32,
+    /// When the daemon started, in milliseconds since the Unix epoch.
+    #[cfg_attr(test, ts(type = "number"))]
+    pub started_at_ms: u64,
+    /// Always `127.0.0.1:<port>`, the bound port (never 0). Connect to exactly
+    /// this address, never to `localhost` (R2.7).
+    #[cfg_attr(test, ts(type = "string"))]
+    pub address: SocketAddrV4,
+    /// The schema version of the running daemon's store.
+    pub schema_version: u32,
+}
 
 /// Result of the `version` method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cs_store::fsperm;
-use serde::{Deserialize, Serialize};
 
 /// Held by the running daemon.
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
@@ -69,23 +68,9 @@ pub const DISCOVERY_FILE_NAME: &str = "daemon.json";
 const LOCK_ATTEMPTS: u32 = 25;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// The contents of `daemon.json`.
-///
-/// Follow-up for unit `wire`: clients in TypeScript read this file, so this type
-/// belongs in `cs-core::control` with a generated TypeScript type (ADR 0009).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Readers ignore unknown fields, so a later daemon can add some.
-#[serde(rename_all = "camelCase")]
-pub struct Discovery {
-    /// The daemon's process id.
-    pub pid: u32,
-    /// When the daemon started, in milliseconds since the Unix epoch.
-    pub started_at_ms: u64,
-    /// Always `127.0.0.1:<port>`, the bound port (never 0).
-    pub address: SocketAddrV4,
-    /// `cs_store::migrate::CURRENT_SCHEMA_VERSION` of the running daemon.
-    pub schema_version: u32,
-}
+/// The contents of `daemon.json`, shared with clients through `cs-core` and its
+/// generated TypeScript type (ADR 0009).
+pub use cs_core::control::Discovery;
 
 /// Why the data directory or the instance lock can't be used. The messages name
 /// the path involved and never a file's contents.
