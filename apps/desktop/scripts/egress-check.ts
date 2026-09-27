@@ -100,6 +100,24 @@ function seconds(value: string, flag: string): number {
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * `promise`'s value, or null if it hasn't settled within `ms`. The timer is
+ * cleared either way, so a finished race doesn't keep the process alive.
+ */
+async function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Rejects with `message` after `ms`, for racing against a promise. */
 const deadline = (ms: number, message: string) =>
   pause(ms).then(() => {
@@ -214,8 +232,7 @@ async function stop(running: Running): Promise<Exit> {
       // Already gone, or only root processes are left in the group.
     }
   };
-  const ended = (ms: number) =>
-    Promise.race([running.exited, pause(ms).then(() => null)]);
+  const ended = (ms: number) => within(running.exited, ms);
   if (running.child.exitCode === null && running.child.signalCode === null) {
     signal("SIGTERM");
   }
@@ -489,10 +506,7 @@ async function runCanary(): Promise<void> {
     path.join(tmp, "canary.log"),
     path.join(tmp, "canary.strace"),
   );
-  const exit = await Promise.race([
-    canary.exited,
-    pause(CANARY_TIMEOUT_MS).then(() => null),
-  ]);
+  const exit = await within(canary.exited, CANARY_TIMEOUT_MS);
   await stop(canary);
   const traced = await readTrace(canary, "egress check", CANARY_PHASE);
 
