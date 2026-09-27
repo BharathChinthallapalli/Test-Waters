@@ -9,10 +9,18 @@
 //! serializes appends anyway. A failed append is counted as dropped and never
 //! fails the call, which has long been answered.
 //!
+//! # Content without its key
+//! With capture on, the store loads the content key on the first append that
+//! carries content and refuses the whole append if it can't (a locked keychain,
+//! say). The recorder then appends the call again without its content and with
+//! `contentTruncated: true`, so the metadata is kept and only the bodies are
+//! lost. That call counts as recorded.
+//!
+//! # Logs
 //! Logs name counts and error kinds only, never a record, its content or a
-//! header, and are rate-limited to one warning per [`WARN_INTERVAL`] for drops
-//! and one for store failures, so a full queue or a broken store can't flood
-//! the log.
+//! header, and are rate-limited to one warning per [`WARN_INTERVAL`] each for
+//! drops, store failures and content left out, so a full queue or a broken
+//! store can't flood the log.
 //!
 //! # Shutdown
 //! The queue's only sender sits in a `Mutex<Option<_>>`; [`Recorder::shutdown`]
@@ -23,7 +31,16 @@
 //! awaits the task's `JoinHandle`, held behind an async mutex across the wait,
 //! so every call (concurrent or repeated) returns only once the queue is
 //! drained. A call cancelled mid-wait leaves the handle for the next one.
+//!
+//! # A drain task that ends early
+//! If the task stops before the queue is closed and empty (its runtime is
+//! dropped, or it panics), the calls it leaves are still counted: the receiver
+//! lives in a [`Drain`] whose `Drop` closes the queue and counts every call left
+//! in it, and the one being appended at that moment, as dropped. That one may
+//! still be committed by the store's writer thread, so the count can be one too
+//! high, never too low.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -37,7 +54,7 @@ use tokio::task::JoinHandle;
 /// Default queue capacity.
 pub const QUEUE_CAPACITY: usize = 1024;
 
-/// At most one drop warning, and one store-failure warning, per interval.
+/// At most one warning of each kind per interval.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A call ready to record.
@@ -50,15 +67,86 @@ pub struct PendingCall {
     pub content: Vec<Vec<u8>>,
 }
 
-/// Shows the size of each content item, never its bytes.
+/// Shows the content items, the user agent and each rate-limit header value
+/// by their length only, never their bytes.
 impl fmt::Debug for PendingCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let content_lens: Vec<usize> = self.content.iter().map(Vec::len).collect();
         f.debug_struct("PendingCall")
             .field("run_id", &self.run_id)
-            .field("record", &self.record)
+            .field("record", &RedactedRecord(&self.record))
             .field("content_lens", &content_lens)
             .finish()
+    }
+}
+
+/// An [`LlmCallRecord`] with the user agent and the header values shown as
+/// their lengths.
+struct RedactedRecord<'a>(&'a LlmCallRecord);
+
+impl fmt::Debug for RedactedRecord<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No `..`: a new field has to be placed here, redacted or not.
+        let LlmCallRecord {
+            provider,
+            method,
+            path,
+            status,
+            outcome,
+            streamed,
+            model,
+            request_id,
+            stop_reason,
+            error_type,
+            usage,
+            started_at_ms,
+            ttfb_ms,
+            duration_ms,
+            request_bytes,
+            response_bytes,
+            rate_limit_headers,
+            trace_id,
+            user_agent,
+            content_truncated,
+        } = self.0;
+        let header_lens: BTreeMap<&str, Len> = rate_limit_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), Len(value.len())))
+            .collect();
+        f.debug_struct("LlmCallRecord")
+            .field("provider", provider)
+            .field("method", method)
+            .field("path", path)
+            .field("status", status)
+            .field("outcome", outcome)
+            .field("streamed", streamed)
+            .field("model", model)
+            .field("request_id", request_id)
+            .field("stop_reason", stop_reason)
+            .field("error_type", error_type)
+            .field("usage", usage)
+            .field("started_at_ms", started_at_ms)
+            .field("ttfb_ms", ttfb_ms)
+            .field("duration_ms", duration_ms)
+            .field("request_bytes", request_bytes)
+            .field("response_bytes", response_bytes)
+            .field("rate_limit_headers", &header_lens)
+            .field("trace_id", trace_id)
+            .field(
+                "user_agent",
+                &user_agent.as_ref().map(|agent| Len(agent.len())),
+            )
+            .field("content_truncated", content_truncated)
+            .finish()
+    }
+}
+
+/// A redacted value, shown by its length only.
+struct Len(usize);
+
+impl fmt::Debug for Len {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
     }
 }
 
@@ -89,6 +177,7 @@ struct Shared {
     dropped: AtomicU64,
     drop_warning: RateLimit,
     store_warning: RateLimit,
+    content_warning: RateLimit,
 }
 
 impl Recorder {
@@ -105,8 +194,16 @@ impl Recorder {
             dropped: AtomicU64::new(0),
             drop_warning: RateLimit::new(WARN_INTERVAL),
             store_warning: RateLimit::new(WARN_INTERVAL),
+            content_warning: RateLimit::new(WARN_INTERVAL),
         });
-        let drain = tokio::spawn(drain(store, receiver, Arc::clone(&shared)));
+        // Built before the spawn: a task dropped before its first poll still
+        // drops its `Drain`, which counts what was queued.
+        let queue = Drain {
+            receiver,
+            shared: Arc::clone(&shared),
+            appending: false,
+        };
+        let drain = tokio::spawn(drain(store, queue));
         Self {
             queue: Mutex::new(Some(sender)),
             drain: tokio::sync::Mutex::new(Some(drain)),
@@ -139,8 +236,18 @@ impl Recorder {
             let joined = task.await;
             // No await in between: the finished handle is never polled again.
             *drain = None;
-            if joined.is_err() {
-                tracing::error!("the call recorder's drain task failed; queued calls were lost");
+            if let Err(error) = joined {
+                // The task's `Drain` is dropped before its handle reports the
+                // error, and has counted every call the task left.
+                tracing::error!(
+                    cause = if error.is_panic() {
+                        "panic"
+                    } else {
+                        "cancelled"
+                    },
+                    records_dropped = self.shared.dropped.load(Ordering::Relaxed),
+                    "the call recorder's drain task ended early; the calls it left were dropped"
+                );
             }
         }
     }
@@ -192,35 +299,104 @@ impl Shared {
             );
         }
     }
+
+    fn content_left_out(&self, kind: &'static str) {
+        if self.content_warning.allow(Instant::now()) {
+            tracing::warn!(
+                error_kind = kind,
+                "a call's content could not be stored; it is recorded without it"
+            );
+        }
+    }
+
+    /// Counts the calls a drain task left when it ended early.
+    fn abandoned(&self, calls: u64) {
+        let dropped = self.dropped.fetch_add(calls, Ordering::Relaxed) + calls;
+        tracing::warn!(
+            abandoned = calls,
+            records_dropped = dropped,
+            "the call recorder stopped before its queue was written; those calls were dropped"
+        );
+    }
 }
 
-/// Appends every queued call until the queue is closed and empty.
-async fn drain(store: Arc<Store>, mut queue: mpsc::Receiver<PendingCall>, shared: Arc<Shared>) {
-    while let Some(call) = queue.recv().await {
-        let appended = match to_event(call) {
-            Ok(event) => store
-                .append(event)
-                .await
-                .map_err(|error| error_kind(&error)),
-            Err(_) => Err("serialize"),
-        };
-        match appended {
-            Ok(_) => {
-                shared.recorded.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(kind) => shared.append_failed(kind),
+/// The drain task's end of the queue. Dropped before the queue is closed and
+/// empty, it counts every call left as dropped (see the module docs).
+struct Drain {
+    receiver: mpsc::Receiver<PendingCall>,
+    shared: Arc<Shared>,
+    /// A call is off the queue and not yet counted as recorded or dropped.
+    appending: bool,
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        // Closed first, so no submit can slip a call in behind the count.
+        self.receiver.close();
+        let mut left = u64::from(self.appending);
+        while self.receiver.try_recv().is_ok() {
+            left += 1;
+        }
+        if left > 0 {
+            self.shared.abandoned(left);
         }
     }
 }
 
+/// Appends every queued call until the queue is closed and empty.
+async fn drain(store: Arc<Store>, mut queue: Drain) {
+    while let Some(call) = queue.receiver.recv().await {
+        queue.appending = true;
+        let recorded = record(&store, call, &queue.shared).await;
+        queue.appending = false;
+        match recorded {
+            Ok(()) => {
+                queue.shared.recorded.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(kind) => queue.shared.append_failed(kind),
+        }
+    }
+}
+
+/// Appends one call. If its content can't be stored for want of the content
+/// key, appends it again without the content, marked `contentTruncated`.
+async fn record(store: &Store, call: PendingCall, shared: &Shared) -> Result<(), &'static str> {
+    let PendingCall {
+        run_id,
+        mut record,
+        content,
+    } = call;
+    let had_content = !content.is_empty();
+    match store
+        .append(to_event(run_id.clone(), &record, content)?)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error @ StoreError::Keychain(_)) if had_content => {
+            shared.content_left_out(error_kind(&error));
+            record.content_truncated = Some(true);
+            store
+                .append(to_event(run_id, &record, Vec::new())?)
+                .await
+                .map(drop)
+                .map_err(|error| error_kind(&error))
+        }
+        Err(error) => Err(error_kind(&error)),
+    }
+}
+
 /// The `llm.call` event for a call.
-fn to_event(call: PendingCall) -> Result<AppendEvent, serde_json::Error> {
+fn to_event(
+    run_id: String,
+    record: &LlmCallRecord,
+    content: Vec<Vec<u8>>,
+) -> Result<AppendEvent, &'static str> {
     Ok(AppendEvent {
-        body: serde_json::to_value(&call.record)?,
-        run_id: call.run_id,
+        body: serde_json::to_value(record).map_err(|_| "serialize")?,
+        run_id,
         kind: LLM_CALL_KIND.to_owned(),
-        ts_ms: call.record.started_at_ms,
-        content: call.content,
+        ts_ms: record.started_at_ms,
+        content,
     })
 }
 
@@ -617,15 +793,130 @@ mod tests {
     }
 
     #[test]
-    fn debug_shows_content_sizes_not_bytes() {
+    fn debug_shows_sizes_not_content_user_agent_or_header_values() {
         let call = PendingCall {
             content: vec![CONTENT_MARKER.to_vec()],
             ..call("run", 1)
         };
+        for shown in [format!("{call:?}"), format!("{call:#?}")] {
+            for marker in [UA_MARKER, HEADER_MARKER, "content-marker"] {
+                assert!(!shown.contains(marker), "{marker} in {shown}");
+            }
+            assert!(!shown.contains(&format!("{:?}", CONTENT_MARKER.to_vec())));
+        }
         let shown = format!("{call:?}");
         assert!(shown.contains("content_lens: [19]"), "{shown}");
-        assert!(!shown.contains("content-marker"), "{shown}");
-        assert!(!shown.contains(&format!("{:?}", CONTENT_MARKER.to_vec())));
+        assert!(shown.contains("user_agent: Some(<14 bytes>)"), "{shown}");
+        assert!(
+            shown.contains(
+                "rate_limit_headers: {\"anthropic-ratelimit-requests-remaining\": <18 bytes>}"
+            ),
+            "header names stay: {shown}"
+        );
+        // The rest of the record is shown as it is.
+        for kept in [
+            "run_id: \"run\"",
+            "model: Some(\"claude-opus-5\")",
+            "request_id: Some(\"req_1\")",
+            "trace_id: \"0af7651916cd43dd8448eb211c80319c\"",
+            "started_at_ms: 1790000000001",
+            "content_truncated: None",
+        ] {
+            assert!(shown.contains(kept), "{kept} in {shown}");
+        }
+    }
+
+    #[test]
+    fn calls_queued_when_the_runtime_drops_are_counted_as_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The runtime is never driven, so its drain task never runs.
+        let recorder = {
+            let _entered = runtime.enter();
+            Recorder::start(Arc::clone(&store), 64)
+        };
+        for n in 0..10 {
+            recorder.submit(call("run", n));
+        }
+        assert_eq!(recorder.stats(), RecorderStats::default());
+
+        drop(runtime);
+        let lost = RecorderStats {
+            calls_recorded: 0,
+            records_dropped: 10,
+        };
+        assert_eq!(recorder.stats(), lost);
+
+        // A later shutdown finds the task cancelled and returns; the queue is
+        // closed, so a later submit is dropped too.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(recorder.shutdown());
+        assert_eq!(recorder.stats(), lost);
+        recorder.submit(call("run", 10));
+        assert_eq!(recorder.stats().records_dropped, 11);
+        assert!(runtime.block_on(rows(&store)).is_empty());
+    }
+
+    // Current-thread runtime, for the log capture (see below).
+    #[tokio::test]
+    async fn without_the_content_key_the_metadata_is_recorded_without_content() {
+        let (logs, _other, _guard) = Logs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        // Capture left on by an earlier run: the next open loads the key on the
+        // first append that carries content, and here it can't.
+        let first = open(dir.path());
+        assert!(first.set_capture_content(true).await.unwrap());
+        first.close().await.unwrap();
+        drop(first);
+        let secrets = InMemorySecretStore::unavailable("keychain locked");
+        let store = Arc::new(Store::open(dir.path(), Arc::new(secrets)).unwrap());
+        let recorder = Recorder::start(Arc::clone(&store), QUEUE_CAPACITY);
+
+        for n in 1..=2 {
+            recorder.submit(PendingCall {
+                content: vec![b"request".to_vec(), CONTENT_MARKER.to_vec()],
+                ..call("run", n)
+            });
+        }
+        recorder.submit(call("run", 3));
+        recorder.shutdown().await;
+
+        assert_eq!(
+            recorder.stats(),
+            RecorderStats {
+                calls_recorded: 3,
+                records_dropped: 0
+            }
+        );
+        let truncated = |n| LlmCallRecord {
+            content_truncated: Some(true),
+            ..record(n)
+        };
+        let bodies: Vec<Value> = rows(&store).await.into_iter().map(|row| row.body).collect();
+        assert_eq!(
+            bodies,
+            [
+                serde_json::to_value(truncated(1)).unwrap(),
+                serde_json::to_value(truncated(2)).unwrap(),
+                // No content, so no key needed and nothing to mark.
+                serde_json::to_value(record(3)).unwrap(),
+            ]
+        );
+        assert_eq!(bodies[0]["contentTruncated"], json!(true));
+        assert_eq!(store.blob_count().await.unwrap(), 0);
+        assert!(store.capture_content(), "the user's setting is kept");
+        assert_verifies(&store, 3).await;
+
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 1, "rate-limited: {lines:?}");
+        assert!(lines[0].starts_with("WARN"), "{lines:?}");
+        assert!(lines[0].contains("error_kind=\"keychain\""), "{lines:?}");
+        assert!(!lines[0].contains("locked"), "no error message: {lines:?}");
+        assert_no_markers(&lines);
     }
 
     #[test]
@@ -806,7 +1097,8 @@ mod tests {
         let store = open(dir.path());
         let started = Instant::now();
         for call in calls.clone() {
-            store.append(to_event(call).unwrap()).await.unwrap();
+            let event = to_event(call.run_id, &call.record, call.content).unwrap();
+            store.append(event).await.unwrap();
         }
         let alone = started.elapsed();
 
