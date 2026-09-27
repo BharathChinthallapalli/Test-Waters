@@ -8,6 +8,12 @@
 //! such as `content`, is skipped by the parser without being built
 //! (`tests/observe_memory.rs` measures the peak).
 //!
+//! Recorded headers are bounded so that one `llm.call` record stays small:
+//! `request-id`, `retry-after` and `x-should-retry` are recorded first, then at
+//! most 48 `anthropic-ratelimit-*` headers in name order. A header is skipped
+//! when its first value isn't UTF-8, its name is over 128 bytes, its value is
+//! over 256 bytes, or it would take the total (names plus values) over 8 KiB.
+//!
 //! Known limits:
 //! - A non-streamed body over 4 MiB is not parsed, so its usage is lost:
 //!   `usage` comes after `content` in the Message object and can't be reached
@@ -61,6 +67,18 @@ const MAX_JSON_BODY_BYTES: usize = 4 << 20;
 /// Longest `model`, `stop_reason` or `error.type` value recorded.
 const MAX_LABEL_BYTES: usize = 256;
 
+/// Headers recorded whenever present and within the caps below.
+const ALWAYS_RECORDED_HEADERS: [&str; 3] = ["request-id", "retry-after", "x-should-retry"];
+const RATE_LIMIT_HEADER_PREFIX: &str = "anthropic-ratelimit-";
+/// Most `anthropic-ratelimit-*` headers recorded, taken in name order.
+const MAX_RATE_LIMIT_HEADERS: usize = 48;
+/// Longest header name recorded.
+const MAX_HEADER_NAME_BYTES: usize = 128;
+/// Longest header value recorded.
+const MAX_HEADER_VALUE_BYTES: usize = 256;
+/// Most bytes, names plus values, recorded across all headers.
+const MAX_RECORDED_HEADER_BYTES: usize = 8 << 10;
+
 /// What the observer learned about one response.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
@@ -74,7 +92,8 @@ pub struct Observed {
     /// Provider-reported; `message_delta` usage overwrites `message_start`'s.
     /// `None` unless both input and output tokens were reported.
     pub usage: Option<Usage>,
-    /// `request-id`, `retry-after`, `x-should-retry`, `anthropic-ratelimit-*`.
+    /// `request-id`, `retry-after`, `x-should-retry`, `anthropic-ratelimit-*`,
+    /// within the caps in the module doc (at most 8 KiB in all).
     pub rate_limit_headers: BTreeMap<String, String>,
     pub response_bytes: u64,
     /// A stream carried `message_stop`.
@@ -211,24 +230,59 @@ fn is_event_stream(content_type: &str) -> bool {
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-/// The allowlisted response headers whose first value is UTF-8.
+/// The allowlisted response headers, within the caps: the three always
+/// recorded first, then `anthropic-ratelimit-*` in name order. `http` stores
+/// names in lower case.
 fn recorded_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
-    let mut recorded = BTreeMap::new();
-    for name in headers.keys() {
-        let name = name.as_str(); // `http` stores names in lower case.
-        let wanted = matches!(name, "request-id" | "retry-after" | "x-should-retry")
-            || name.starts_with("anthropic-ratelimit-");
-        if !wanted {
-            continue;
+    let mut recorded = HeaderRecord::default();
+    for name in ALWAYS_RECORDED_HEADERS {
+        recorded.insert(headers, name);
+    }
+    let mut rate_limit_names: Vec<&str> = headers
+        .keys()
+        .map(http::HeaderName::as_str)
+        .filter(|name| name.starts_with(RATE_LIMIT_HEADER_PREFIX))
+        .collect();
+    rate_limit_names.sort_unstable();
+    let mut kept = 0;
+    for name in rate_limit_names {
+        if kept == MAX_RATE_LIMIT_HEADERS {
+            break;
         }
-        if let Some(value) = headers
-            .get(name)
-            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-        {
-            recorded.insert(name.to_owned(), value.to_owned());
+        if recorded.insert(headers, name) {
+            kept += 1;
         }
     }
-    recorded
+    recorded.headers
+}
+
+/// Recorded headers and the bytes (names plus values) they hold.
+#[derive(Default)]
+struct HeaderRecord {
+    headers: BTreeMap<String, String>,
+    bytes: usize,
+}
+
+impl HeaderRecord {
+    /// Records `name`'s first value when it is UTF-8, both are within their
+    /// caps and the total stays within [`MAX_RECORDED_HEADER_BYTES`].
+    fn insert(&mut self, headers: &HeaderMap, name: &str) -> bool {
+        let Some(value) = headers
+            .get(name)
+            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+        else {
+            return false;
+        };
+        let size = name.len() + value.len();
+        let fits = name.len() <= MAX_HEADER_NAME_BYTES
+            && value.len() <= MAX_HEADER_VALUE_BYTES
+            && self.bytes + size <= MAX_RECORDED_HEADER_BYTES;
+        if fits {
+            self.headers.insert(name.to_owned(), value.to_owned());
+            self.bytes += size;
+        }
+        fits
+    }
 }
 
 /// Appends `bytes` unless `buffer` would exceed `cap`, growing the allocation
@@ -1341,6 +1395,115 @@ mod tests {
         .collect();
         assert_eq!(observed.rate_limit_headers, expected);
         assert_eq!(observed.request_id.as_deref(), Some("req_fixture01"));
+    }
+
+    #[test]
+    fn two_hundred_hostile_headers_stay_within_the_caps() {
+        let mut map = sse();
+        let value = "v".repeat(250);
+        let eligible_name = |i: usize| format!("anthropic-ratelimit-hostile-{i:03}");
+        // Inserted in reverse so that name order, not arrival order, decides.
+        for i in (0..120).rev() {
+            map.append(
+                http::HeaderName::from_bytes(eligible_name(i).as_bytes()).unwrap(),
+                HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+        for i in 0..30 {
+            // Name over 128 bytes; sorts before the eligible ones.
+            let name = format!("anthropic-ratelimit-{}{i:02}", "a".repeat(120));
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("1"),
+            );
+            // Value over 256 bytes.
+            let name = format!("anthropic-ratelimit-big-{i:02}");
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(&"b".repeat(257)).unwrap(),
+            );
+        }
+        for i in 0..17 {
+            let name = format!("anthropic-ratelimit-bin-{i:02}");
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+            );
+        }
+        // The always-recorded headers arrive last, after the budget could be spent.
+        map.append("request-id", HeaderValue::from_static("req_fixture03"));
+        map.append("retry-after", HeaderValue::from_static("30"));
+        map.append("x-should-retry", HeaderValue::from_static("true"));
+        let allowlisted = map
+            .keys()
+            .filter(|name| name.as_str() != "content-type")
+            .count();
+        assert_eq!(allowlisted, 200);
+
+        let recorded = ResponseObserver::new(StatusCode::OK, &map)
+            .finish()
+            .rate_limit_headers;
+        assert_eq!(recorded["request-id"], "req_fixture03");
+        assert_eq!(recorded["retry-after"], "30");
+        assert_eq!(recorded["x-should-retry"], "true");
+
+        let total: usize = recorded
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        assert!(total <= MAX_RECORDED_HEADER_BYTES, "{total}");
+        for (name, value) in &recorded {
+            assert!(name.len() <= MAX_HEADER_NAME_BYTES, "{name}");
+            assert!(value.len() <= MAX_HEADER_VALUE_BYTES, "{name}");
+        }
+
+        // The budget left after the three buys this many eligible headers,
+        // taken in name order.
+        let always = "request-id".len() + 13 + "retry-after".len() + 2 + "x-should-retry".len() + 4;
+        let each = eligible_name(0).len() + value.len();
+        let fitting = (MAX_RECORDED_HEADER_BYTES - always) / each;
+        assert!(fitting < MAX_RATE_LIMIT_HEADERS, "the byte cap binds here");
+        let expected: Vec<String> = (0..fitting).map(eligible_name).collect();
+        let kept: Vec<String> = recorded
+            .keys()
+            .filter(|name| name.starts_with(RATE_LIMIT_HEADER_PREFIX))
+            .cloned()
+            .collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn at_most_48_rate_limit_headers_in_name_order() {
+        let mut map = json();
+        for i in (0..60).rev() {
+            let name = format!("anthropic-ratelimit-n-{i:02}");
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("1"),
+            );
+        }
+        // The value cap applies to the always-recorded headers too.
+        map.append(
+            "request-id",
+            HeaderValue::from_str(&"r".repeat(257)).unwrap(),
+        );
+        map.append(
+            "retry-after",
+            HeaderValue::from_str(&"7".repeat(256)).unwrap(),
+        );
+
+        let recorded = ResponseObserver::new(StatusCode::OK, &map).finish();
+        assert_eq!(recorded.request_id, None);
+        assert_eq!(recorded.rate_limit_headers["retry-after"].len(), 256);
+        let kept: Vec<&String> = recorded
+            .rate_limit_headers
+            .keys()
+            .filter(|name| name.starts_with(RATE_LIMIT_HEADER_PREFIX))
+            .collect();
+        let expected: Vec<String> = (0..MAX_RATE_LIMIT_HEADERS)
+            .map(|i| format!("anthropic-ratelimit-n-{i:02}"))
+            .collect();
+        assert_eq!(kept, expected.iter().collect::<Vec<_>>());
     }
 
     #[test]
