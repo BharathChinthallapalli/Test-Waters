@@ -927,7 +927,7 @@ describe("DaemonMonitor: recent calls", () => {
     assert.ok(!requests.some((r) => r.body.method === "calls.list"));
   });
 
-  test("a page larger than other replies' 64 KiB is read", async () => {
+  test("a calls reply over 64 KiB fails only the calls", async () => {
     await publish();
     await writeToken(TOKEN_A);
     const bulky = (pos: number) => {
@@ -947,8 +947,29 @@ describe("DaemonMonitor: recent calls", () => {
     );
     const status = await check();
     assert.ok(status.state === "running");
+    assert.deepEqual(status.calls, {
+      state: "failed",
+      message: "The daemon didn't return its recent calls.",
+      detail: "Reply over 64 KiB",
+    });
+  });
+
+  test("a short page with nextBefore passes the cursor on", async () => {
+    // The daemon caps a page at about 48 KiB of entries (#63): fewer calls
+    // than asked for, and nextBefore says more exist.
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, {
+        calls: [daemonEntry(99), daemonEntry(98)],
+        nextBefore: 98,
+      }),
+    );
+    const status = await check();
+    assert.ok(status.state === "running");
     assert.ok(status.calls.state === "loaded");
-    assert.equal(status.calls.calls.length, 50);
+    assert.equal(status.calls.calls.length, 2);
+    assert.equal(status.calls.nextBefore, 98);
   });
 
   test("listCalls asks for the page before a cursor from the running daemon", async () => {

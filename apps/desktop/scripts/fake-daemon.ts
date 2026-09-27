@@ -83,6 +83,47 @@ function rateLimits(remaining: number, resetAtMs: number) {
   };
 }
 
+/**
+ * The 13 `anthropic-ratelimit-unified-*` headers a subscription login gets.
+ * Only the prefix is documented (sources.md marks the names UNVERIFIED); these
+ * names and values are made up to give the details view a realistically wide
+ * header map.
+ */
+function unifiedLimits(status: string, resetAtMs: number, used: number) {
+  const reset = String(Math.floor(resetAtMs / 1000));
+  const week = String(Math.floor(resetAtMs / 1000) + 5 * 86_400);
+  const prefix = "anthropic-ratelimit-unified";
+  return {
+    [`${prefix}-status`]: status,
+    [`${prefix}-reset`]: reset,
+    [`${prefix}-representative-claim`]: "five_hour",
+    [`${prefix}-fallback-percentage`]: "0.5",
+    [`${prefix}-overage-status`]: "rejected",
+    [`${prefix}-overage-disabled-reason`]: "org_level_disabled",
+    [`${prefix}-5h-status`]: status,
+    [`${prefix}-5h-reset`]: reset,
+    [`${prefix}-5h-utilization`]: (used / 100).toFixed(2),
+    [`${prefix}-7d-status`]: "allowed",
+    [`${prefix}-7d-reset`]: week,
+    [`${prefix}-7d-utilization`]: (used / 400).toFixed(2),
+    [`${prefix}-7d_opus-utilization`]: (used / 900).toFixed(2),
+  };
+}
+
+/** Subscription (unified) headers for most calls; API-key ones for every third. */
+function limitsFor(i: number, startedAtMs: number, rejected = false) {
+  if (i % 3 === 2 && !rejected) {
+    return rateLimits(49 - (i % 10), startedAtMs + MINUTE);
+  }
+  const used = rejected ? 100 : 40 + (i % 50);
+  const status = rejected
+    ? "rejected"
+    : used >= 80
+      ? "allowed_warning"
+      : "allowed";
+  return unifiedLimits(status, startedAtMs + 3 * 60 * MINUTE, used);
+}
+
 function hex(length: number, seed: number): string {
   let out = "";
   let state = seed * 2_654_435_761;
@@ -123,7 +164,7 @@ function makeCall(i: number, now: number) {
     responseBytes: 4_200 + i * 31,
     rateLimitHeaders: {
       "request-id": requestId,
-      ...rateLimits(49 - (i % 10), startedAtMs + MINUTE),
+      ...limitsFor(i, startedAtMs),
     } as Record<string, string>,
     traceId: hex(32, i + 101),
     userAgent: "claude-cli/2.1.227 (external, cli)",
@@ -162,7 +203,10 @@ function makeCall(i: number, now: number) {
           "request-id": requestId,
           "retry-after": "17",
           "x-should-retry": "true",
-          ...rateLimits(0, startedAtMs + 17 * SECOND),
+          // An API key's limit, or a subscription's five-hour window.
+          ...(i % 2 === 1
+            ? rateLimits(0, startedAtMs + 17 * SECOND)
+            : limitsFor(i, startedAtMs, true)),
         },
       };
     case 5: // cancelled by the user part-way through a stream
@@ -232,10 +276,14 @@ const unreadable = new Set(
     }),
 );
 
+/** The daemon keeps a page's entries to about this many bytes (#63). */
+const PAGE_BYTES = 48 * 1024;
+
 /**
- * `calls.list` as the daemon pages it (#63): `limit` records are scanned,
- * unreadable ones are left out but still count, and `nextBefore` is the oldest
- * record scanned, present whenever older records remain.
+ * `calls.list` as the daemon pages it (#63): up to `limit` records are
+ * scanned, stopping early once the entries reach {@link PAGE_BYTES};
+ * unreadable ones are left out but still count; and `nextBefore` is the
+ * oldest record scanned, present whenever older records remain.
  */
 function listCalls(params: unknown): Record<string, unknown> {
   const { limit = 50, before } = (params ?? {}) as {
@@ -245,12 +293,22 @@ function listCalls(params: unknown): Record<string, unknown> {
   const older = allCalls.filter(
     (entry) => before === undefined || entry.globalPos < before,
   );
-  const scanned = older.slice(0, limit);
-  const calls = scanned.filter(
-    (entry) => !unreadable.has(allCalls.indexOf(entry)),
-  );
-  const last = scanned.at(-1);
-  return older.length > limit && last
+  const calls: typeof allCalls = [];
+  let scanned = 0;
+  let bytes = 0;
+  for (const entry of older.slice(0, limit)) {
+    if (!unreadable.has(allCalls.indexOf(entry))) {
+      const size = Buffer.byteLength(JSON.stringify(entry));
+      if (calls.length > 0 && bytes + size > PAGE_BYTES) {
+        break;
+      }
+      bytes += size;
+      calls.push(entry);
+    }
+    scanned += 1;
+  }
+  const last = older[scanned - 1];
+  return older.length > scanned && last
     ? { calls, nextBefore: last.globalPos }
     : { calls };
 }

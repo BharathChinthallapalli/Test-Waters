@@ -25,13 +25,6 @@ export const LIMITS: Readonly<Limits> = Object.freeze({
   headerValue: 128,
 });
 
-/**
- * The largest `calls.list` reply read. A page of 50 typical records is about
- * 100 KiB; each record is bounded by the daemon (a 200-byte user agent, 256-byte
- * run id), so this leaves room without letting a reply grow without limit.
- */
-export const CALLS_MAX_RESPONSE_BYTES = 1024 * 1024;
-
 const OUTCOMES: ReadonlySet<string> = new Set<CallOutcome>([
   "completed",
   "upstreamError",

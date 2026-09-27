@@ -14,7 +14,7 @@ import {
   type DaemonStatus,
 } from "../shared/daemon-status.ts";
 import type { RecentCalls } from "../shared/recent-calls.ts";
-import { CALLS_MAX_RESPONSE_BYTES, LIMITS, parseCallsList } from "./calls.ts";
+import { LIMITS, parseCallsList } from "./calls.ts";
 
 /**
  * The desktop app's client for the local daemon (feature 02, task 12).
@@ -97,7 +97,10 @@ export const REQUEST_TIMEOUT_MS = 2000;
  */
 export const STARTING_GRACE_MS = 10_000;
 
-/** Replies are a few hundred bytes; anything much bigger is not the daemon. */
+/**
+ * Replies are a few hundred bytes, and a `calls.list` page at most about 48 KiB
+ * of entries (#63); anything bigger is not the daemon.
+ */
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
 /**
@@ -369,7 +372,6 @@ function postRpc(
   token: string,
   body: string,
   timeoutMs: number,
-  maxBytes: number,
 ): Promise<HttpReply> {
   return new Promise((resolve, reject) => {
     const fail = (error: unknown): void => reject(classifyNetworkError(error));
@@ -394,12 +396,12 @@ function postRpc(
         let size = 0;
         response.on("data", (chunk: Buffer) => {
           size += chunk.length;
-          if (size > maxBytes) {
+          if (size > MAX_RESPONSE_BYTES) {
             request.destroy(
               new DaemonCallError(
                 "protocol",
                 "The reply was too large.",
-                `Reply over ${maxBytes / 1024} KiB`,
+                "Reply over 64 KiB",
               ),
             );
             return;
@@ -722,13 +724,9 @@ export class DaemonMonitor {
         : { limit: LIMITS.pageSize, before };
     let result: unknown;
     try {
-      result = await this.#call(
-        dataDir,
-        discovery,
-        "calls.list",
-        params,
-        CALLS_MAX_RESPONSE_BYTES,
-      );
+      // Within the usual 64 KiB reply cap: the daemon keeps a page's entries
+      // to about 48 KiB and says with `nextBefore` that more exist (#63).
+      result = await this.#call(dataDir, discovery, "calls.list", params);
     } catch (error) {
       if (error instanceof RpcError && error.code === METHOD_NOT_FOUND) {
         return { state: "unsupported" };
@@ -827,7 +825,6 @@ export class DaemonMonitor {
     discovery: Discovery,
     method: string,
     params?: object,
-    maxBytes = MAX_RESPONSE_BYTES,
   ): Promise<unknown> {
     const id = this.#nextId++;
     const body = JSON.stringify({ jsonrpc: "2.0", method, params, id });
@@ -837,17 +834,10 @@ export class DaemonMonitor {
       this.#token,
       body,
       this.#timeoutMs,
-      maxBytes,
     );
     if (reply.status === 401) {
       this.#token = await readToken(dataDir);
-      reply = await postRpc(
-        discovery.port,
-        this.#token,
-        body,
-        this.#timeoutMs,
-        maxBytes,
-      );
+      reply = await postRpc(discovery.port, this.#token, body, this.#timeoutMs);
       if (reply.status === 401) {
         throw new DaemonCallError("unauthorized", "The token was rejected.");
       }
