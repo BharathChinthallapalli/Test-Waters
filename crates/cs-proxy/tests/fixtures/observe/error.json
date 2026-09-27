@@ -1,0 +1,5 @@
+{
+  "type": "error",
+  "error": { "type": "rate_limit_error", "message": "Fixture: rate limited." },
+  "request_id": "req_fixture0000000000000001"
+}
