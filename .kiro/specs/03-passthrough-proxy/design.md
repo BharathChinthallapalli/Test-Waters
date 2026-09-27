@@ -80,9 +80,11 @@ timeout 10 s, no total timeout.
 - **To upstream:** all request headers except hop-by-hop (`connection`, `keep-alive`,
   `proxy-connection`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`,
   `upgrade`, and any named in `connection`), `host` (set to the upstream's), and
-  `x-callsheet-*` (Callsheet's own, stripped). `accept-encoding` is removed so the
-  upstream answers uncompressed and the observer can read usage; the client still
-  gets a valid response (no `content-encoding`). Documented deviation.
+  `x-callsheet-*` (Callsheet's own, stripped). The client's `accept-encoding` is
+  replaced by `accept-encoding: identity` so the upstream answers uncompressed and
+  the observer can read usage (an absent header would mean any coding is
+  acceptable, RFC 9110 §12.5.3); the client still gets a valid response (no
+  `content-encoding`). Documented deviation.
 - **To client:** all response headers except hop-by-hop.
 - **Recorded** (allowlist, never auth): `request-id`, `retry-after`, `x-should-retry`,
   and every `anthropic-ratelimit-*` name with its raw value (#6, #39: raw now,
