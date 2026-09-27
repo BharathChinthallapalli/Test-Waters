@@ -794,6 +794,27 @@ mod tests {
         assert_ne!(again.plan_id, plan.plan_id, "contentItems is in the ID");
     }
 
+    /// Erasure and verification agree (R6.4): after an erase, the log still
+    /// verifies, and the events of the erased run and of the run that shared its
+    /// content count as erased, not as missing content.
+    #[tokio::test]
+    async fn the_log_still_verifies_after_an_erase() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path()).await;
+        seed(&store).await;
+        let plan = store.erase_plan("a").await.unwrap();
+        store.erase("a", &plan.plan_id).await.unwrap();
+        append(&store, "c", 6, &[b"gamma"]).await;
+
+        let result = crate::verify::verify(&store).await.unwrap();
+
+        assert!(result.ok, "{:?}", result.first_problem);
+        assert_eq!(result.first_problem, None);
+        // Events 1 and 5 (run a) and 2 (run b) referenced erased content.
+        assert_eq!(result.erased_events, 3);
+        assert_eq!(result.events_checked, 7);
+    }
+
     /// A used plan ID can't be confirmed again, and a fresh plan of an erased
     /// run deletes nothing and records nothing.
     #[tokio::test]
