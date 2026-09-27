@@ -14,8 +14,8 @@ use cs_daemon::instance::prepare_data_dir;
 use cs_daemon::methods::Methods;
 use cs_daemon::serve::{self, ServeConfig, Server};
 use cs_daemon::token::{ControlToken, TOKEN_FILE_NAME};
-use cs_store::Store;
 use cs_store::secrets::InMemorySecretStore;
+use cs_store::{AppendEvent, Store};
 use serde_json::{Value, json};
 use support::{exchange, post, status};
 use tokio::net::TcpListener;
@@ -177,6 +177,67 @@ async fn a_batch_mixes_calls_and_notifications() {
             { "jsonrpc": "2.0", "result": { "captureContent": true }, "id": 2 },
             { "jsonrpc": "2.0", "error": { "code": -32601, "message": "Method not found" }, "id": 3 },
         ])
+    );
+
+    daemon.server.stop().await;
+    daemon.store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn calls_list_answers_over_http() {
+    let daemon = start().await;
+    let token = token_in(&daemon.dir);
+    let request = |params: Value| {
+        json!({ "jsonrpc": "2.0", "method": "calls.list", "params": params, "id": 1 }).to_string()
+    };
+
+    let (code, body) = call(daemon.addr, &token, &request(json!({}))).await;
+    assert_eq!(code, 200);
+    assert_eq!(body["result"], json!({ "calls": [] }));
+
+    let call_body = json!({
+        "provider": "anthropic", "method": "POST", "path": "/v1/messages", "status": 200,
+        "outcome": "completed", "streamed": false, "startedAtMs": 1_790_000_000_000_u64,
+        "durationMs": 5, "requestBytes": 10, "responseBytes": 20,
+        "rateLimitHeaders": {}, "traceId": "0af7651916cd43dd8448eb211c80319c",
+    });
+    for (kind, body) in [
+        ("llm.call", call_body.clone()),
+        ("test.event", json!({})),
+        ("llm.call", call_body.clone()),
+    ] {
+        daemon
+            .store
+            .append(AppendEvent {
+                run_id: "cc-session".to_owned(),
+                kind: kind.to_owned(),
+                ts_ms: 1_790_000_000_000,
+                body,
+                content: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let (code, body) = call(daemon.addr, &token, &request(json!({ "limit": 1 }))).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        body["result"],
+        json!({
+            "calls": [{ "globalPos": 3, "runId": "cc-session", "call": call_body }],
+            "nextBefore": 3,
+        })
+    );
+    let (_, body) = call(daemon.addr, &token, &request(json!({ "before": 3 }))).await;
+    assert_eq!(body["result"]["calls"][0]["globalPos"], 1);
+    assert_eq!(body["result"]["calls"].as_array().map(Vec::len), Some(1));
+    assert!(body["result"].get("nextBefore").is_none());
+
+    let (code, body) = call(daemon.addr, &token, &request(json!({ "limit": 0 }))).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        body["error"],
+        json!({ "code": -32602, "message": "Invalid params" })
     );
 
     daemon.server.stop().await;
