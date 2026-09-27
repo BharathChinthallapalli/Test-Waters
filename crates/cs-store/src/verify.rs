@@ -1284,7 +1284,7 @@ mod tests {
         // Erasing run b's content removes the blob run a shares; the erasure
         // event is appended to run b only.
         store
-            .append(erasure("b", &[&shared], &["a", "b"]))
+            .append_reserved(erasure("b", &[&shared], &["a", "b"]))
             .await
             .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;
@@ -1307,7 +1307,7 @@ mod tests {
         assert!(store.set_capture_content(true).await.unwrap());
         let shared = address(b"shared");
         store
-            .append(erasure("c", &[&shared], &["c"]))
+            .append_reserved(erasure("c", &[&shared], &["c"]))
             .await
             .unwrap();
         store
@@ -1328,7 +1328,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = shared_content(dir.path()).await;
         let shared = address(b"shared");
-        store.append(erasure("b", &[&shared], &[])).await.unwrap();
+        store
+            .append_reserved(erasure("b", &[&shared], &[]))
+            .await
+            .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;
         let result = verified(&store).await;
         assert_eq!(
@@ -1342,7 +1345,7 @@ mod tests {
         let store = shared_content(dir.path()).await;
         let shared = address(b"shared");
         store
-            .append(erasure("c", &[&shared], &["a", "b"]))
+            .append_reserved(erasure("c", &[&shared], &["a", "b"]))
             .await
             .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;
@@ -1357,7 +1360,7 @@ mod tests {
         let store = shared_content(dir.path()).await;
         let shared = address(b"shared");
         store
-            .append(erasure("c", &[&shared], &["c"]))
+            .append_reserved(erasure("c", &[&shared], &["c"]))
             .await
             .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;
@@ -1377,7 +1380,7 @@ mod tests {
         let store = shared_content(dir.path()).await;
         let shared = address(b"shared");
         store
-            .append(erasure("c", &[&shared], &["c"]))
+            .append_reserved(erasure("c", &[&shared], &["c"]))
             .await
             .unwrap();
         let forged = erasure("c", &[&shared], &["a", "b"]).body;
@@ -1450,7 +1453,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append(erasure("b", &[&shared], &["a", "b"]))
+            .append_reserved(erasure("b", &[&shared], &["a", "b"]))
             .await
             .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;
@@ -1667,7 +1670,7 @@ mod tests {
         drop(conn);
         let store = open(dir.path());
         store
-            .append(erasure("b", &[&shared], &["a", "b"]))
+            .append_reserved(erasure("b", &[&shared], &["a", "b"]))
             .await
             .unwrap();
         let store = tampered(store, dir.path(), delete_blob(shared)).await;

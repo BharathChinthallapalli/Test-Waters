@@ -13,4 +13,7 @@ pub mod verify;
 pub mod writer;
 
 pub use content::{ContentKey, content_address};
-pub use writer::{AppendEvent, AppendedEvent, InvalidEvent, Store, StoreError, StoreOpenError};
+pub use erase::EraseError;
+pub use writer::{
+    AppendEvent, AppendedEvent, InvalidEvent, Store, StoreError, StoreOpenError, StoreOptions,
+};

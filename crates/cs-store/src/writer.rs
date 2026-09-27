@@ -86,24 +86,34 @@
 //! One read-only connection behind a `std::sync::Mutex` serves every read, so
 //! reads run one at a time on a blocking thread. [`Store::read`] holds the read
 //! gate (`tokio::sync::RwLock`) shared for the whole SQLite read transaction;
-//! [`Store::exclude_readers`] takes it exclusively, which waits for open reads to
-//! finish and holds new ones back (erasure, task 10).
+//! erasure takes it exclusively, which waits for open reads to finish and holds
+//! new ones back.
+//!
+//! # Erasure (R6)
+//! [`Store::erase_plan`] is a read; [`Store::erase`] is one writer command that
+//! takes the read gate exclusively itself (`blocking_write` on the writer
+//! thread), so no append and no read interleaves with it. While an erasure is
+//! pending ([`Store::erasure_pending`]), the writer waits for commands with a
+//! timeout and retries it every [`StoreOptions::erasure_retry_interval`], and
+//! once when it starts. See [`crate::erase`].
 
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cs_core::control::{ErasePlanResult, EraseResult};
 use cs_core::event::{self, BodyError, EventHashError, HashedEvent, MAX_SAFE_INTEGER, ZERO_HASH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::content::{self, ContentKey};
 use crate::db::{self, OpenError};
+use crate::erase::{self, BackupRemover, CONTENT_ERASED_KIND, EraseError, Finisher};
 use crate::migrate::{self, MigrateError, Migrated};
 use crate::secrets::{IfMissing, KeychainUnavailable, SecretStore};
 
@@ -189,6 +199,9 @@ pub enum InvalidEvent {
     KindTooLong,
     /// `kind` holds a control character (including NUL).
     KindHasControlCharacter,
+    /// `kind` is reserved for the store itself: `content.erased`
+    /// ([`crate::erase::CONTENT_ERASED_KIND`]), which only erasure appends.
+    ReservedKind,
     /// Content or body over one of the limits ([`MAX_CONTENT_ITEMS`],
     /// [`MAX_CONTENT_BYTES`], [`MAX_BODY_BYTES`]); `what` names it.
     TooLarge {
@@ -214,6 +227,7 @@ impl fmt::Display for InvalidEvent {
             Self::EmptyKind => f.write_str("event kind is empty"),
             Self::KindTooLong => write!(f, "event kind is longer than {MAX_NAME_LEN} bytes"),
             Self::KindHasControlCharacter => f.write_str("event kind holds a control character"),
+            Self::ReservedKind => f.write_str("event kind is reserved for the store"),
             Self::TooLarge { what, max } => write!(f, "event {what} is above the limit of {max}"),
             Self::TimestampOutOfRange => f.write_str("event tsMs is above 2^53 − 1"),
             Self::BodyNotAnObject => f.write_str("event body is not a JSON object"),
@@ -320,6 +334,22 @@ impl From<MigrateError> for StoreOpenError {
     }
 }
 
+/// Tunables for [`Store::open_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreOptions {
+    /// How often a pending erasure is retried; [`erase::ERASURE_RETRY_INTERVAL`]
+    /// by default, and never less than [`erase::MIN_ERASURE_RETRY_INTERVAL`].
+    pub erasure_retry_interval: Duration,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            erasure_retry_interval: erase::ERASURE_RETRY_INTERVAL,
+        }
+    }
+}
+
 /// The SQLite store: one writer thread, one reader, the read gate and the
 /// capture setting. See the module docs.
 pub struct Store {
@@ -339,6 +369,10 @@ pub struct Store {
     /// The last failed key load for an append; see [`KEY_RETRY_INTERVAL`].
     last_key_failure: Mutex<Option<(Instant, KeychainUnavailable)>>,
     migrated: Migrated,
+    data_dir: PathBuf,
+    /// An erasure's WAL truncation or backup removal is still to be done.
+    /// Stored by the writer thread.
+    erasure_pending: Arc<AtomicBool>,
 }
 
 /// Capture state shared between the async side and the writer thread.
@@ -386,10 +420,30 @@ impl Store {
     /// Opens (creating if needed) and migrates the database in `data_dir`, opens
     /// the reader and starts the writer thread. Blocks; see the module docs.
     pub fn open(data_dir: &Path, secrets: Arc<dyn SecretStore>) -> Result<Self, StoreOpenError> {
+        Self::open_with(data_dir, secrets, StoreOptions::default())
+    }
+
+    /// [`Store::open`] with explicit [`StoreOptions`].
+    pub fn open_with(
+        data_dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        options: StoreOptions,
+    ) -> Result<Self, StoreOpenError> {
+        Self::open_inner(data_dir, secrets, options, erase::default_backup_remover())
+    }
+
+    /// Opens with an injected backup remover, so tests can make removal fail.
+    pub(crate) fn open_inner(
+        data_dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        options: StoreOptions,
+        remove_backups: BackupRemover,
+    ) -> Result<Self, StoreOpenError> {
         let mut writer = db::open_writer(data_dir)?;
         let migrated = migrate::migrate(&mut writer, data_dir)?;
         let reader = db::open_reader(data_dir)?;
         let capture = read_capture_setting(&writer).map_err(StoreOpenError::Sqlite)?;
+        let pending = erase::read_pending(&writer).map_err(StoreOpenError::Sqlite)?;
 
         let flags = Arc::new(CaptureFlags {
             on: AtomicBool::new(capture),
@@ -399,11 +453,22 @@ impl Store {
         });
         let (commands, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (stopped, writer_stopped) = watch::channel(false);
+        let gate = Arc::new(RwLock::new(()));
+        let erasure_pending = Arc::new(AtomicBool::new(pending));
         let state = WriterState {
             conn: writer,
             key: None,
             applied: 0,
             flags: Arc::clone(&flags),
+            gate: Arc::clone(&gate),
+            finisher: Finisher::new(
+                data_dir.to_path_buf(),
+                remove_backups,
+                Arc::clone(&erasure_pending),
+                options.erasure_retry_interval,
+                migrated.backup.as_deref(),
+            ),
+            timer: Timer::new().map_err(StoreOpenError::SpawnWriter)?,
         };
         // Detached: `close` waits for it through `writer_stopped`.
         thread::Builder::new()
@@ -415,12 +480,14 @@ impl Store {
             commands: Mutex::new(Some(commands)),
             writer_stopped,
             reader: Arc::new(Mutex::new(reader)),
-            gate: Arc::new(RwLock::new(())),
+            gate,
             secrets,
             capture: flags,
             key_load: tokio::sync::Mutex::new(()),
             last_key_failure: Mutex::new(None),
             migrated,
+            data_dir: data_dir.to_path_buf(),
+            erasure_pending,
         })
     }
 
@@ -448,6 +515,17 @@ impl Store {
             ))),
             outcome => settle(outcome),
         }
+    }
+
+    /// Test-only: appends even a reserved kind, so verification's tests can
+    /// forge `content.erased` events the way a tampered database would hold them.
+    #[cfg(test)]
+    pub(crate) async fn append_reserved(
+        &self,
+        event: AppendEvent,
+    ) -> Result<AppendedEvent, StoreError> {
+        let event = ValidEvent::checked(event)?;
+        settle(self.send_append(event).await?)
     }
 
     /// Whether content capture is on (R3.4; off unless enabled).
@@ -502,14 +580,73 @@ impl Store {
     }
 
     /// Takes the read gate exclusively: waits for every open read to finish and
-    /// holds new reads back until the guard is dropped. For erasure (task 10).
+    /// holds new reads back until the guard is dropped.
     ///
     /// While the guard is held, [`Store::read`] (and everything built on it,
     /// such as [`Store::blob_count`]) waits for it, so calling one from the
-    /// holder deadlocks. Erasure must therefore recompute its plan on the
-    /// writer connection, inside the command that erases, not through `read`.
-    pub async fn exclude_readers(&self) -> OwnedRwLockWriteGuard<()> {
+    /// holder deadlocks. So does [`Store::erase`], whose writer command takes
+    /// the gate itself: never hold this guard across an erase. That is why it
+    /// exists for tests only; erasure takes the gate on the writer thread.
+    #[cfg(test)]
+    pub(crate) async fn exclude_readers(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.gate).write_owned().await
+    }
+
+    /// The dry run of erasing `run_id`'s content (R6.1): what would be erased,
+    /// which other runs share it, and the plan ID to confirm. Erases nothing.
+    /// Fails with [`EraseError::UnknownRun`] if the run doesn't exist.
+    pub async fn erase_plan(&self, run_id: &str) -> Result<ErasePlanResult, EraseError> {
+        let owned = run_id.to_owned();
+        let plan = self
+            .read(move |conn| erase::plan_in(conn, &owned))
+            .await?
+            .ok_or(EraseError::UnknownRun)?;
+        let plan_id = plan.plan_id()?;
+        let data_dir = self.data_dir.clone();
+        let backups_to_remove =
+            tokio::task::spawn_blocking(move || migrate::count_migration_backups(&data_dir))
+                .await
+                .map_err(|_| StoreError::TaskFailed)?
+                .map_err(EraseError::Io)?;
+        Ok(ErasePlanResult {
+            plan_id,
+            run_id: plan.run_id,
+            shared_with_runs: plan.shared_with_runs,
+            content_items: plan.content_items,
+            backups_to_remove,
+        })
+    }
+
+    /// Erases `run_id`'s content as confirmed by `plan_id` (R6.2–R6.4); see
+    /// [`crate::erase`]. Success means every copy in Callsheet's own files is
+    /// gone. [`EraseError::PlanOutOfDate`] means nothing was erased;
+    /// [`EraseError::Pending`] means the content was deleted and the rest is
+    /// retried.
+    ///
+    /// Runs on the writer thread, which waits for open reads first. A caller
+    /// that stops waiting doesn't stop the erasure.
+    pub async fn erase(&self, run_id: &str, plan_id: &str) -> Result<EraseResult, EraseError> {
+        let run_id = run_id.to_owned();
+        let plan_id = plan_id.to_owned();
+        self.request(|reply| Command::Erase {
+            run_id,
+            plan_id,
+            reply,
+        })
+        .await?
+    }
+
+    /// Whether an erasure's WAL truncation or backup removal is still pending
+    /// (the `erasurePending` of `health`).
+    pub fn erasure_pending(&self) -> bool {
+        self.erasure_pending.load(Ordering::SeqCst)
+    }
+
+    /// Whether a writer is waiting for the read gate or holds it, so new reads
+    /// wait. For tests of the erasure's ordering.
+    #[cfg(test)]
+    pub(crate) fn readers_held_back(&self) -> bool {
+        self.gate.try_read().is_err()
     }
 
     /// Global position of the newest event; 0 for an empty log.
@@ -718,6 +855,16 @@ struct ValidEvent {
 
 impl ValidEvent {
     fn new(event: AppendEvent) -> Result<Self, StoreError> {
+        // Verification trusts this kind to explain missing blobs, so only the
+        // erase command may append it (it builds its event directly).
+        if event.kind == CONTENT_ERASED_KIND {
+            return Err(InvalidEvent::ReservedKind.into());
+        }
+        Self::checked(event)
+    }
+
+    /// Every check except the reserved kind.
+    fn checked(event: AppendEvent) -> Result<Self, StoreError> {
         check_name(
             &event.run_id,
             [
@@ -833,6 +980,12 @@ enum Command {
         seen: u64,
         reply: oneshot::Sender<()>,
     },
+    /// Erase `run_id`'s content if its plan still has ID `plan_id`.
+    Erase {
+        run_id: String,
+        plan_id: String,
+        reply: oneshot::Sender<Result<EraseResult, EraseError>>,
+    },
 }
 
 /// What the writer did with a capture change.
@@ -860,6 +1013,52 @@ struct WriterState {
     /// Ticket of the newest capture change applied.
     applied: u64,
     flags: Arc<CaptureFlags>,
+    /// The store's read gate, taken exclusively to erase.
+    gate: Arc<RwLock<()>>,
+    finisher: Finisher,
+    timer: Timer,
+}
+
+/// A current-thread runtime with only a time driver, which the writer uses to
+/// wait for a command with a timeout while an erasure is pending. It is never
+/// entered while a command is handled, so `blocking_write` works there.
+///
+/// Built at open, so a failure shows there rather than as a retry that never
+/// runs. Dropping a runtime normally blocks, which panics in an async context
+/// (where a failed thread spawn would drop it), so it shuts down in the
+/// background instead; it has no tasks to wait for.
+struct Timer(Option<tokio::runtime::Runtime>);
+
+impl Timer {
+    fn new() -> io::Result<Self> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map(|runtime| Self(Some(runtime)))
+    }
+
+    /// Waits up to `wait` for the next command: `Err` if the time ran out.
+    fn recv_timeout(
+        &self,
+        commands: &mut mpsc::Receiver<Command>,
+        wait: Duration,
+    ) -> Result<Option<Command>, tokio::time::error::Elapsed> {
+        match &self.0 {
+            // The timeout is created inside the runtime: its timer needs one.
+            Some(runtime) => {
+                runtime.block_on(async { tokio::time::timeout(wait, commands.recv()).await })
+            }
+            None => Ok(commands.blocking_recv()),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl WriterState {
@@ -868,7 +1067,7 @@ impl WriterState {
     /// `stopped` without that report.
     fn run(mut self, mut commands: mpsc::Receiver<Command>, stopped: watch::Sender<bool>) {
         let _report = ReportPanic;
-        while let Some(command) = commands.blocking_recv() {
+        while let Some(command) = self.next_command(&mut commands) {
             // A caller that stopped waiting has dropped its receiver; the command
             // was still carried out.
             match command {
@@ -885,6 +1084,13 @@ impl WriterState {
                     self.load_key(key, seen);
                     let _ = reply.send(());
                 }
+                Command::Erase {
+                    run_id,
+                    plan_id,
+                    reply,
+                } => {
+                    let _ = reply.send(self.erase(&run_id, &plan_id));
+                }
             }
         }
         let Self { conn, key, .. } = self;
@@ -893,6 +1099,78 @@ impl WriterState {
             tracing::warn!(%error, "closing the writer connection failed");
         }
         stopped.send_replace(true);
+    }
+
+    /// The next command. While an erasure is pending, retries it whenever the
+    /// retry is due (at once after opening) before waiting on.
+    fn next_command(&mut self, commands: &mut mpsc::Receiver<Command>) -> Option<Command> {
+        loop {
+            if !self.finisher.is_pending() {
+                return commands.blocking_recv();
+            }
+            let wait = self.finisher.until_retry();
+            if wait.is_zero() {
+                self.retry_erasure();
+                continue;
+            }
+            match self.timer.recv_timeout(commands, wait) {
+                Ok(command) => return command,
+                Err(_elapsed) => self.retry_erasure(),
+            }
+        }
+    }
+
+    /// Retries the steps after a committed erasure, under the exclusive gate.
+    fn retry_erasure(&mut self) {
+        let _gate = self.gate.blocking_write();
+        if self.finisher.finish(&self.conn).is_ok() {
+            tracing::info!("pending erasure completed");
+        }
+    }
+
+    /// See [`crate::erase`] for the steps.
+    fn erase(&mut self, run_id: &str, plan_id: &str) -> Result<EraseResult, EraseError> {
+        // Held until the end: no read sees a state between the steps, and the
+        // checkpoint can't be blocked by a reader.
+        let _gate = self.gate.blocking_write();
+        let plan = erase::plan_in(&self.conn, run_id)?.ok_or(EraseError::UnknownRun)?;
+        let current_id = plan.plan_id()?;
+        if current_id != plan_id {
+            return Err(EraseError::PlanOutOfDate);
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let erased_items = erase::delete_blobs(&tx, &plan.addresses)?;
+        // Nothing deleted, nothing to record: a blob delete and its event
+        // always commit together, so verification never misses one.
+        if erased_items > 0 {
+            // Built directly rather than through `ValidEvent::new`: the body is
+            // ours, has no numbers and no `content`, and must not be refused
+            // for size, or a run with many addresses could never be erased.
+            let event = ValidEvent {
+                run_id: plan.run_id.clone(),
+                kind: CONTENT_ERASED_KIND.to_owned(),
+                ts_ms: now_ms(),
+                body: plan.erased_event_body(&current_id),
+                content: Vec::new(),
+            };
+            append_in(&tx, event, None)?;
+        }
+        erase::set_pending(&tx)?;
+        tx.commit()?;
+        self.finisher.mark_pending();
+
+        let backups_removed = self
+            .finisher
+            .finish(&self.conn)
+            .map_err(|_| EraseError::Pending)?;
+        Ok(EraseResult {
+            erased_items,
+            affected_runs: plan.shared_with_runs,
+            backups_removed,
+        })
     }
 
     fn append(&mut self, event: ValidEvent) -> Result<AppendedEvent, AppendFailure> {
@@ -1086,6 +1364,16 @@ fn append_in(
         global_pos,
         event_hash,
     })
+}
+
+/// Unix milliseconds now, within 2^53 − 1 (0 if the clock is before 1970).
+fn now_ms() -> u64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since_epoch.as_millis())
+        .unwrap_or(MAX_SAFE_INTEGER)
+        .min(MAX_SAFE_INTEGER)
 }
 
 /// The position after `last`, which stays within 2^53 − 1.
