@@ -9,6 +9,7 @@ pub mod http;
 pub mod instance;
 pub mod logging;
 pub mod methods;
+pub mod proxy;
 pub mod rpc;
 pub mod serve;
 pub mod shutdown;

@@ -11,7 +11,8 @@
 //! level: the HTTP layer logs only the fact of a rejection and the peer
 //! (`crate::http`), the server only connection errors (`crate::serve`), and
 //! `hyper` is built without its `tracing` feature. The daemon's tests capture the
-//! output while requests carry a known token and assert it never appears.
+//! output while requests carry a known token and assert it never appears. Panic
+//! messages aren't printed either ([`install_panic_hook`]).
 
 use std::fmt;
 
@@ -74,6 +75,24 @@ where
 /// already installed.
 pub fn init(level: LevelFilter) -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
     tracing::subscriber::set_global_default(subscriber(level, std::io::stderr))
+}
+
+/// Replaces Rust's default panic hook, which prints the panic's message to
+/// stderr, with one that logs only where the panic happened. The proxy runs its
+/// response observer behind `catch_unwind` (`cs_proxy::forward`, "observer
+/// guard"), but the hook still runs first, and an observer's panic message
+/// could quote response text. The panic itself is unchanged: it still unwinds.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()));
+        tracing::error!(
+            location = location.as_deref().unwrap_or("unknown"),
+            "a thread panicked; its message is not logged, since it could quote request or \
+             response content"
+        );
+    }));
 }
 
 #[cfg(test)]

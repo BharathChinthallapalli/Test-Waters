@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 cs-core = { version = "0.1.0", path = "../cs-core" }
+cs-proxy = { version = "0.1.0", path = "../cs-proxy" }
 cs-store = { version = "0.1.0", path = "../cs-store" }
 etcetera = "0.11.0"
 getrandom = "0.4.3"

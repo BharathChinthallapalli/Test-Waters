@@ -1,13 +1,19 @@
 //! Callsheet daemon: the only binary in the workspace.
 //!
 //! Startup, in order: command line (exit 2 for a bad one, before any file or
-//! socket exists) → logging → data directory → instance lock → token → signal
-//! handlers → store (opened and migrated on a blocking thread) → migration
-//! backup check → listener on `127.0.0.1` → server with every control-API
-//! method (`cs_daemon::methods::Methods`) → `daemon.json` → wait for a signal →
-//! graceful shutdown (`cs_daemon::shutdown`), whose drain step closes the store
-//! after its writer has carried out every queued write. A startup failure prints
-//! one line naming the file or value involved, never a secret, and exits 1.
+//! socket exists) → logging and the panic hook → data directory → instance lock
+//! → token → signal handlers → store (opened and migrated on a blocking thread)
+//! → migration backup check → proxy listener on `127.0.0.1` (first, so the
+//! control API's port 0 can't take the proxy's saved port) → control-API
+//! listener on `127.0.0.1` → the proxy (`cs_daemon::proxy`: the call recorder
+//! and the proxy's HTTPS client) → both servers, the control API with
+//! every method (`cs_daemon::methods::Methods`) → `daemon.json`, with
+//! `proxyAddress` → wait for a signal → graceful shutdown
+//! (`cs_daemon::shutdown`): both servers stop, then the drain step writes the
+//! recorder's queue (at most `cs_daemon::proxy::RECORDER_SHUTDOWN_TIMEOUT`, less
+//! after a Windows close event) and closes the store after its writer has
+//! carried out every queued write. A startup failure prints one line naming the
+//! file or value involved, never a secret, and exits 1.
 //!
 //! A signal while the store opens or the backup check runs stops the daemon
 //! before it listens (exit 0). At exit, blocking tasks still running (a keychain
@@ -49,10 +55,12 @@ use cs_daemon::config::{self, Command, Config, USAGE, USAGE_EXIT_CODE};
 use cs_daemon::http::{self, HttpConfig};
 use cs_daemon::instance::{self, Instance};
 use cs_daemon::logging;
-use cs_daemon::methods::Methods;
+use cs_daemon::methods::{Methods, ProxyStatus};
+use cs_daemon::proxy;
 use cs_daemon::serve::{self, ServeConfig, Server};
 use cs_daemon::shutdown::{self, DrainHook, Signals};
 use cs_daemon::token::ControlToken;
+use cs_proxy::Recorder;
 use cs_store::migrate::{count_migration_backups, remove_migration_backups};
 use cs_store::{Store, secrets};
 use tokio::net::TcpListener;
@@ -74,6 +82,7 @@ fn main() -> ExitCode {
     if let Err(error) = logging::init(level) {
         return fail(&error, ExitCode::FAILURE);
     }
+    logging::install_panic_hook();
     let (config, instance, token) = match prepare(config) {
         Ok(prepared) => prepared,
         Err(error) => return fail(error.as_ref(), ExitCode::FAILURE),
@@ -166,8 +175,8 @@ async fn run(
             return Ok(());
         }
     };
-    let server = match start(&config, &instance, token, Arc::clone(&store), started).await {
-        Ok(server) => server,
+    let running = match start(&config, &instance, token, Arc::clone(&store), started).await {
+        Ok(running) => running,
         Err(error) => {
             // The error that matters is the startup failure.
             let _ = store.close().await;
@@ -178,7 +187,12 @@ async fn run(
 
     let signal = signals.recv().await;
     tracing::info!(signal = signal.name(), "shutting down");
-    let stopping = shutdown::graceful(server, signal.drain_timeout(), close_store(store), instance);
+    let stopping = shutdown::graceful(
+        running.servers,
+        signal.drain_timeout(),
+        drain(running.recorder, signal.recorder_timeout(), store),
+        instance,
+    );
     tokio::pin!(stopping);
     let mut received = 1;
     loop {
@@ -226,15 +240,26 @@ async fn open_store(data_dir: &Path) -> Result<Arc<Store>, Box<dyn Error>> {
     Ok(Arc::new(store))
 }
 
-/// The listener, the server and `daemon.json`. On failure nothing is left
-/// serving; the caller closes the store and the instance.
+/// What [`start`] leaves running.
+struct Running {
+    /// The control API's server and the proxy's.
+    servers: Vec<Server>,
+    recorder: Arc<Recorder>,
+}
+
+/// The listeners, the servers, the call recorder and `daemon.json`. On failure
+/// nothing is left serving; the caller closes the store and the instance.
 async fn start(
     config: &Config,
     instance: &Instance,
     token: Arc<ControlToken>,
     store: Arc<Store>,
     started: Instant,
-) -> Result<Server, Box<dyn Error>> {
+) -> Result<Running, Box<dyn Error>> {
+    // The proxy first: its saved port is free while no daemon runs, and the
+    // control API's port 0 must not be given that port by the OS.
+    let (proxy_listener, proxy_address) =
+        proxy::bind(&config.data_dir, config.proxy_listen).await?;
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|error| format!("cannot listen on {}: {error}", config.listen))?;
@@ -244,26 +269,59 @@ async fn start(
     else {
         return Err("the listener is not bound to an IPv4 address".into());
     };
+    let proxy = proxy::start(
+        proxy_listener,
+        proxy_address,
+        config.proxy_upstream.clone(),
+        instance.started_at_ms(),
+        Arc::clone(&store),
+        ServeConfig::default(),
+    )?;
+
     // The bound port, never the configured one (which may be 0).
     let http_config = HttpConfig::new(address.port());
-    let methods = Methods::new(store, token.clone(), started);
+    let methods = Methods::new(store, token.clone(), started).with_proxy(ProxyStatus {
+        address: proxy.address,
+        recorder: Arc::clone(&proxy.recorder),
+    });
     let router = http::router(http_config, token, Arc::new(methods));
     let server = serve::spawn(listener, router, ServeConfig::default());
+    let running = Running {
+        servers: vec![server, proxy.server],
+        recorder: proxy.recorder,
+    };
 
-    let discovery = match instance.publish(address) {
+    let discovery = match instance.publish(address, Some(proxy.address)) {
         Ok(discovery) => discovery,
         Err(error) => {
-            server.stop().await;
+            for server in running.servers {
+                server.stop().await;
+            }
+            running.recorder.shutdown().await;
             return Err(error.into());
         }
     };
     tracing::info!(
         address = %discovery.address,
+        proxy_address = %proxy.address,
+        upstream = %config.proxy_upstream.authority(),
         pid = discovery.pid,
         data_dir = %config.data_dir.display(),
         "Callsheet daemon listening"
     );
-    Ok(server)
+    Ok(running)
+}
+
+/// The drain step of the shutdown: the call recorder writes its queue (at most
+/// `recorder_timeout`, the signal's), then the store closes ([`close_store`]).
+fn drain(recorder: Arc<Recorder>, recorder_timeout: Duration, store: Arc<Store>) -> DrainHook {
+    let close = close_store(store);
+    Box::new(move || {
+        Box::pin(async move {
+            proxy::drain_recorder(&recorder, recorder_timeout).await;
+            close().await
+        })
+    })
 }
 
 /// Deletes the migration backups once the database has passed

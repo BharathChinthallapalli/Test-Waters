@@ -1,18 +1,21 @@
 //! Command line and configuration (R1.1, R1.2).
 //!
-//! Owned by unit `daemon-proc`. The whole command line is parsed, and the listen
-//! address checked, before anything touches the file system or the network: an
-//! address other than `127.0.0.1:<port>` ends the process with status 2
-//! ([`USAGE_EXIT_CODE`]) before any file or socket exists.
+//! Owned by unit `daemon-proc`; the proxy flags by feature 03, task 8 (`wire`).
+//! The whole command line is parsed, and the listen addresses and the upstream
+//! checked, before anything touches the file system or the network: a
+//! `--listen` or `--proxy-listen` other than `127.0.0.1:<port>`, or a
+//! `--proxy-upstream` that `cs_proxy::Upstream::parse` refuses, ends the
+//! process with status 2 ([`USAGE_EXIT_CODE`]) before any file or socket exists.
 //!
 //! ```text
 //! cs-daemon [--listen 127.0.0.1:<port>] [--data-dir <path>]
+//!           [--proxy-listen 127.0.0.1:<port>] [--proxy-upstream <url>]
 //! cs-daemon --help
 //! ```
 //!
 //! Each flag and its value are separate arguments (no `--flag=value`, which would
 //! need the flag and a non-UTF-8 path in one argument). The parser is written by
-//! hand; two flags don't justify a CLI crate.
+//! hand; four flags don't justify a CLI crate.
 //!
 //! **Data directory.** Without `--data-dir`, the per-user data directory comes
 //! from `etcetera::app_strategy::choose_native_strategy` with the app name
@@ -24,6 +27,13 @@
 //! - Windows: `%APPDATA%\Callsheet\data`, by default
 //!   `C:\Users\<user>\AppData\Roaming\Callsheet\data`.
 //!
+//! **Proxy.** Without `--proxy-listen` the proxy's port comes from the
+//! `proxy-port` file in the data directory (`crate::proxy`); with it, that file
+//! is neither read nor written. `--proxy-upstream` defaults to
+//! [`Upstream::ANTHROPIC`]; `http` is accepted only to a loopback IP (tests).
+//! The proxy always runs: there is no flag to turn it off, since every test gets
+//! its own data directory and so its own port.
+//!
 //! There is no configuration file yet; everything comes from the command line.
 
 use std::ffi::OsString;
@@ -31,6 +41,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
+use cs_proxy::{Upstream, UpstreamError};
 use etcetera::app_strategy::{AppStrategy, AppStrategyArgs, choose_native_strategy};
 
 /// The listen address when `--listen` isn't given: `127.0.0.1`, on a port the
@@ -52,8 +63,10 @@ const APP_NAME: &str = "Callsheet";
 /// Printed for `--help`.
 pub const USAGE: &str = "\
 Usage: cs-daemon [--listen 127.0.0.1:<port>] [--data-dir <path>]
+                 [--proxy-listen 127.0.0.1:<port>] [--proxy-upstream <url>]
 
-Runs the Callsheet daemon: the control API on 127.0.0.1 and the local store.
+Runs the Callsheet daemon: the control API and the model-call proxy on
+127.0.0.1, and the local store.
 
 Options:
   --listen <ip:port>   Address of the control API; the IP must be 127.0.0.1.
@@ -62,6 +75,14 @@ Options:
   --data-dir <path>    Data directory. Default: the per-user data directory
                        (~/.local/share/callsheet, ~/Library/Application Support/
                        Callsheet or %APPDATA%\\Callsheet\\data).
+  --proxy-listen <ip:port>
+                       Address of the model-call proxy; the IP must be
+                       127.0.0.1. Default: the port saved in proxy-port in the
+                       data directory, picked from 20000-29999 on the first
+                       start and reused after, so ANTHROPIC_BASE_URL stays valid.
+  --proxy-upstream <url>
+                       Where the proxy forwards calls: an https URL, or http to
+                       a loopback IP (tests). Default https://api.anthropic.com.
   --help               Print this help.
 
 Environment:
@@ -83,6 +104,11 @@ pub struct Config {
     /// Always `127.0.0.1`; the port may be 0.
     pub listen: SocketAddrV4,
     pub data_dir: PathBuf,
+    /// `--proxy-listen`: always `127.0.0.1`; the port may be 0. `None` means the
+    /// port saved in the data directory (`crate::proxy`).
+    pub proxy_listen: Option<SocketAddrV4>,
+    /// `--proxy-upstream`, [`Upstream::ANTHROPIC`] by default.
+    pub proxy_upstream: Upstream,
 }
 
 /// A command line the daemon can't use. Every variant exits with
@@ -95,10 +121,17 @@ pub enum ConfigError {
     Repeated { flag: &'static str },
     /// An argument that isn't a known flag.
     UnknownArgument(String),
-    /// `--listen` isn't `<ip>:<port>`.
-    InvalidListen(String),
-    /// `--listen` is a valid address, but not `127.0.0.1` (R1.2).
-    NotLoopback(SocketAddr),
+    /// `--listen` or `--proxy-listen` isn't `<ip>:<port>`.
+    InvalidListen { flag: &'static str, value: String },
+    /// `--listen` or `--proxy-listen` is a valid address, but not `127.0.0.1`
+    /// (R1.2; feature 03, requirement 5).
+    NotLoopback {
+        flag: &'static str,
+        address: SocketAddr,
+    },
+    /// `--proxy-upstream` was refused. The message never repeats the URL, which
+    /// could hold a credential.
+    InvalidUpstream(UpstreamError),
     /// `--data-dir` is empty.
     EmptyDataDir,
     /// No `--data-dir`, and etcetera found no home directory.
@@ -113,16 +146,21 @@ impl fmt::Display for ConfigError {
             Self::UnknownArgument(argument) => {
                 write!(f, "unknown argument {argument:?} (see --help)")
             }
-            Self::InvalidListen(value) => {
+            Self::InvalidListen { flag, value } => {
                 write!(
                     f,
-                    "--listen {value:?} is not an address like 127.0.0.1:<port>"
+                    "{flag} {value:?} is not an address like 127.0.0.1:<port>"
                 )
             }
-            Self::NotLoopback(address) => write!(
-                f,
-                "--listen {address}: the control API only listens on 127.0.0.1"
-            ),
+            Self::NotLoopback { flag, address } => {
+                let what = if *flag == PROXY_LISTEN {
+                    "the proxy"
+                } else {
+                    "the control API"
+                };
+                write!(f, "{flag} {address}: {what} only listens on 127.0.0.1")
+            }
+            Self::InvalidUpstream(error) => write!(f, "{PROXY_UPSTREAM}: {error}"),
             Self::EmptyDataDir => f.write_str("--data-dir is empty"),
             Self::NoDataDir => f.write_str(
                 "no home directory to put the data directory in; pass --data-dir <path>",
@@ -142,6 +180,8 @@ where
 {
     let mut listen: Option<SocketAddrV4> = None;
     let mut data_dir: Option<PathBuf> = None;
+    let mut proxy_listen: Option<SocketAddrV4> = None;
+    let mut proxy_upstream: Option<Upstream> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
@@ -150,7 +190,7 @@ where
         match arg.to_str() {
             Some(LISTEN) => {
                 let value = value_of(LISTEN, &mut args)?;
-                set_once(&mut listen, LISTEN, parse_listen(&value)?)?;
+                set_once(&mut listen, LISTEN, parse_listen(LISTEN, &value)?)?;
             }
             Some(DATA_DIR) => {
                 let value = value_of(DATA_DIR, &mut args)?;
@@ -158,6 +198,17 @@ where
                     return Err(ConfigError::EmptyDataDir);
                 }
                 set_once(&mut data_dir, DATA_DIR, PathBuf::from(value))?;
+            }
+            Some(PROXY_LISTEN) => {
+                let value = value_of(PROXY_LISTEN, &mut args)?;
+                let address = parse_listen(PROXY_LISTEN, &value)?;
+                set_once(&mut proxy_listen, PROXY_LISTEN, address)?;
+            }
+            Some(PROXY_UPSTREAM) => {
+                let value = value_of(PROXY_UPSTREAM, &mut args)?;
+                let upstream = Upstream::parse(&value.to_string_lossy())
+                    .map_err(ConfigError::InvalidUpstream)?;
+                set_once(&mut proxy_upstream, PROXY_UPSTREAM, upstream)?;
             }
             _ => {
                 return Err(ConfigError::UnknownArgument(
@@ -170,14 +221,22 @@ where
         Some(path) => path,
         None => default_data_dir()?,
     };
+    let proxy_upstream = match proxy_upstream {
+        Some(upstream) => upstream,
+        None => Upstream::parse(Upstream::ANTHROPIC).map_err(ConfigError::InvalidUpstream)?,
+    };
     Ok(Command::Run(Config {
         listen: listen.unwrap_or(DEFAULT_LISTEN),
         data_dir,
+        proxy_listen,
+        proxy_upstream,
     }))
 }
 
 const LISTEN: &str = "--listen";
 const DATA_DIR: &str = "--data-dir";
+const PROXY_LISTEN: &str = "--proxy-listen";
+const PROXY_UPSTREAM: &str = "--proxy-upstream";
 
 fn value_of(
     flag: &'static str,
@@ -194,17 +253,18 @@ fn set_once<T>(slot: &mut Option<T>, flag: &'static str, value: T) -> Result<(),
     Ok(())
 }
 
-/// Accepts only `127.0.0.1:<port>`. `localhost`, `::1`, other `127.x` addresses and
-/// every non-loopback address are refused: clients connect to one address,
-/// `127.0.0.1` (design, "Configuration and binding").
-pub fn parse_listen(value: &OsString) -> Result<SocketAddrV4, ConfigError> {
+/// Accepts only `127.0.0.1:<port>` as the value of `flag`. `localhost`, `::1`,
+/// other `127.x` addresses and every non-loopback address are refused: clients
+/// connect to one address, `127.0.0.1` (design, "Configuration and binding").
+pub fn parse_listen(flag: &'static str, value: &OsString) -> Result<SocketAddrV4, ConfigError> {
     let text = value.to_string_lossy();
-    let address: SocketAddr = text
-        .parse()
-        .map_err(|_| ConfigError::InvalidListen(text.clone().into_owned()))?;
+    let address: SocketAddr = text.parse().map_err(|_| ConfigError::InvalidListen {
+        flag,
+        value: text.clone().into_owned(),
+    })?;
     match address {
         SocketAddr::V4(v4) if *v4.ip() == Ipv4Addr::LOCALHOST => Ok(v4),
-        other => Err(ConfigError::NotLoopback(other)),
+        address => Err(ConfigError::NotLoopback { flag, address }),
     }
 }
 
@@ -240,6 +300,8 @@ mod tests {
 
         assert_eq!(config.listen, "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.data_dir, PathBuf::from("d"));
+        assert_eq!(config.proxy_listen, None);
+        assert_eq!(config.proxy_upstream.as_str(), Upstream::ANTHROPIC);
     }
 
     #[test]
@@ -273,40 +335,47 @@ mod tests {
             Command::Run(Config {
                 listen: DEFAULT_LISTEN,
                 data_dir: PathBuf::from(path),
+                proxy_listen: None,
+                proxy_upstream: Upstream::parse(Upstream::ANTHROPIC).unwrap(),
             })
         );
     }
 
     #[test]
     fn refuses_every_other_address() {
-        for value in [
-            "0.0.0.0:1",
-            "127.0.0.2:1",
-            "10.0.0.1:1",
-            "[::1]:1",
-            "[::]:1",
-        ] {
-            assert!(
-                matches!(
-                    parse(&["--listen", value, "--data-dir", "d"]),
-                    Err(ConfigError::NotLoopback(_))
-                ),
-                "{value}"
-            );
-        }
-        for value in [
-            "localhost:1",
-            "::1",
-            "127.0.0.1",
-            "garbage",
-            "",
-            "127.0.0.1:99999",
-        ] {
-            assert_eq!(
-                parse(&["--listen", value, "--data-dir", "d"]),
-                Err(ConfigError::InvalidListen(value.to_owned())),
-                "{value}"
-            );
+        for flag in [LISTEN, PROXY_LISTEN] {
+            for value in [
+                "0.0.0.0:1",
+                "127.0.0.2:1",
+                "10.0.0.1:1",
+                "[::1]:1",
+                "[::]:1",
+            ] {
+                assert!(
+                    matches!(
+                        parse(&[flag, value, "--data-dir", "d"]),
+                        Err(ConfigError::NotLoopback { flag: refused, .. }) if refused == flag
+                    ),
+                    "{flag} {value}"
+                );
+            }
+            for value in [
+                "localhost:1",
+                "::1",
+                "127.0.0.1",
+                "garbage",
+                "",
+                "127.0.0.1:99999",
+            ] {
+                assert_eq!(
+                    parse(&[flag, value, "--data-dir", "d"]),
+                    Err(ConfigError::InvalidListen {
+                        flag,
+                        value: value.to_owned()
+                    }),
+                    "{flag} {value}"
+                );
+            }
         }
     }
 
@@ -325,17 +394,89 @@ mod tests {
             Err(ConfigError::Repeated { flag: DATA_DIR })
         );
         assert_eq!(parse(&["--data-dir", ""]), Err(ConfigError::EmptyDataDir));
+        assert_eq!(
+            parse(&["--proxy-upstream"]),
+            Err(ConfigError::MissingValue {
+                flag: PROXY_UPSTREAM
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "--proxy-listen",
+                "127.0.0.1:1",
+                "--proxy-listen",
+                "127.0.0.1:2"
+            ]),
+            Err(ConfigError::Repeated { flag: PROXY_LISTEN })
+        );
     }
 
     #[test]
     fn arguments_are_read_in_order_up_to_help() {
         assert_eq!(
             parse(&["--listen", "0.0.0.0:1", "--help"]),
-            Err(ConfigError::NotLoopback("0.0.0.0:1".parse().unwrap()))
+            Err(ConfigError::NotLoopback {
+                flag: LISTEN,
+                address: "0.0.0.0:1".parse().unwrap()
+            })
         );
         assert_eq!(
             parse(&["--help", "--listen", "0.0.0.0:1"]),
             Ok(Command::Help)
+        );
+    }
+
+    #[test]
+    fn proxy_flags_are_read() {
+        let config = run(&[
+            "--proxy-listen",
+            "127.0.0.1:4200",
+            "--proxy-upstream",
+            "http://127.0.0.1:9/base",
+            "--data-dir",
+            "d",
+        ]);
+
+        assert_eq!(config.proxy_listen, Some("127.0.0.1:4200".parse().unwrap()));
+        assert_eq!(config.proxy_upstream.as_str(), "http://127.0.0.1:9/base");
+        assert_eq!(
+            run(&["--proxy-listen", "127.0.0.1:0", "--data-dir", "d"]).proxy_listen,
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_refused_upstream_is_a_usage_error_that_does_not_repeat_it() {
+        for value in [
+            "http://example.com",
+            "ftp://127.0.0.1",
+            "https://user:hunter2@api.example.com",
+            "https://api.example.com/?key=hunter2",
+            "not a url hunter2",
+        ] {
+            let error = parse(&["--proxy-upstream", value, "--data-dir", "d"]).unwrap_err();
+
+            assert!(
+                matches!(error, ConfigError::InvalidUpstream(_)),
+                "{value}: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.starts_with("--proxy-upstream: "), "{message}");
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+    }
+
+    #[test]
+    fn messages_name_the_flag_and_what_listens() {
+        assert_eq!(
+            parse(&["--proxy-listen", "0.0.0.0:1"])
+                .unwrap_err()
+                .to_string(),
+            "--proxy-listen 0.0.0.0:1: the proxy only listens on 127.0.0.1"
+        );
+        assert_eq!(
+            parse(&["--listen", "0.0.0.0:1"]).unwrap_err().to_string(),
+            "--listen 0.0.0.0:1: the control API only listens on 127.0.0.1"
         );
     }
 

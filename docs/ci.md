@@ -35,12 +35,18 @@ says how to run it locally.
 ## The daemon client test
 
 `packages/api-types/test/daemon.integration.test.ts` (feature 02, R2.8 and
-R2.9) starts the built `cs-daemon` binary with a temporary `--data-dir` and the
-default listen address (port 0), reads `daemon.json` and the token, calls
-`health` and `version` typed with the generated types, checks 401 for a missing
-or wrong token, rotates the token (the old one gets 401, a client re-reads the
-file once and succeeds), then sends `SIGTERM` and checks exit status 0 and that
-`daemon.json` is gone. It uses only Node built-ins.
+R2.9; feature 03, requirement 7) starts a mock Anthropic API on loopback
+(`node:http`), then the built `cs-daemon` binary with a temporary `--data-dir`,
+the default listen address (port 0) and `--proxy-upstream` pointing at the mock.
+It reads `daemon.json` (including `proxyAddress`, which must match the saved
+`proxy-port`) and the token, calls `health` and `version` typed with the
+generated types, sends one `POST /v1/messages` through the proxy with a fake
+`x-api-key` and reads it back with `calls.list` (run, model, usage, outcome)
+and `health.proxy.callsRecorded`, checks 401 for a missing or wrong token,
+rotates the token (the old one gets 401, a client re-reads the file once and
+succeeds), then sends `SIGTERM` and checks exit status 0 and that `daemon.json`
+is gone. It uses only Node built-ins, and nothing leaves the machine: the
+proxy's upstream is the loopback mock.
 
 It needs the binary, so it is not part of `pnpm -r test` (the `ts` job has no
 Rust toolchain) and has its own script instead. It fails, never skips, when the
@@ -195,13 +201,14 @@ have seen it.
   systemd-resolved's D-Bus interface), and I/O submitted through `io_uring`,
   make no `connect` or `send` call in the traced processes. A `send` or `write`
   on an already connected socket isn't traced, but its `connect` is.
-- **The daemon's HTTP client.** `cs-daemon` has no outbound client today:
-  reqwest is in `cs-proxy`, which the daemon doesn't depend on yet (it will
-  from task 8). Today the daemon legs prove that its idle start and its
-  pairing with the app make no connections. Once the proxy is wired in, they
-  also cover reqwest, which honours `HTTPS_PROXY` (cs-proxy turns proxies off
-  only for a loopback upstream), and anything it connects directly shows in
-  the trace.
+- **Calls routed through the daemon's proxy.** Since feature 03, task 8, the
+  daemon runs the model-call proxy: its reqwest client (which honours
+  `HTTPS_PROXY`; cs-proxy turns proxies off only for a loopback upstream) is
+  built at startup but opens no connection and resolves no name until a call
+  arrives. The daemon legs cover that idle state (the proxy's loopback
+  listener, its `proxy-port` file and its recorder are local only). A call a
+  user sends through the proxy goes to the provider by design, and no leg
+  sends one.
 - **Anything after the user acts.** The app is left idle; no button is pressed
   and no network feature is turned on.
 
