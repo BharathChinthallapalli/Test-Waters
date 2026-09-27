@@ -6,14 +6,18 @@
  *
  * Every variant carries `message`, one plain-language sentence saying what
  * happened; `checkedAtMs`, when the check that produced it finished (0 before
- * the first check); and `customDataDir`, true when the data directory came from
- * `CALLSHEET_DATA_DIR`, so starting the daemon needs `--data-dir`.
+ * the first check); `customDataDir`, true when the data directory came from
+ * `CALLSHEET_DATA_DIR`, so starting the daemon needs `--data-dir`; and
+ * `platform`, which decides how that command is quoted. `detail` is optional
+ * secondary technical detail (an error code, a daemon's error message) that is
+ * never the message itself.
  */
 export type DaemonStatus =
   | ConnectingStatus
   | StartingStatus
   | NotRunningStatus
   | RunningStatus
+  | UnhealthyStatus
   | UnauthorizedStatus
   | UnreachableStatus
   | ErrorStatus;
@@ -22,6 +26,16 @@ interface StatusBase {
   message: string;
   checkedAtMs: number;
   customDataDir: boolean;
+  /** "windows" gets PowerShell quoting in the start command, "posix" sh quoting. */
+  platform: CommandPlatform;
+  detail?: string;
+}
+
+export type CommandPlatform = "windows" | "posix";
+
+/** How the start command is quoted, from Node's `process.platform`. */
+export function commandPlatform(platform: string): CommandPlatform {
+  return platform === "win32" ? "windows" : "posix";
 }
 
 /** The app has not finished its first check yet. */
@@ -66,6 +80,18 @@ export interface RunningStatus extends StatusBase {
   health: DaemonHealth | null;
 }
 
+/**
+ * A live daemon accepted the token and answered `version`, but its `health`
+ * call returned a JSON-RPC error (other than "method not found").
+ */
+export interface UnhealthyStatus extends StatusBase {
+  state: "unhealthy";
+  dataDir: string;
+  address: string;
+  pid: number;
+  daemonVersion: string;
+}
+
 /** The daemon rejected the token twice, re-reading the token file in between. */
 export interface UnauthorizedStatus extends StatusBase {
   state: "unauthorized";
@@ -73,7 +99,10 @@ export interface UnauthorizedStatus extends StatusBase {
   address: string;
 }
 
-/** A live daemon process is registered, but its address refused or timed out. */
+/**
+ * A live daemon process is registered, but its address refused the connection,
+ * closed it without answering, or didn't answer in time.
+ */
 export interface UnreachableStatus extends StatusBase {
   state: "unreachable";
   dataDir: string;
@@ -102,7 +131,9 @@ export type ErrorReason =
   | "bad-token"
   /** The program at the address didn't answer like the daemon. */
   | "protocol"
-  /** The daemon answered with a JSON-RPC error, or something else failed. */
-  | "unexpected";
+  /** The daemon answered `version` with a JSON-RPC error, or something else failed. */
+  | "unexpected"
+  /** The app's own renderer couldn't get a status from its main process. */
+  | "app";
 
 export type DaemonState = DaemonStatus["state"];

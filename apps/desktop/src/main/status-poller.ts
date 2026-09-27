@@ -1,4 +1,6 @@
-import type { DaemonStatus } from "../shared/daemon-status.ts";
+import { commandPlatform, type DaemonStatus } from "../shared/daemon-status.ts";
+
+const PLATFORM = commandPlatform(process.platform);
 
 /** How often the daemon is checked while the window is visible. */
 export const POLL_INTERVAL_MS = 3000;
@@ -22,6 +24,7 @@ const INITIAL_STATUS: DaemonStatus = {
   message: "This usually takes less than a second.",
   checkedAtMs: 0,
   customDataDir: false,
+  platform: PLATFORM,
 };
 
 /**
@@ -90,6 +93,7 @@ export class StatusPoller {
         dataDir: null,
         reason: "unexpected",
         customDataDir: false,
+        platform: PLATFORM,
         message: "Something unexpected went wrong while checking the daemon.",
         checkedAtMs: Date.now(),
       };

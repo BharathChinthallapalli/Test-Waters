@@ -6,12 +6,17 @@ import type {
   ErrorReason,
   RunningStatus,
 } from "../shared/daemon-status.ts";
-import { describeStatus, type StatusView } from "./describe.ts";
+import {
+  CAPTURE_OFF_NOTE,
+  describeStatus,
+  type StatusView,
+} from "./describe.ts";
 
 const base = {
   message: "What happened.",
   checkedAtMs: 1,
   customDataDir: false,
+  platform: "posix" as const,
 };
 const dataDir = "/home/ann/.local/share/callsheet";
 const address = "127.0.0.1:4100";
@@ -42,6 +47,7 @@ const REASONS: ErrorReason[] = [
   "bad-token",
   "protocol",
   "unexpected",
+  "app",
 ];
 
 const EVERY_STATE: DaemonStatus[] = [
@@ -54,11 +60,21 @@ const EVERY_STATE: DaemonStatus[] = [
   { ...running, health: { ...health, erasurePending: true } },
   { ...base, state: "unauthorized", dataDir, address },
   { ...base, state: "unreachable", dataDir, address, pid: 7 },
+  {
+    ...base,
+    state: "unhealthy",
+    dataDir,
+    address,
+    pid: 7,
+    daemonVersion: "0.1.0",
+    detail: "Error -32000: store unavailable",
+  },
   ...REASONS.map(
     (reason): DaemonStatus => ({ ...base, state: "error", dataDir, reason }),
   ),
 ];
 
+/** Everything but the technical detail row, which may hold codes on purpose. */
 function strings(view: StatusView): string[] {
   return [
     view.headline,
@@ -68,7 +84,9 @@ function strings(view: StatusView): string[] {
     view.nextStep?.text,
     view.nextStep?.command,
     view.nextStep?.after,
-    ...view.rows.flatMap((row) => [row.label, row.value, row.note]),
+    ...view.rows
+      .filter((row) => row.key !== "detail")
+      .flatMap((row) => [row.label, row.value, row.note]),
   ].filter((text): text is string => text !== undefined);
 }
 
@@ -90,11 +108,15 @@ test("each state has its own headline and mark", () => {
     starting: ["Daemon starting", "pending"],
     "not-running": ["Daemon not running", "off"],
     running: ["Daemon running", "ok"],
+    unhealthy: ["Daemon unhealthy", "warning"],
     unauthorized: ["Daemon refused access", "warning"],
     unreachable: ["Daemon not responding", "danger"],
     error: ["Can't check the daemon", "danger"],
   };
   for (const status of EVERY_STATE) {
+    if (status.state === "error" && status.reason === "app") {
+      continue; // below
+    }
     const view = describeStatus(status);
     assert.deepEqual([view.headline, view.tone], expected[status.state]);
   }
@@ -140,7 +162,7 @@ test("running: aligned facts, humanised and grouped", () => {
   );
   assert.equal(row(view, "address")?.mono, true);
   assert.equal(row(view, "version")?.mono, undefined);
-  assert.match(row(view, "capture")?.note ?? "", /never message content/);
+  assert.equal(row(view, "capture")?.note, CAPTURE_OFF_NOTE);
   assert.equal(view.notice, null);
   assert.equal(view.nextStep, null);
 });
@@ -208,8 +230,86 @@ test("unreachable says which process to stop and how to start again", () => {
     address,
     pid: 4321,
   });
-  assert.match(view.nextStep?.text ?? "", /stop process 4321/);
+  assert.match(view.nextStep?.text ?? "", /stop the daemon \(process 4321\)/);
   assert.equal(view.nextStep?.command, "cs-daemon");
+});
+
+test("capture off says what PRIVACY.md says: new content isn't stored, old content stays", () => {
+  assert.equal(
+    CAPTURE_OFF_NOTE,
+    "New message content isn't stored, only call metadata. Content stored while capture was on stays until you erase it.",
+  );
+});
+
+test("unhealthy: the daemon runs but its health call failed; the error is only a detail", () => {
+  const view = describeStatus({
+    ...base,
+    state: "unhealthy",
+    dataDir,
+    address,
+    pid: 4321,
+    daemonVersion: "0.1.0",
+    detail: "Error -32000: store unavailable",
+  });
+  assert.deepEqual(
+    view.rows.map((r) => [r.key, r.value]),
+    [
+      ["address", address],
+      ["version", "0.1.0"],
+      ["pid", "4321"],
+      ["detail", "Error -32000: store unavailable"],
+    ],
+  );
+  assert.equal(row(view, "detail")?.label, "Technical detail");
+  assert.match(view.nextStep?.text ?? "", /stop the daemon \(process 4321\)/);
+  assert.equal(view.nextStep?.command, "cs-daemon");
+});
+
+test("an app-side failure doesn't blame the daemon and says to restart Callsheet", () => {
+  const view = describeStatus({
+    ...base,
+    state: "error",
+    dataDir: null,
+    reason: "app",
+  });
+  assert.equal(view.headline, "Callsheet can't show the status");
+  assert.match(view.nextStep?.text ?? "", /^Restart Callsheet\./);
+  assert.equal(view.nextStep?.command, undefined);
+  assert.deepEqual(view.rows, []);
+});
+
+test("a detail is shown last, as a secondary row, only when there is one", () => {
+  const status: DaemonStatus = {
+    ...base,
+    state: "error",
+    dataDir,
+    reason: "unreadable",
+    detail: "EACCES",
+  };
+  const rows = describeStatus(status).rows;
+  assert.deepEqual(rows.at(-1), {
+    key: "detail",
+    label: "Technical detail",
+    value: "EACCES",
+    mono: true,
+  });
+  const { detail: _, ...withoutDetail } = status;
+  assert.equal(row(describeStatus(withoutDetail), "detail"), undefined);
+});
+
+test("on Windows the start command is quoted for cmd.exe and PowerShell", () => {
+  const view = describeStatus({
+    ...base,
+    platform: "windows",
+    customDataDir: true,
+    state: "not-running",
+    dataDir: "C:\\Users\\ann\\My Data",
+    stale: false,
+  });
+  assert.equal(
+    view.nextStep?.command,
+    'cs-daemon --data-dir "C:\\Users\\ann\\My Data"',
+  );
 });
 
 test("each error reason has its own next step", () => {

@@ -10,8 +10,8 @@ export function createWindowOptions(
   return {
     width: 1100,
     height: 720,
-    // The status screen's narrow layout starts below 560 px; smaller than this
-    // it would have to clip or scroll sideways.
+    // The status screen switches to its narrow layout at 520 px (style.css) and
+    // is designed down to 420 px; narrower, it would clip or scroll sideways.
     minWidth: 420,
     minHeight: 480,
     title: "Callsheet",

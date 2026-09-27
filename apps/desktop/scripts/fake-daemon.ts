@@ -8,6 +8,7 @@
 // same Host and bearer checks. Modes:
 //   healthy        `version` and `health` (default)
 //   no-health      `health` answers -32601, like a daemon before task 11
+//   unhealthy      `health` answers a JSON-RPC error (-32000)
 //   unauthorized   accepts no token: every request gets 401
 //   unreachable    publishes a port nothing listens on
 //   hang           accepts connections and never answers
@@ -37,7 +38,10 @@ if (!dataDir) {
 }
 const mode = values.mode;
 const token = randomBytes(32).toString("hex");
-const startedAtMs = Date.now() - Number(values["uptime-ms"]);
+// daemon.json gets the real start time: the app checks it against when this
+// process started. The longer --uptime-ms is only what `health` reports.
+const startedAtMs = Date.now();
+const reportedStartMs = startedAtMs - Number(values["uptime-ms"]);
 
 function reply(id: unknown, body: Record<string, unknown>): string {
   return JSON.stringify({ jsonrpc: "2.0", id, ...body });
@@ -53,10 +57,15 @@ function answer(method: unknown, id: unknown): string {
           error: { code: -32601, message: "Method not found" },
         });
       }
+      if (mode === "unhealthy") {
+        return reply(id, {
+          error: { code: -32000, message: "store unavailable" },
+        });
+      }
       return reply(id, {
         result: {
           status: "ok",
-          uptimeMs: Date.now() - startedAtMs,
+          uptimeMs: Date.now() - reportedStartMs,
           schemaVersion: 1,
           captureContent: values.capture === "on",
           lastGlobalPosition: Number(values.events),

@@ -3,6 +3,8 @@
  * no-break space so a value never wraps between "2" and "h".
  */
 
+import type { CommandPlatform } from "../shared/daemon-status.ts";
+
 const NBSP = " ";
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -69,21 +71,57 @@ export function formatClock(ms: number, locale?: string): string {
 }
 
 /**
- * The command that starts the daemon. A custom data directory is passed on,
- * quoted for the shell when it has anything but plain path characters: single
- * quotes for POSIX shells (and PowerShell, which also takes them literally),
- * so nothing in the path is expanded.
+ * The command that starts the daemon, as typed into the platform's usual shell.
+ * A custom data directory is passed on. It is left bare only when every
+ * character is safe unquoted in that shell; otherwise it is quoted so that
+ * nothing in it is expanded:
+ * - POSIX shells (Linux, macOS): `'…'`, with each `'` written `'\''`;
+ * - Windows: `"…"`, which cmd.exe and PowerShell both take literally unless it
+ *   holds `%` (cmd.exe), `$` or a backtick (PowerShell), or a double quote
+ *   (PowerShell also reads U+201C, U+201D and U+201E as one). A trailing `\`
+ *   is also left out of double quotes, where it would escape the closing quote
+ *   for the program's argument parser. Those rare paths get PowerShell's
+ *   `'…'`, with each single quote doubled; PowerShell reads U+2018 to U+201B
+ *   as single quotes too, so those are doubled as well (about_Quoting_Rules;
+ *   `CharExtensions.IsSingleQuote` and `IsDoubleQuote` in PowerShell).
  */
-export function startCommand(dataDir: string | null): string {
+export function startCommand(
+  dataDir: string | null,
+  platform: CommandPlatform,
+): string {
   if (dataDir === null) {
     return "cs-daemon";
   }
-  return `cs-daemon --data-dir ${quoteArgument(dataDir)}`;
+  const quoted =
+    platform === "windows" ? quoteWindows(dataDir) : quotePosix(dataDir);
+  return `cs-daemon --data-dir ${quoted}`;
 }
 
-function quoteArgument(value: string): string {
-  if (/^[\w@%+=:,./\\-]+$/.test(value)) {
+/** Plain path characters. No `\`, which is an escape in POSIX shells. */
+const POSIX_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+/**
+ * Plain path characters. No `,` (the array operator), `@` (splatting) or `%`
+ * (an alias), which PowerShell can read as syntax.
+ */
+const WINDOWS_SAFE = /^[A-Za-z0-9_.:\\/-]+$/;
+
+/** Not literal inside double quotes in cmd.exe or PowerShell. */
+const DOUBLE_QUOTE_UNSAFE = /[%$`"“”„]|\\$/;
+
+/** U+0027 and U+2018, U+2019, U+201A, U+201B. */
+const POWERSHELL_SINGLE_QUOTES = /['‘’‚‛]/g;
+
+function quotePosix(value: string): string {
+  return POSIX_SAFE.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function quoteWindows(value: string): string {
+  if (WINDOWS_SAFE.test(value)) {
     return value;
   }
-  return `'${value.replaceAll("'", "'\\''")}'`;
+  if (!DOUBLE_QUOTE_UNSAFE.test(value)) {
+    return `"${value}"`; // cmd.exe and PowerShell
+  }
+  return `'${value.replace(POWERSHELL_SINGLE_QUOTES, "$&$&")}'`; // PowerShell
 }

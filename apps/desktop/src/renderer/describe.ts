@@ -48,10 +48,25 @@ export interface StatusView {
   rows: DetailRow[];
 }
 
-const CAPTURE_ON_NOTE = "Message content is stored on this machine.";
-const CAPTURE_OFF_NOTE = "Only metadata is recorded, never message content.";
+export const CAPTURE_ON_NOTE = "Message content is stored on this machine.";
+/** Matches PRIVACY.md, "Content capture and your keychain". */
+export const CAPTURE_OFF_NOTE =
+  "New message content isn't stored, only call metadata. Content stored while capture was on stays until you erase it.";
 
 export function describeStatus(status: DaemonStatus): StatusView {
+  const view = describeState(status);
+  if (status.detail !== undefined) {
+    view.rows.push({
+      key: "detail",
+      label: "Technical detail",
+      value: status.detail,
+      mono: true,
+    });
+  }
+  return view;
+}
+
+function describeState(status: DaemonStatus): StatusView {
   switch (status.state) {
     case "connecting":
       return {
@@ -70,7 +85,8 @@ export function describeStatus(status: DaemonStatus): StatusView {
         message: status.message,
         notice: null,
         nextStep: {
-          text: "This usually takes a moment. The screen updates by itself.",
+          text: `This usually takes a moment, and the screen updates by itself. If it lasts more than a minute, stop the daemon (process ${status.pid}) and start it again:`,
+          command: command(status),
         },
         rows: [
           { key: "pid", label: "Process", value: String(status.pid) },
@@ -86,7 +102,7 @@ export function describeStatus(status: DaemonStatus): StatusView {
         notice: null,
         nextStep: {
           text: "Start it in a terminal:",
-          command: startCommand(status.customDataDir ? status.dataDir : null),
+          command: command(status),
           after: "This screen updates by itself once it's running.",
         },
         rows: [dataDirRow(status.dataDir)],
@@ -137,6 +153,28 @@ export function describeStatus(status: DaemonStatus): StatusView {
         ],
       };
 
+    case "unhealthy":
+      return {
+        tone: "warning",
+        headline: "Daemon unhealthy",
+        message: status.message,
+        notice: null,
+        nextStep: {
+          text: `It may recover by itself. If this lasts more than a minute, stop the daemon (process ${status.pid}) and start it again:`,
+          command: command(status),
+        },
+        rows: [
+          {
+            key: "address",
+            label: "Address",
+            value: status.address,
+            mono: true,
+          },
+          { key: "version", label: "Version", value: status.daemonVersion },
+          { key: "pid", label: "Process", value: String(status.pid) },
+        ],
+      };
+
     case "unauthorized":
       return {
         tone: "warning",
@@ -169,8 +207,8 @@ export function describeStatus(status: DaemonStatus): StatusView {
         message: status.message,
         notice: null,
         nextStep: {
-          text: `It may be busy or stuck. If this lasts more than a minute, stop process ${status.pid} and start the daemon again:`,
-          command: startCommand(status.customDataDir ? status.dataDir : null),
+          text: `It may be busy or stuck. If this lasts more than a minute, stop the daemon (process ${status.pid}) and start it again:`,
+          command: command(status),
         },
         rows: [
           {
@@ -187,7 +225,10 @@ export function describeStatus(status: DaemonStatus): StatusView {
     case "error":
       return {
         tone: "danger",
-        headline: "Can't check the daemon",
+        headline:
+          status.reason === "app"
+            ? "Callsheet can't show the status"
+            : "Can't check the daemon",
         message: status.message,
         notice: null,
         nextStep: errorNextStep(status),
@@ -198,8 +239,15 @@ export function describeStatus(status: DaemonStatus): StatusView {
 
 const RESTARTED = "This screen updates by itself once it's running again.";
 
+function command(status: DaemonStatus & { dataDir: string | null }): string {
+  return startCommand(
+    status.customDataDir ? status.dataDir : null,
+    status.platform,
+  );
+}
+
 function errorNextStep(status: ErrorStatus): NextStep {
-  const command = startCommand(status.customDataDir ? status.dataDir : null);
+  const start = command(status);
   switch (status.reason) {
     case "no-data-dir":
       return {
@@ -212,31 +260,35 @@ function errorNextStep(status: ErrorStatus): NextStep {
     case "invalid-record":
       return {
         text: "Restart the daemon so it writes the file again:",
-        command,
+        command: start,
         after: RESTARTED,
       };
     case "not-loopback":
       return {
         text: "Callsheet's daemon only listens on 127.0.0.1, so another program may have written this file. Restart the daemon to replace it:",
-        command,
+        command: start,
         after: RESTARTED,
       };
     case "bad-token":
       return {
         text: "Restart the daemon: it creates a missing token file. If the file is damaged, delete it first.",
-        command,
+        command: start,
         after: RESTARTED,
       };
     case "protocol":
       return {
         text: "Another program may have taken the daemon's port. Restart the daemon so it publishes a new address:",
-        command,
+        command: start,
         after: RESTARTED,
       };
     case "unexpected":
       return {
         text: "The app keeps checking. If this stays, restart the daemon:",
-        command,
+        command: start,
+      };
+    case "app":
+      return {
+        text: "Restart Callsheet. Restarting the app doesn't stop the daemon.",
       };
   }
 }

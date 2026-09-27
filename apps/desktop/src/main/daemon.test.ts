@@ -12,12 +12,18 @@ import {
   describe,
   test,
 } from "node:test";
-import type { DaemonStatus } from "../shared/daemon-status.ts";
+import { commandPlatform, type DaemonStatus } from "../shared/daemon-status.ts";
 import {
+  BOOT_SLACK_MS,
   DaemonMonitor,
   type MonitorOptions,
+  type ProcessInfo,
+  parseBootTime,
   parseDiscovery,
+  parseProcessStat,
+  readLinuxProcessInfo,
   resolveDataDir,
+  START_SLACK_MS,
 } from "./daemon.ts";
 
 const TOKEN_A = "a".repeat(64);
@@ -130,6 +136,53 @@ describe("parseDiscovery", () => {
   });
 });
 
+describe("reading /proc", () => {
+  // Field 2 may hold spaces and parentheses; field 22 is the start time in ticks.
+  const stat =
+    "4242 (cs daemon (x)) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 4 0 12345 1000 50 18446744073709551615";
+
+  test("state and start time are read after the last parenthesis", () => {
+    assert.deepEqual(parseProcessStat(stat, 1_000_000), {
+      state: "S",
+      startedAtMs: 1_000_000 + 123_450,
+    });
+    assert.equal(parseProcessStat(stat.replace(") S ", ") Z "), 0)?.state, "Z");
+    assert.equal(parseProcessStat("4242 no parenthesis", 0), null);
+    assert.equal(parseProcessStat("4242 (x) S 1", 0), null);
+  });
+
+  test("btime is the boot time in seconds", () => {
+    assert.equal(
+      parseBootTime("cpu  1 2 3\nctxt 99\nbtime 1605316999\nprocesses 5\n"),
+      1_605_316_999_000,
+    );
+    assert.equal(parseBootTime("cpu 1 2 3\n"), null);
+  });
+
+  test("a pid that isn't in /proc is gone", {
+    skip: process.platform !== "linux",
+  }, async () => {
+    // pid_max is at most 4194304 (2^22), so this pid can't exist.
+    assert.equal(await readLinuxProcessInfo(2 ** 22 + 1), "gone");
+  });
+
+  test("this process, read from /proc, is running and started before now", {
+    skip: process.platform !== "linux",
+  }, async () => {
+    const info = await readLinuxProcessInfo(process.pid);
+    assert.ok(info && info !== "gone");
+    assert.match(info.state, /^[RS]$/);
+    assert.ok(info.startedAtMs <= Date.now() + 1000);
+    assert.ok(info.startedAtMs > Date.now() - 10 * 60_000);
+  });
+
+  test("the start command is quoted for PowerShell only on Windows", () => {
+    assert.equal(commandPlatform("win32"), "windows");
+    assert.equal(commandPlatform("darwin"), "posix");
+    assert.equal(commandPlatform("linux"), "posix");
+  });
+});
+
 /** A stand-in daemon: records every request and answers with `respond`. */
 interface Recorded {
   method: string | undefined;
@@ -150,12 +203,15 @@ function rpcResult(reply: http.ServerResponse, id: number, result: unknown) {
     .end(JSON.stringify({ jsonrpc: "2.0", id, result }));
 }
 
-function rpcError(reply: http.ServerResponse, id: number, code: number) {
+function rpcError(
+  reply: http.ServerResponse,
+  id: number,
+  code: number,
+  message = "no",
+) {
   reply
     .writeHead(200, { "content-type": "application/json" })
-    .end(
-      JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: "no" } }),
-    );
+    .end(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }));
 }
 
 const HEALTH = {
@@ -237,18 +293,50 @@ async function publish(
   }
 }
 
+async function writeLock(pid: number, writtenAtMs: number): Promise<void> {
+  const lock = path.join(dataDir, "daemon.lock");
+  await writeFile(lock, String(pid));
+  const when = new Date(writtenAtMs);
+  await utimes(lock, when, when);
+}
+
 async function writeToken(token: string): Promise<void> {
   await writeFile(path.join(dataDir, "control-token"), token);
 }
 
+/**
+ * A monitor for the temporary data directory. LIVE_PID is the only live pid,
+ * the OS can't say more about it (as on macOS) unless a test passes
+ * `processInfo`, and the machine booted at the epoch.
+ */
 function monitor(options: Partial<MonitorOptions> = {}): DaemonMonitor {
   return new DaemonMonitor({
     dataDir,
     platform: "linux",
     isProcessAlive: (pid) => pid === LIVE_PID,
+    processInfo: () => Promise.resolve(null),
+    bootTimeMs: () => 0,
     timeoutMs: 500,
     ...options,
   });
+}
+
+/** Linux reporting LIVE_PID in `state`, started at `startedAtMs`. */
+/** Linux reporting that LIVE_PID has left `/proc`. */
+const gone: Partial<MonitorOptions> = {
+  processInfo: () => Promise.resolve("gone"),
+};
+
+function linux(state: string, startedAtMs: number): Partial<MonitorOptions> {
+  return {
+    processInfo: (pid): Promise<ProcessInfo | null> =>
+      Promise.resolve(pid === LIVE_PID ? { state, startedAtMs } : null),
+  };
+}
+
+/** Error codes and JSON-RPC codes belong in `detail`, never in the message. */
+function assertPlainMessage(status: DaemonStatus): void {
+  assert.doesNotMatch(status.message, /\bE[A-Z]{3,}\b|-\d{3,}|JSON-RPC/);
 }
 
 /** Checks, and asserts no token ever appears in what the renderer would get. */
@@ -312,12 +400,93 @@ describe("DaemonMonitor", () => {
     assert.equal(status.state === "starting" && status.pid, LIVE_PID);
   });
 
-  test("an old lock is not a starting daemon", async () => {
-    const lock = path.join(dataDir, "daemon.lock");
-    await writeFile(lock, String(LIVE_PID));
-    const old = new Date(Date.now() - 60_000);
-    await utimes(lock, old, old);
+  test("an old lock is not a starting daemon when the OS can't confirm it", async () => {
+    await writeLock(LIVE_PID, Date.now() - 60_000);
     assert.equal((await check()).state, "not-running");
+  });
+
+  test("an old lock whose process Linux confirms is starting (a slow migration)", async () => {
+    const writtenAtMs = Date.now() - 5 * 60_000;
+    await writeLock(LIVE_PID, writtenAtMs);
+    const status = await check(monitor(linux("S", writtenAtMs - 200)));
+    assert.equal(status.state, "starting");
+  });
+
+  test("a live lock pid other than a stale daemon.json's pid is starting", async () => {
+    await publish({ pid: 999 }, null);
+    await writeLock(LIVE_PID, Date.now() - 5 * 60_000);
+    const status = await check();
+    assert.equal(status.state, "starting");
+    assert.equal(status.state === "starting" && status.pid, LIVE_PID);
+    assert.equal(requests.length, 0);
+  });
+
+  test("a lock naming the stale daemon.json's own pid is not starting", async () => {
+    await publish({ pid: 999 });
+    assert.equal((await check()).state, "not-running");
+  });
+
+  test("a zombie daemon (exited, not reaped) is stale, not running", async () => {
+    const startedAtMs = Date.now() - HOUR;
+    await publish({ startedAtMs });
+    await writeToken(TOKEN_A);
+    const status = await check(monitor(linux("Z", startedAtMs - 100)));
+    assert.equal(status.state, "not-running");
+    assert.equal(status.state === "not-running" && status.stale, true);
+    assert.equal(requests.length, 0);
+    const dead = await check(monitor(linux("X", startedAtMs - 100)));
+    assert.equal(dead.state, "not-running");
+  });
+
+  test("a zombie holding a fresh lock is not a starting daemon", async () => {
+    await writeLock(LIVE_PID, Date.now());
+    const status = await check(monitor(linux("Z", Date.now() - 100)));
+    assert.equal(status.state, "not-running");
+    assert.equal(status.state === "not-running" && status.stale, false);
+  });
+
+  test("a process that started after daemon.json was written reused the pid", async () => {
+    const startedAtMs = Date.now() - HOUR;
+    await publish({ startedAtMs });
+    await writeToken(TOKEN_A);
+    const reused = await check(
+      monitor(linux("S", startedAtMs + START_SLACK_MS + 1000)),
+    );
+    assert.equal(reused.state, "not-running");
+    assert.equal(requests.length, 0);
+    // Within the slack for coarse clocks, it is still the daemon.
+    const same = await check(monitor(linux("S", startedAtMs + 1000)));
+    assert.equal(same.state, "running");
+  });
+
+  test("a daemon.json written before this boot is stale (pid reused after a reboot)", async () => {
+    const startedAtMs = Date.now() - HOUR;
+    await publish({ startedAtMs });
+    await writeToken(TOKEN_A);
+    const bootedSince = monitor({
+      bootTimeMs: () => startedAtMs + BOOT_SLACK_MS + 60_000,
+    });
+    assert.equal((await check(bootedSince)).state, "not-running");
+    assert.equal(requests.length, 0);
+    const bootedBefore = monitor({ bootTimeMs: () => startedAtMs - HOUR });
+    assert.equal((await check(bootedBefore)).state, "running");
+  });
+
+  test("a pid /proc no longer has is dead, even though kill(pid, 0) said alive", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    const status = await check(monitor(gone));
+    assert.equal(status.state, "not-running");
+    assert.equal(requests.length, 0);
+  });
+
+  test("a lock written before this boot is not a starting daemon", async () => {
+    const writtenAtMs = Date.now();
+    await writeLock(LIVE_PID, writtenAtMs);
+    const status = await check(
+      monitor({ bootTimeMs: () => writtenAtMs + BOOT_SLACK_MS + 1000 }),
+    );
+    assert.equal(status.state, "not-running");
   });
 
   test("running: calls version and health on 127.0.0.1 with the token", async () => {
@@ -374,14 +543,15 @@ describe("DaemonMonitor", () => {
     const target = monitor();
     assert.equal((await check(target)).state, "running");
 
-    // The token is rotated: the daemon now accepts only TOKEN_B.
+    // The token is rotated: the daemon now accepts only TOKEN_B. `version` is
+    // known already, so only `health` is asked: once with A, once with B.
     await writeToken(TOKEN_B);
     respond = healthyDaemon(TOKEN_B);
     requests = [];
     assert.equal((await check(target)).state, "running");
     assert.deepEqual(
-      requests.map((r) => r.headers.authorization).sort(),
-      [TOKEN_A, TOKEN_A, TOKEN_B, TOKEN_B].map((t) => `Bearer ${t}`),
+      requests.map((r) => r.headers.authorization),
+      [TOKEN_A, TOKEN_B].map((t) => `Bearer ${t}`),
     );
   });
 
@@ -411,7 +581,23 @@ describe("DaemonMonitor", () => {
 
     const status = await check();
     assert.equal(status.state, "unreachable");
-    assert.match(status.message, /refused/);
+    assert.match(
+      status.message,
+      /^The daemon \(process 4242\) is registered at .*, but nothing is accepting connections there\.$/,
+    );
+    assert.equal(status.detail, "ECONNREFUSED");
+    assertPlainMessage(status);
+  });
+
+  test("a connection closed without an answer: unreachable, said plainly", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = (_call, reply) => reply.socket?.destroy();
+    const status = await check();
+    assert.equal(status.state, "unreachable");
+    assert.match(status.message, /closed the connection without answering\.$/);
+    assert.equal(status.detail, "ECONNRESET");
+    assertPlainMessage(status);
   });
 
   test("no answer within the timeout: unreachable", async () => {
@@ -457,6 +643,84 @@ describe("DaemonMonitor", () => {
     respond = (_call, reply) => reply.writeHead(200).end("<html>hello</html>");
     const status = await check();
     assert.equal(status.state === "error" && status.reason, "protocol");
+    assert.equal(status.detail, "Reply wasn't JSON");
+    respond = (_call, reply) => reply.writeHead(500).end();
+    const http500 = await check();
+    assert.equal(http500.detail, "HTTP 500");
+    assertPlainMessage(http500);
+  });
+
+  test("version is asked once per daemon run; health on every check", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    const target = monitor();
+    await check(target);
+    requests = [];
+    await check(target);
+    assert.deepEqual(
+      requests.map((r) => r.body.method),
+      ["health"],
+    );
+    // A restarted daemon (a new start time) is asked again.
+    await publish({ startedAtMs: Date.now() - 1000 });
+    requests = [];
+    await check(target);
+    assert.deepEqual(requests.map((r) => r.body.method).sort(), [
+      "health",
+      "version",
+    ]);
+  });
+
+  test("a health error from a live daemon: unhealthy, with the error as detail", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = (call, reply) =>
+      call.body.method === "version"
+        ? rpcResult(reply, call.body.id, { daemonVersion: "0.1.0" })
+        : rpcError(reply, call.body.id, -32000, "store unavailable");
+    const status = await check();
+    assert.equal(status.state, "unhealthy");
+    assert.ok(status.state === "unhealthy");
+    assert.equal(status.daemonVersion, "0.1.0");
+    assert.equal(status.pid, LIVE_PID);
+    assert.equal(status.detail, "Error -32000: store unavailable");
+    assertPlainMessage(status);
+  });
+
+  test("a version error: error, with the code only as detail", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = (call, reply) =>
+      call.body.method === "version"
+        ? rpcError(reply, call.body.id, -32603, "internal")
+        : rpcResult(reply, call.body.id, HEALTH);
+    const status = await check();
+    assert.equal(status.state === "error" && status.reason, "unexpected");
+    assert.equal(status.detail, "Error -32603: internal");
+    assertPlainMessage(status);
+  });
+
+  test("unreadable files are said plainly; the error code is only a detail", async () => {
+    await mkdir(path.join(dataDir, "daemon.json"));
+    const discovery = await check();
+    assert.equal(discovery.state === "error" && discovery.reason, "unreadable");
+    assert.equal(
+      discovery.message,
+      "The app couldn't read the daemon's discovery file (daemon.json).",
+    );
+    assert.equal(discovery.detail, "EISDIR");
+
+    await rm(path.join(dataDir, "daemon.json"), { recursive: true });
+    await publish();
+    await mkdir(path.join(dataDir, "control-token"));
+    const token = await check();
+    assert.equal(token.state === "error" && token.reason, "unreadable");
+    assert.equal(
+      token.message,
+      "The app couldn't read the daemon's token file (control-token).",
+    );
+    assert.equal(token.detail, "EISDIR");
+    assert.equal(requests.length, 0);
   });
 
   test("a malformed health reply is not shown as running", async () => {
@@ -495,5 +759,13 @@ describe("DaemonMonitor", () => {
     const status = await check(monitor({ customDataDir: true }));
     assert.equal(status.customDataDir, true);
     assert.equal((await check()).customDataDir, false);
+  });
+
+  test("statuses say how to quote the start command, and have no empty detail", async () => {
+    const posix = await check();
+    assert.equal(posix.platform, "posix");
+    assert.ok(!("detail" in posix));
+    const windows = await check(monitor({ platform: "win32" }));
+    assert.equal(windows.platform, "windows");
   });
 });

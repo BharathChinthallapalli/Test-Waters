@@ -200,10 +200,14 @@ function copyCommand(): void {
   }
   const shortcut = navigator.userAgent.includes("Mac") ? "⌘C" : "Ctrl+C";
   ui.copy.textContent = copied ? "Copied" : `Press ${shortcut}`;
-  window.setTimeout(() => {
+  // A second click restarts the two seconds rather than racing the first timer.
+  window.clearTimeout(copyResetTimer);
+  copyResetTimer = window.setTimeout(() => {
     ui.copy.textContent = "Copy";
   }, 2000);
 }
+
+let copyResetTimer: number | undefined;
 
 ui.copy.addEventListener("click", copyCommand);
 
@@ -220,13 +224,16 @@ const initial = (status: DaemonStatus): void => {
   }
 };
 window.callsheet.status.get().then(initial, () => {
-  // The main process refused or failed; the next pushed status replaces this.
+  // The app's own main process refused or failed, which says nothing about the
+  // daemon. A pushed status still replaces this if one arrives.
   initial({
     state: "error",
     dataDir: null,
-    reason: "unexpected",
+    reason: "app",
     customDataDir: false,
-    message: "The app couldn't ask its main process for the daemon's status.",
-    checkedAtMs: Date.now(),
+    platform: navigator.userAgent.includes("Windows") ? "windows" : "posix",
+    message:
+      "This window couldn't get the daemon's status from the rest of Callsheet.",
+    checkedAtMs: 0, // nothing was checked: no "Last checked" line
   });
 });

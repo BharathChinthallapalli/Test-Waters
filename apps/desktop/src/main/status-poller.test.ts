@@ -31,6 +31,7 @@ function status(checkedAtMs: number): DaemonStatus {
     dataDir: "/d",
     stale: false,
     customDataDir: false,
+    platform: "posix",
     message: "No daemon.",
     checkedAtMs,
   };
