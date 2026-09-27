@@ -1,32 +1,48 @@
 import type { CallsheetApi } from "../preload/api.ts";
 import type { DaemonStatus } from "../shared/daemon-status.ts";
 import {
+  announce,
+  focusRow,
+  loadOlderHasFocus,
+  loadOlderHidden,
+  onLoadOlder,
+  renderCalls,
+  renderConnect,
+} from "./calls-render.ts";
+import { applyStatus, type CallsList, EMPTY_LIST } from "./calls-state.ts";
+import {
+  describeCalls,
+  describeConnect,
+  describeOlderLoaded,
+} from "./calls-view.ts";
+import { wireCopyButton } from "./copy.ts";
+import {
   type DetailRow,
   describeStatus,
   type NextStep,
   type Notice,
 } from "./describe.ts";
+import {
+  element,
+  setBreakableText,
+  setHidden,
+  setOptionalText,
+  setText,
+} from "./dom.ts";
 import { formatClock } from "./format.ts";
+import { OlderLoader } from "./older-loader.ts";
 
 /**
- * The status screen. Draws {@link describeStatus}'s view with plain DOM calls.
- * Text is only ever set with `textContent`, and only when it changes, so a
- * three-second update neither re-announces the status to screen readers nor
- * clears a selection the user is making.
+ * The status screen. Draws {@link describeStatus}'s view, the Connect Claude
+ * Code card and the Recent calls list with plain DOM calls (`dom.ts`), changing
+ * only what changed, so a three-second update neither re-announces the status
+ * to screen readers nor clears a selection the user is making.
  */
 
 declare global {
   interface Window {
     readonly callsheet: CallsheetApi;
   }
-}
-
-function element<T extends HTMLElement>(id: string): T {
-  const found = document.getElementById(id);
-  if (!found) {
-    throw new Error(`#${id} is missing from index.html`);
-  }
-  return found as T;
 }
 
 const ui = {
@@ -45,36 +61,11 @@ const ui = {
   command: element("command"),
   copy: element<HTMLButtonElement>("copy"),
   nextStepAfter: element("next-step-after"),
+  daemon: element("daemon"),
+  daemonTitle: element("daemon-title"),
   details: element<HTMLDListElement>("details"),
   checked: element("checked"),
 };
-
-function setText(target: HTMLElement, text: string): void {
-  if (target.textContent !== text) {
-    target.textContent = text;
-  }
-}
-
-/**
- * Like {@link setText}, for paths and commands: a line may break after each
- * path separator (a `<wbr>`, which copying leaves out) rather than mid-word.
- */
-function setBreakableText(target: HTMLElement, text: string): void {
-  if (target.textContent === text) {
-    return;
-  }
-  const parts = text.split(/(?<=[/\\])/);
-  target.replaceChildren(
-    ...parts.flatMap((part, index) =>
-      index === 0 ? [part] : [document.createElement("wbr"), part],
-    ),
-  );
-}
-
-function setOptionalText(target: HTMLElement, text: string | undefined): void {
-  target.hidden = text === undefined;
-  setText(target, text ?? "");
-}
 
 /**
  * A warning is a callout above the details; information about them is a quiet
@@ -83,12 +74,12 @@ function setOptionalText(target: HTMLElement, text: string | undefined): void {
 function renderNotice(notice: Notice | null): void {
   const warning = notice?.tone === "warning" ? notice : null;
   const info = notice?.tone === "info" ? notice : null;
-  ui.notice.hidden = warning === null;
+  setHidden(ui.notice, warning === null);
   if (warning) {
     setText(ui.noticeTitle, warning.title);
     setText(ui.noticeText, warning.text);
   }
-  ui.aside.hidden = info === null;
+  setHidden(ui.aside, info === null);
   if (info) {
     setText(ui.asideTitle, info.title);
     setText(ui.asideText, info.text);
@@ -96,12 +87,12 @@ function renderNotice(notice: Notice | null): void {
 }
 
 function renderNextStep(step: NextStep | null): void {
-  ui.nextStep.hidden = step === null;
+  setHidden(ui.nextStep, step === null);
   if (!step) {
     return;
   }
   setText(ui.nextStepText, step.text);
-  ui.commandRow.hidden = step.command === undefined;
+  setHidden(ui.commandRow, step.command === undefined);
   setBreakableText(ui.command, step.command ?? "");
   setOptionalText(ui.nextStepAfter, step.after);
 }
@@ -130,7 +121,7 @@ function createRow(): RowElements {
 
 /** Updates rows in place by key; adds, removes and reorders only as needed. */
 function renderRows(rows: readonly DetailRow[]): void {
-  ui.details.hidden = rows.length === 0;
+  setHidden(ui.daemon, rows.length === 0);
   const keep = new Set(rows.map((row) => row.key));
   for (const [key, elements] of rowElements) {
     if (!keep.has(key)) {
@@ -163,6 +154,43 @@ function renderRows(rows: readonly DetailRow[]): void {
   });
 }
 
+/** The calls held, and "Load older". */
+let calls: CallsList = EMPTY_LIST;
+let latest: DaemonStatus | null = null;
+const older = new OlderLoader({
+  fetch: (before) => window.callsheet.calls.older(before),
+  list: () => calls,
+  settled: ({ list, loaded }) => {
+    calls = list;
+    const hadFocus = loadOlderHasFocus();
+    renderCallsSection();
+    if (loaded === null) {
+      return; // a failure is the text by the button
+    }
+    announce(describeOlderLoaded(loaded.added, loaded.ended));
+    // The button hid under the keyboard's focus: carry on at the first call
+    // it loaded, rather than leaving focus on nothing.
+    if (hadFocus && loadOlderHidden() && loaded.firstNew !== null) {
+      focusRow(String(loaded.firstNew));
+    }
+  },
+});
+
+function renderCallsSection(): void {
+  if (latest === null) {
+    return;
+  }
+  renderConnect(describeConnect(latest));
+  renderCalls(
+    describeCalls(
+      latest,
+      calls,
+      { loadingOlder: older.loading, olderError: older.error },
+      Date.now(),
+    ),
+  );
+}
+
 function render(status: DaemonStatus): void {
   const view = describeStatus(status);
   if (ui.mark.dataset.tone !== view.tone) {
@@ -173,43 +201,32 @@ function render(status: DaemonStatus): void {
   renderNotice(view.notice);
   renderNextStep(view.nextStep);
   renderRows(view.rows);
+  // Below the calls, the daemon's facts need a name of their own.
+  setHidden(ui.daemonTitle, status.state !== "running");
   setText(
     ui.checked,
     status.checkedAtMs > 0
-      ? `Last checked ${formatClock(status.checkedAtMs)} · Refreshes every 3\u00a0seconds`
-      : " ",
+      ? `Last checked ${formatClock(status.checkedAtMs)} · Refreshes every 3 seconds`
+      : "\u00a0",
   );
-}
-
-/**
- * Copies the command. The Clipboard API needs a permission this app denies to
- * every page, so the command is selected and copied with the editing command;
- * if that fails the command stays selected for the user to copy.
- */
-function copyCommand(): void {
-  const selection = window.getSelection();
-  const range = document.createRange();
-  range.selectNodeContents(ui.command);
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-  let copied = false;
-  try {
-    copied = document.execCommand("copy");
-  } catch {
-    copied = false;
+  latest = status;
+  const before = calls.run;
+  calls = applyStatus(calls, status);
+  if (calls.run !== before) {
+    older.reset();
   }
-  const shortcut = navigator.userAgent.includes("Mac") ? "⌘C" : "Ctrl+C";
-  ui.copy.textContent = copied ? "Copied" : `Press ${shortcut}`;
-  // A second click restarts the two seconds rather than racing the first timer.
-  window.clearTimeout(copyResetTimer);
-  copyResetTimer = window.setTimeout(() => {
-    ui.copy.textContent = "Copy";
-  }, 2000);
+  renderCallsSection();
 }
 
-let copyResetTimer: number | undefined;
+function loadOlder(): void {
+  if (older.start()) {
+    announce("");
+    renderCallsSection();
+  }
+}
 
-ui.copy.addEventListener("click", copyCommand);
+wireCopyButton(ui.copy, ui.command);
+onLoadOlder(loadOlder);
 
 // Pushed statuses are always the newest. The answer to the first `get` is only
 // shown if no push arrived before it (ordering by arrival, not by the clock).

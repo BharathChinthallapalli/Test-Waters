@@ -68,6 +68,14 @@ const TEXT_PAIRS: Array<[string, string]> = [
   ["text-secondary", "warning-subtle"],
   ["text-tertiary", "bg"],
   ["text-tertiary", "surface"],
+  // Recent calls: rows on the card, and open or hovered rows.
+  ["text", "row-active"],
+  ["text-secondary", "row-active"],
+  ["text-tertiary", "row-active"],
+  ["warning", "surface"],
+  ["warning", "row-active"],
+  ["danger", "surface"],
+  ["danger", "row-active"],
 ];
 
 /** Icons, status marks and the focus ring: 3:1 (SC 1.4.11). */
@@ -81,6 +89,12 @@ const UI_PAIRS: Array<[string, string]> = [
   ]),
   ["focus", "bg"],
   ["focus", "surface"],
+  ["focus", "row-active"],
+  // A call's outcome mark, on a row and on an open row.
+  ...["ok", "off", "warning", "danger"].flatMap((tone): [string, string][] => [
+    [tone, "surface"],
+    [tone, "row-active"],
+  ]),
 ];
 
 for (const [theme, colours] of [

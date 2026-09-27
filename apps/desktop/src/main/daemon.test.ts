@@ -489,7 +489,7 @@ describe("DaemonMonitor", () => {
     assert.equal(status.state, "not-running");
   });
 
-  test("running: calls version and health on 127.0.0.1 with the token", async () => {
+  test("running: calls version, health and calls.list on 127.0.0.1 with the token", async () => {
     await publish();
     await writeToken(TOKEN_A);
     const status = await check();
@@ -504,9 +504,13 @@ describe("DaemonMonitor", () => {
       captureContent: false,
       lastGlobalPosition: 12_408,
       erasurePending: false,
+      proxy: null,
     });
+    // This daemon has no calls.list (-32601).
+    assert.deepEqual(status.calls, { state: "unsupported" });
 
     assert.deepEqual(requests.map((r) => r.body.method).sort(), [
+      "calls.list",
       "health",
       "version",
     ]);
@@ -544,14 +548,15 @@ describe("DaemonMonitor", () => {
     assert.equal((await check(target)).state, "running");
 
     // The token is rotated: the daemon now accepts only TOKEN_B. `version` is
-    // known already, so only `health` is asked: once with A, once with B.
+    // known already, so `health` is asked once with A, once with B, and then
+    // `calls.list` with B.
     await writeToken(TOKEN_B);
     respond = healthyDaemon(TOKEN_B);
     requests = [];
     assert.equal((await check(target)).state, "running");
     assert.deepEqual(
       requests.map((r) => r.headers.authorization),
-      [TOKEN_A, TOKEN_B].map((t) => `Bearer ${t}`),
+      [TOKEN_A, TOKEN_B, TOKEN_B].map((t) => `Bearer ${t}`),
     );
   });
 
@@ -650,7 +655,7 @@ describe("DaemonMonitor", () => {
     assertPlainMessage(http500);
   });
 
-  test("version is asked once per daemon run; health on every check", async () => {
+  test("version is asked once per daemon run; health and calls on every check", async () => {
     await publish();
     await writeToken(TOKEN_A);
     const target = monitor();
@@ -659,13 +664,14 @@ describe("DaemonMonitor", () => {
     await check(target);
     assert.deepEqual(
       requests.map((r) => r.body.method),
-      ["health"],
+      ["health", "calls.list"],
     );
     // A restarted daemon (a new start time) is asked again.
     await publish({ startedAtMs: Date.now() - 1000 });
     requests = [];
     await check(target);
     assert.deepEqual(requests.map((r) => r.body.method).sort(), [
+      "calls.list",
       "health",
       "version",
     ]);
@@ -767,5 +773,289 @@ describe("DaemonMonitor", () => {
     assert.ok(!("detail" in posix));
     const windows = await check(monitor({ platform: "win32" }));
     assert.equal(windows.platform, "windows");
+  });
+});
+
+/** A `calls.list` entry as the daemon sends it (`cs_core::llm::CallEntry`). */
+function daemonEntry(globalPos: number) {
+  return {
+    globalPos,
+    runId: "cc-7d2f",
+    call: {
+      provider: "anthropic",
+      method: "POST",
+      path: "/v1/messages",
+      status: 200,
+      outcome: "completed",
+      streamed: true,
+      model: "claude-opus-4-1",
+      stopReason: "end_turn",
+      usage: { inputTokens: 12, outputTokens: 340, cacheReadInputTokens: 9000 },
+      startedAtMs: 1_790_000_000_000,
+      ttfbMs: 420,
+      durationMs: 3200,
+      requestBytes: 1000,
+      responseBytes: 4000,
+      rateLimitHeaders: {
+        "anthropic-ratelimit-requests-remaining": "49",
+      } as Record<string, string>,
+      traceId: "0af7651916cd43dd8448eb211c80319c",
+    },
+  };
+}
+
+const PROXY = {
+  address: "127.0.0.1:4101",
+  callsRecorded: 3,
+  recordsDropped: 1,
+};
+
+interface CallsRequest extends Recorded {
+  body: Recorded["body"] & { params?: unknown };
+}
+
+/** A feature 03 daemon: `health` has a proxy, and `calls.list` answers `list`. */
+function proxyDaemon(
+  list: (call: CallsRequest, reply: http.ServerResponse) => void,
+  proxy: unknown = PROXY,
+) {
+  return (call: Recorded, reply: http.ServerResponse) => {
+    if (call.body.method === "version") {
+      rpcResult(reply, call.body.id, { daemonVersion: "0.2.0" });
+    } else if (call.body.method === "health") {
+      rpcResult(reply, call.body.id, { ...HEALTH, proxy });
+    } else if (call.body.method === "calls.list") {
+      list(call, reply);
+    } else {
+      rpcError(reply, call.body.id, -32601);
+    }
+  };
+}
+
+describe("DaemonMonitor: recent calls", () => {
+  afterEach(async () => {
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  test("the proxy and the newest page come with a running status", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, {
+        calls: [daemonEntry(9), daemonEntry(4)],
+        nextBefore: 4,
+      }),
+    );
+    const status = await check();
+    assert.ok(status.state === "running");
+    assert.deepEqual(status.health?.proxy, PROXY);
+    assert.ok(status.calls.state === "loaded");
+    assert.deepEqual(
+      status.calls.calls.map((call) => call.globalPos),
+      [9, 4],
+    );
+    assert.equal(status.calls.nextBefore, 4);
+    const listed = requests.find((r) => r.body.method === "calls.list");
+    assert.ok(listed);
+    assert.deepEqual((listed.body as CallsRequest["body"]).params, {
+      limit: 50,
+    });
+  });
+
+  test("a proxy address other than 127.0.0.1:<port> isn't the daemon", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    for (const address of [
+      "0.0.0.0:4101",
+      "127.0.0.1:0",
+      "127.0.0.1:04101",
+      "127.0.0.1:4101; rm -rf ~",
+      // A trailing newline would end the line and run what follows it; JS
+      // `$` without the m flag matches only at the very end, unlike PCRE.
+      "127.0.0.1:4101\n",
+      "127.0.0.1:4101\nrm -rf ~",
+      "127.0.0.1:4101\r\n",
+      "localhost:4101",
+    ]) {
+      respond = proxyDaemon(
+        (call, reply) => rpcResult(reply, call.body.id, { calls: [] }),
+        { ...PROXY, address },
+      );
+      const status = await check();
+      assert.equal(status.state === "error" && status.reason, "protocol");
+    }
+    respond = proxyDaemon(
+      (call, reply) => rpcResult(reply, call.body.id, { calls: [] }),
+      { ...PROXY, recordsDropped: -1 },
+    );
+    assert.equal((await check()).state, "error");
+  });
+
+  test("a failing calls.list leaves the daemon running; the calls say why", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcError(reply, call.body.id, -32000, "store unavailable"),
+    );
+    const failed = await check();
+    assert.equal(failed.state, "running");
+    assert.ok(failed.state === "running");
+    assert.deepEqual(failed.calls, {
+      state: "failed",
+      message: "The daemon didn't return its recent calls.",
+      detail: "Error -32000: store unavailable",
+    });
+
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, { calls: [{ globalPos: "9" }] }),
+    );
+    const malformed = await check();
+    assert.ok(malformed.state === "running");
+    assert.equal(malformed.calls.state, "failed");
+
+    respond = proxyDaemon(() => {}); // calls.list never answers
+    const slow = await check(monitor({ timeoutMs: 200 }));
+    assert.ok(slow.state === "running");
+    assert.equal(slow.calls.state, "failed");
+  });
+
+  test("a daemon without health isn't asked for calls", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = (call, reply) =>
+      call.body.method === "version"
+        ? rpcResult(reply, call.body.id, { daemonVersion: "0.1.0" })
+        : rpcError(reply, call.body.id, -32601);
+    const status = await check();
+    assert.ok(status.state === "running");
+    assert.deepEqual(status.calls, { state: "unsupported" });
+    assert.ok(!requests.some((r) => r.body.method === "calls.list"));
+  });
+
+  test("a calls reply over 64 KiB fails only the calls", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    const bulky = (pos: number) => {
+      const entry = daemonEntry(pos);
+      entry.call.rateLimitHeaders = Object.fromEntries(
+        Array.from({ length: 30 }, (_, i) => [
+          `anthropic-ratelimit-x-${i}`,
+          "v".repeat(60),
+        ]),
+      );
+      return entry;
+    };
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, {
+        calls: Array.from({ length: 50 }, (_, i) => bulky(100 - i)),
+      }),
+    );
+    const status = await check();
+    assert.ok(status.state === "running");
+    assert.deepEqual(status.calls, {
+      state: "failed",
+      message: "The daemon didn't return its recent calls.",
+      detail: "Reply over 64 KiB",
+    });
+  });
+
+  test("a short page with nextBefore passes the cursor on", async () => {
+    // The daemon caps a page at about 48 KiB of entries (#63): fewer calls
+    // than asked for, and nextBefore says more exist.
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, {
+        calls: [daemonEntry(99), daemonEntry(98)],
+        nextBefore: 98,
+      }),
+    );
+    const status = await check();
+    assert.ok(status.state === "running");
+    assert.ok(status.calls.state === "loaded");
+    assert.equal(status.calls.calls.length, 2);
+    assert.equal(status.calls.nextBefore, 98);
+  });
+
+  test("listCalls asks for the page before a cursor from the running daemon", async () => {
+    await publish();
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, { calls: [daemonEntry(3)] }),
+    );
+    const target = monitor();
+    assert.deepEqual(await target.listCalls(4), {
+      state: "failed",
+      message: "The daemon isn't running, so older calls can't be loaded.",
+    });
+    assert.equal(requests.length, 0);
+
+    await check(target);
+    requests = [];
+    const older = await target.listCalls(4);
+    assert.ok(older.state === "loaded");
+    assert.equal(older.nextBefore, null);
+    const [olderRequest] = requests;
+    assert.ok(olderRequest);
+    assert.deepEqual((olderRequest.body as CallsRequest["body"]).params, {
+      limit: 50,
+      before: 4,
+    });
+
+    await rm(path.join(dataDir, "daemon.json"));
+    await check(target);
+    assert.equal((await target.listCalls(4)).state, "failed");
+  });
+
+  test("listCalls re-checks the run before sending the token", async () => {
+    const startedAtMs = Date.now() - HOUR;
+    await publish({ startedAtMs });
+    await writeToken(TOKEN_A);
+    respond = proxyDaemon((call, reply) =>
+      rpcResult(reply, call.body.id, { calls: [daemonEntry(3)] }),
+    );
+    let alive = true;
+    const target = monitor({
+      isProcessAlive: (pid) => alive && pid === LIVE_PID,
+    });
+    const refused = async (): Promise<void> => {
+      requests = [];
+      assert.deepEqual(await target.listCalls(4), {
+        state: "failed",
+        message: "The daemon isn't running, so older calls can't be loaded.",
+      });
+      assert.equal(requests.length, 0, "no request, so no token sent");
+    };
+
+    // Another run took the discovery file since the last check.
+    await check(target);
+    await publish({ startedAtMs, pid: LIVE_PID + 1 }, LIVE_PID + 1);
+    await refused();
+    // The refusal is kept: the same run coming back needs a new check.
+    await publish({ startedAtMs });
+    await refused();
+
+    // The lock names another process.
+    await check(target);
+    await writeFile(path.join(dataDir, "daemon.lock"), String(LIVE_PID + 1));
+    await refused();
+    await publish({ startedAtMs });
+
+    // The process died.
+    await check(target);
+    alive = false;
+    await refused();
+    alive = true;
+
+    // The window was hidden: nothing checked the daemon meanwhile.
+    await check(target);
+    target.forgetRunning();
+    await refused();
+
+    // And a run that is still there is asked.
+    await check(target);
+    requests = [];
+    assert.equal((await target.listCalls(4)).state, "loaded");
+    assert.equal(requests.length, 1);
   });
 });

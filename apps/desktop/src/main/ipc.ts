@@ -6,6 +6,8 @@ import { APP_SCHEME, RENDERER_HOST } from "./renderer-files.ts";
  */
 export const STATUS_GET_CHANNEL = "callsheet:status:get";
 export const STATUS_CHANGED_CHANNEL = "callsheet:status:changed";
+/** Takes one `before` cursor; answers a `RecentCalls`. */
+export const CALLS_OLDER_CHANNEL = "callsheet:calls:older";
 
 /** The renderer's origin: the only one allowed to use the preload API. */
 export const RENDERER_ORIGIN = `${APP_SCHEME}://${RENDERER_HOST}`;

@@ -2,12 +2,19 @@ import { readFile, stat } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import type { HealthResult, VersionResult } from "@callsheet/api-types";
+import type {
+  CallsListParams,
+  HealthResult,
+  ProxyHealth,
+  VersionResult,
+} from "@callsheet/api-types";
 import {
   commandPlatform,
   type DaemonHealth,
   type DaemonStatus,
 } from "../shared/daemon-status.ts";
+import type { RecentCalls } from "../shared/recent-calls.ts";
+import { LIMITS, parseCallsList } from "./calls.ts";
 
 /**
  * The desktop app's client for the local daemon (feature 02, task 12).
@@ -64,6 +71,12 @@ import {
  * is sent to it, which is the safe way to be wrong. A clock-independent identity
  * in `daemon.json` (the boot id and the process's start ticks) would remove
  * this; it is a follow-up in the same pull request.
+ *
+ * **Recent calls** (feature 03). A running daemon with `health` is also asked
+ * for the newest page of `calls.list` on every check, after `version` and
+ * `health` answered, so a failure there never changes the daemon's status; it
+ * only makes the calls "failed". {@link DaemonMonitor.listCalls} fetches an
+ * older page for "Load older", from the daemon the last check found running.
  */
 
 export const DISCOVERY_FILE_NAME = "daemon.json";
@@ -84,7 +97,10 @@ export const REQUEST_TIMEOUT_MS = 2000;
  */
 export const STARTING_GRACE_MS = 10_000;
 
-/** Replies are a few hundred bytes; anything much bigger is not the daemon. */
+/**
+ * Replies are a few hundred bytes, and a `calls.list` page at most about 48 KiB
+ * of entries (#63); anything bigger is not the daemon.
+ */
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
 /**
@@ -481,6 +497,8 @@ export class DaemonMonitor {
   #token: string | null = null;
   /** `version` doesn't change while a daemon runs, so it is asked once per run. */
   #version: { run: string; result: VersionResult } | null = null;
+  /** Where the last check found a running daemon, for {@link listCalls}. */
+  #running: { dataDir: string; discovery: Discovery } | null = null;
   #nextId = 1;
 
   constructor(options: MonitorOptions) {
@@ -501,8 +519,13 @@ export class DaemonMonitor {
   /** Never throws: anything unexpected becomes an "error" status. */
   async check(): Promise<DaemonStatus> {
     try {
-      return await this.#check();
+      const status = await this.#check();
+      if (status.state !== "running") {
+        this.#running = null;
+      }
+      return status;
     } catch {
+      this.#running = null;
       return this.#status({
         state: "error",
         dataDir: this.#dataDir,
@@ -639,7 +662,19 @@ export class DaemonMonitor {
       captureContent: health.captureContent,
       lastGlobalPosition: health.lastGlobalPosition,
       erasurePending: health.erasurePending,
+      proxy: health.proxy
+        ? {
+            address: health.proxy.address,
+            callsRecorded: health.proxy.callsRecorded,
+            recordsDropped: health.proxy.recordsDropped,
+          }
+        : null,
     };
+    this.#running = { dataDir, discovery };
+    // A daemon without `health` predates `calls.list` too.
+    const calls: RecentCalls = health
+      ? await this.#listCalls(dataDir, discovery, null)
+      : { state: "unsupported" };
     return this.#status({
       state: "running",
       dataDir,
@@ -650,8 +685,119 @@ export class DaemonMonitor {
       uptimeMs:
         health?.uptimeMs ?? Math.max(0, this.#now() - discovery.startedAtMs),
       health: details,
+      calls,
       message: `The daemon is running and answering on ${address}.`,
     });
+  }
+
+  /**
+   * The page of calls older than `before`, from the daemon the last check found
+   * running. Never throws. Refused when no check has found one running.
+   */
+  async listCalls(before: number): Promise<RecentCalls> {
+    const running = this.#running;
+    const notRunning: RecentCalls = {
+      state: "failed",
+      message: "The daemon isn't running, so older calls can't be loaded.",
+    };
+    if (running === null) {
+      return notRunning;
+    }
+    try {
+      // The token goes only to the process the last check vouched for, so
+      // that check's cheap parts run again first: the same discovery record,
+      // a lock that agrees, and a live process.
+      if (!(await this.#stillRunning(running.dataDir, running.discovery))) {
+        if (this.#running === running) {
+          this.#running = null;
+        }
+        return notRunning;
+      }
+      return await this.#listCalls(running.dataDir, running.discovery, before);
+    } catch {
+      return {
+        state: "failed",
+        message: "Something unexpected went wrong while loading calls.",
+      };
+    }
+  }
+
+  /**
+   * Forgets the running daemon, so {@link listCalls} refuses until the next
+   * check finds one again. Called while the window isn't shown and no checks
+   * run, when what the last check found can't be kept up to date.
+   */
+  forgetRunning(): void {
+    this.#running = null;
+  }
+
+  /**
+   * The discovery file still names the same run, the lock agrees and the
+   * process is alive: {@link #check}'s tests without asking the daemon.
+   */
+  async #stillRunning(dataDir: string, known: Discovery): Promise<boolean> {
+    let current: ReturnType<typeof parseDiscovery>;
+    try {
+      const raw = await readFile(
+        path.join(dataDir, DISCOVERY_FILE_NAME),
+        "utf8",
+      );
+      current = parseDiscovery(JSON.parse(raw));
+    } catch {
+      return false;
+    }
+    if (
+      typeof current === "string" ||
+      current.pid !== known.pid ||
+      current.port !== known.port ||
+      current.startedAtMs !== known.startedAtMs
+    ) {
+      return false;
+    }
+    const [lock, liveness] = await Promise.all([
+      this.#readLock(dataDir),
+      this.#liveness(known.pid, known.startedAtMs),
+    ]);
+    const lockAgrees = this.#platform === "win32" || lock?.pid === known.pid;
+    return liveness !== "dead" && lockAgrees;
+  }
+
+  /** One `calls.list` page; every failure becomes "failed" or "unsupported". */
+  async #listCalls(
+    dataDir: string,
+    discovery: Discovery,
+    before: number | null,
+  ): Promise<RecentCalls> {
+    const params: CallsListParams =
+      before === null
+        ? { limit: LIMITS.pageSize }
+        : { limit: LIMITS.pageSize, before };
+    let result: unknown;
+    try {
+      // Within the usual 64 KiB reply cap: the daemon keeps a page's entries
+      // to about 48 KiB and says with `nextBefore` that more exist (#63).
+      result = await this.#call(dataDir, discovery, "calls.list", params);
+    } catch (error) {
+      if (error instanceof RpcError && error.code === METHOD_NOT_FOUND) {
+        return { state: "unsupported" };
+      }
+      const detail =
+        error instanceof RpcError || error instanceof DaemonCallError
+          ? error.detail
+          : undefined;
+      return {
+        state: "failed",
+        message: "The daemon didn't return its recent calls.",
+        ...(detail === undefined ? {} : { detail }),
+      };
+    }
+    return (
+      parseCallsList(result) ?? {
+        state: "failed",
+        message:
+          "The daemon's list of recent calls wasn't in the format the app expects.",
+      }
+    );
   }
 
   /** The status for a call that didn't get a JSON-RPC answer. */
@@ -728,9 +874,10 @@ export class DaemonMonitor {
     dataDir: string,
     discovery: Discovery,
     method: string,
+    params?: object,
   ): Promise<unknown> {
     const id = this.#nextId++;
-    const body = JSON.stringify({ jsonrpc: "2.0", method, id });
+    const body = JSON.stringify({ jsonrpc: "2.0", method, params, id });
     this.#token ??= await readToken(dataDir);
     let reply = await postRpc(
       discovery.port,
@@ -961,11 +1108,34 @@ function parseHealth(result: unknown): HealthResult {
     !isCount(health.schemaVersion) ||
     typeof health.captureContent !== "boolean" ||
     !isCount(health.lastGlobalPosition) ||
-    typeof health.erasurePending !== "boolean"
+    typeof health.erasurePending !== "boolean" ||
+    !isProxyHealth(health.proxy)
   ) {
     throw notTheDaemon("Malformed health reply");
   }
   return health as HealthResult;
+}
+
+/**
+ * Absent (no proxy), or a proxy on `127.0.0.1:<non-zero port>`. The address
+ * becomes a command the user runs, so nothing else is accepted.
+ */
+function isProxyHealth(value: unknown): value is ProxyHealth | undefined {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  const proxy = value as Record<string, unknown>;
+  if (
+    typeof proxy !== "object" ||
+    typeof proxy.address !== "string" ||
+    !isCount(proxy.callsRecorded) ||
+    !isCount(proxy.recordsDropped)
+  ) {
+    return false;
+  }
+  const digits = ADDRESS_PATTERN.exec(proxy.address)?.[1] ?? "0";
+  const port = Number(digits);
+  return port >= 1 && port <= 65_535 && String(port) === digits;
 }
 
 function errorCode(error: unknown): string | undefined {

@@ -25,6 +25,7 @@ const health: DaemonHealth = {
   captureContent: false,
   lastGlobalPosition: 12_408,
   erasurePending: false,
+  proxy: null,
 };
 
 const running: RunningStatus = {
@@ -37,6 +38,7 @@ const running: RunningStatus = {
   schemaVersion: 3,
   uptimeMs: (2 * 60 + 14) * 60_000,
   health,
+  calls: { state: "unsupported" },
 };
 
 const REASONS: ErrorReason[] = [

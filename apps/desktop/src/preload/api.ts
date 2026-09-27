@@ -1,4 +1,5 @@
 import type { DaemonStatus } from "../shared/daemon-status.ts";
+import type { RecentCalls } from "../shared/recent-calls.ts";
 
 /**
  * The API the preload script exposes to the renderer as `window.callsheet`.
@@ -7,6 +8,7 @@ import type { DaemonStatus } from "../shared/daemon-status.ts";
  */
 export interface CallsheetApi {
   readonly status: StatusApi;
+  readonly calls: CallsApi;
 }
 
 export interface StatusApi {
@@ -17,4 +19,12 @@ export interface StatusApi {
    * visible. Returns a function that stops the calls.
    */
   onChange(listener: (status: DaemonStatus) => void): () => void;
+}
+
+export interface CallsApi {
+  /**
+   * The page of recorded calls older than `before` (a page's `nextBefore`).
+   * The newest page comes with every status instead.
+   */
+  older(before: number): Promise<RecentCalls>;
 }
